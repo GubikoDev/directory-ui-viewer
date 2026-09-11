@@ -29,6 +29,12 @@ Use Vitest and React Testing Library for components and logic, and Playwright fo
 
 Filesystem access is read-only and user-initiated. Never grant a static whole-disk scope. Canonicalize selected paths, restrict traversal to descendants of the selected root, preserve OS permission failures, and avoid following symlinks outside the approved tree. Do not log filenames or absolute paths without explicit diagnostic consent.
 
+## Project Memory & Agent Collaboration
+
+Treat `.project-notes/` as active project memory, not an archive. Before substantive work, read `Home.md` and the notes relevant to the task. Record durable decisions with rationale in `Decisions.md`, update completed work and next actions in `Session Log.md`, and keep `Roadmap.md` current. Maintain wiki links and `Project Map.canvas` when relationships change; omit routine command noise.
+
+Codex and Claude share these instructions through `CLAUDE.md` and coordinate through `Agent Handoff.md`. Before continuing another agent's work, inspect the handoff, current files, and Git state. Record ownership, changed paths, validation, unresolved questions, and the next concrete action. Verify another agent's output before relying on it, preserve concurrent changes, and leave consequential unresolved choices to the user. The Vault is local-only and must never be committed or published.
+
 ## Commit & Pull Request Guidelines
 
 Use focused Conventional Commits, for example `feat: add directory picker` or `fix: contain symlink traversal`. Pull requests must explain purpose, security implications, validation performed, and linked issues. Include screenshots for UI changes. Never commit `.project-notes/`, credentials, real directory listings, build output, or editor state.
