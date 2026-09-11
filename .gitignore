@@ -23,3 +23,6 @@ test-results/
 
 # Private Obsidian project Vault (never commit)
 .project-notes/
+
+# Personal Claude Code overrides
+CLAUDE.local.md
