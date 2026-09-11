@@ -1,0 +1,25 @@
+# Dependencies and builds
+node_modules/
+dist/
+target/
+src-tauri/target/
+
+# Test output
+coverage/
+playwright-report/
+test-results/
+
+# Environment and local files
+.env
+.env.*
+!.env.example
+*.local
+.DS_Store
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Private Obsidian project Vault (never commit)
+.project-notes/
