@@ -15,7 +15,7 @@ Directory UI Viewer is a local-first desktop application with a web UI. Keep Rea
 - `npm run lint` and `npm run format:check` validate code style.
 - `cargo check --manifest-path src-tauri/Cargo.toml` checks Rust code.
 
-Use Node.js 22 as declared in `.nvmrc` and the repository's npm version from `packageManager`.
+Use Node.js 24 LTS as declared in `.nvmrc` and the exact npm version from `packageManager`.
 
 ## Coding Style & Naming Conventions
 

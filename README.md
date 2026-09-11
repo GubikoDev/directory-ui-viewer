@@ -15,7 +15,7 @@ The repository currently contains the project foundation only. Directory browsin
 
 ## Getting Started
 
-Prerequisites are Node.js 22, npm 11, Rust, and the [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your OS.
+Prerequisites are Node.js 24.21.0 LTS, npm 11.19.0, Rust, and the [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your OS.
 
 ```bash
 npm install
