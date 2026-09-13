@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod domain;
 pub mod listing;
 pub mod platform;
