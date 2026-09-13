@@ -102,6 +102,8 @@ impl Delivery {
     }
 }
 impl Receipt {
+    /// Confirms the client slot settled. The slot can contain a client-local
+    /// resource error; this acknowledgement never denotes operation success.
     pub async fn wait(self) -> Result<(), DeliveryError> {
         if self
             .receiver

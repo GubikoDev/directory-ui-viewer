@@ -170,13 +170,14 @@ impl Generation {
             enabled: Mutex::new(true),
             sink: resources.events.clone(),
         });
-        let usage = UsageService::new(
+        let usage = UsageService::with_budgets(
             scope.clone(),
             root_id.clone(),
             index.clone(),
             resources.scheduler.clone(),
             resources.clock.clone(),
             events.clone(),
+            resources.budgets.clone(),
         )
         .map_err(usage_error)?;
         let listing = ListingService::with_events(

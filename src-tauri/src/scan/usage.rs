@@ -4,6 +4,7 @@ use crate::domain::{
     index::{DirectoryKey, Origin, SharedDirectoryIndex},
     model::{DirectoryUsage, FsIssue, IssueScope, Issues, Kind, Measure, Reason, ScanState},
 };
+use crate::runtime::memory::{ManagedBudgets, Reservation};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -149,6 +150,7 @@ struct Aggregate {
 const SHARED_BYTES: usize = 160; // BTree node, identity, two tagged metrics, allocator overhead
 const VISITED_BYTES: usize = 96;
 const FRAME_BYTES: usize = 2048;
+const SCANNER_BASE_BYTES: usize = 64 * 1024;
 impl Aggregate {
     fn reason(&mut self, reason: Reason) {
         self.logical.reason(reason);
@@ -191,12 +193,20 @@ impl Aggregate {
         sum.add(merged);
         merged
     }
-    fn file(&mut self, observation: &Observation, shared_bytes: &mut usize, limit: usize) -> bool {
+    fn file(
+        &mut self,
+        observation: &Observation,
+        shared_bytes: &mut usize,
+        limit: usize,
+        memory: &mut Reservation,
+    ) -> bool {
         if observation.link_count <= 1 {
             self.add_own(observation);
             return true;
         }
         let Some(identity) = observation.identity else {
+            // Without identity this may duplicate an already counted link.
+            // Preserve a lower-bound partial instead of inventing unique bytes.
             self.reason(Reason::Unsupported);
             return true;
         };
@@ -210,7 +220,11 @@ impl Aggregate {
                 Self::reconcile(&mut self.allocated, existing.allocated, size.allocated);
             return true;
         }
-        if shared_bytes.saturating_add(SHARED_BYTES) > limit {
+        if shared_bytes.saturating_add(SHARED_BYTES) > limit
+            || memory
+                .resize(shared_bytes.saturating_add(SHARED_BYTES))
+                .is_err()
+        {
             self.reason(Reason::ResourceLimit);
             return false;
         }
@@ -277,15 +291,46 @@ pub struct UsageScanner<S: ObservationSource> {
     revision: u64,
     pub stats: ScanStats,
     pub issues: Issues,
+    // Declared last: sources, cursors and aggregate maps drop before charges.
+    work_memory: Reservation,
+    shared_memory: Reservation,
 }
 impl<S: ObservationSource> UsageScanner<S> {
     pub fn new(
+        source: S,
+        root: Observation,
+        index: impl Into<SharedDirectoryIndex>,
+        limits: ScanLimits,
+        cancellation: Cancellation,
+    ) -> Result<Self, &'static str> {
+        Self::with_budgets(
+            source,
+            root,
+            index,
+            limits,
+            cancellation,
+            &ManagedBudgets::default(),
+        )
+    }
+    pub fn with_budgets(
         mut source: S,
         mut root: Observation,
         index: impl Into<SharedDirectoryIndex>,
         limits: ScanLimits,
         cancellation: Cancellation,
+        budgets: &ManagedBudgets,
     ) -> Result<Self, &'static str> {
+        let mut stack = Vec::new();
+        let frame_bytes = FRAME_BYTES.max(std::mem::size_of::<Frame<S::Cursor>>() * 2);
+        let work_memory = budgets
+            .work
+            .reserve(SCANNER_BASE_BYTES + frame_bytes + VISITED_BYTES)
+            .map_err(|_| "RESOURCE_LIMIT")?;
+        let shared_memory = budgets.hardlinks.reserve(0).map_err(|_| "RESOURCE_LIMIT")?;
+        stack.try_reserve_exact(1).map_err(|_| "RESOURCE_LIMIT")?;
+        if stack.capacity() > 1 {
+            return Err("RESOURCE_LIMIT");
+        }
         let index = index.into();
         if root.kind != Kind::Directory {
             return Err("NOT_DIRECTORY");
@@ -355,13 +400,14 @@ impl<S: ObservationSource> UsageScanner<S> {
             visited.insert(identity);
         }
         let root_open = usize::from(cursor.is_some());
+        stack.push(Frame {
+            id: root_id.clone(),
+            cursor,
+            aggregate,
+        });
         Ok(Self {
             source,
-            stack: vec![Frame {
-                id: root_id.clone(),
-                cursor,
-                aggregate,
-            }],
+            stack,
             visited,
             index,
             root_id,
@@ -371,11 +417,13 @@ impl<S: ObservationSource> UsageScanner<S> {
             cancellation,
             phase: ScanPhase::Running,
             shared_bytes: 0,
+            work_memory,
+            shared_memory,
             revision: 0,
             stats: ScanStats {
                 processed_directories: 1,
                 peak_open_directories: root_open,
-                peak_working_bytes: FRAME_BYTES + VISITED_BYTES,
+                peak_working_bytes: SCANNER_BASE_BYTES + frame_bytes + VISITED_BYTES,
                 ..ScanStats::default()
             },
             issues,
@@ -434,11 +482,57 @@ impl<S: ObservationSource> UsageScanner<S> {
                 .aggregate
                 .merge(frame.aggregate, &mut self.shared_bytes);
         } else {
+            drop(frame.aggregate);
             self.shared_bytes = 0;
             if self.phase != ScanPhase::Cancelled {
                 self.phase = ScanPhase::Completed;
             }
         }
+        self.shared_memory
+            .resize(self.shared_bytes)
+            .expect("released shared entries");
+    }
+    /// Grow before inserting into the frame vector/visited tree or opening a
+    /// cursor. Keep capacity reservations after pop until the scanner is dropped.
+    fn reserve_child(&mut self) -> bool {
+        let frame_bytes = FRAME_BYTES.max(std::mem::size_of::<Frame<S::Cursor>>() * 2);
+        let required = self.stack.len() + 1;
+        let capacity = self.stack.capacity().max(required);
+        let previous = self.work_memory.bytes();
+        let final_bytes = previous.max(
+            SCANNER_BASE_BYTES + capacity * frame_bytes + (self.visited.len() + 1) * VISITED_BYTES,
+        );
+        let growing = required > self.stack.capacity();
+        // A replacement keeps the old stack intact on allocation failure.
+        // Charge both buffers before allocating; release the old one before
+        // shrinking the reservation. Never grow a live Vec then try to pay for it.
+        let transient = if growing {
+            self.stack.capacity() * std::mem::size_of::<Frame<S::Cursor>>()
+        } else {
+            0
+        };
+        if self.work_memory.resize(final_bytes + transient).is_err() {
+            return false;
+        }
+        if growing {
+            let mut replacement = Vec::new();
+            if replacement.try_reserve_exact(required).is_err() || replacement.capacity() > required
+            {
+                drop(replacement);
+                self.work_memory
+                    .resize(previous)
+                    .expect("reservation rollback");
+                return false;
+            }
+            replacement.append(&mut self.stack);
+            let old = std::mem::replace(&mut self.stack, replacement);
+            drop(old);
+        }
+        self.stats.peak_working_bytes = self.stats.peak_working_bytes.max(final_bytes + transient);
+        self.work_memory
+            .resize(final_bytes)
+            .expect("released stack buffer");
+        true
     }
     fn stop_partial(&mut self, reason: Reason, observed_at: &str) {
         if reason == Reason::Cancelled {
@@ -506,6 +600,7 @@ impl<S: ObservationSource> UsageScanner<S> {
                     &observation,
                     &mut self.shared_bytes,
                     self.limits.hardlink_bytes,
+                    &mut self.shared_memory,
                 ) {
                     self.stop_partial(Reason::ResourceLimit, observed_at);
                     break;
@@ -543,7 +638,8 @@ impl<S: ObservationSource> UsageScanner<S> {
             let working =
                 (self.stack.len() + 1) * FRAME_BYTES + (self.visited.len() + 1) * VISITED_BYTES;
             let limited = self.stack.len() >= self.limits.max_open_directories
-                || working > self.limits.working_bytes;
+                || working > self.limits.working_bytes
+                || (!excluded && observation.identity.is_some() && !self.reserve_child());
             if excluded || limited || observation.identity.is_none() {
                 aggregate.reason(if excluded {
                     Reason::ExcludedByPolicy
@@ -945,6 +1041,160 @@ mod tests {
         );
         scan.run(STAMP);
         assert!(scan.source().opened.is_empty());
+    }
+    fn charged_scanner(
+        source: Source,
+        budgets: &ManagedBudgets,
+        name: &str,
+    ) -> UsageScanner<Source> {
+        UsageScanner::with_budgets(
+            source,
+            node(1, "root", Kind::Directory, 10, 20),
+            DirectoryIndex::new(name.into(), 1_000_000, 1_000_000),
+            ScanLimits::default(),
+            Cancellation::default(),
+            budgets,
+        )
+        .unwrap()
+    }
+    fn shared_source() -> Source {
+        let mut source = Source::default();
+        let mut shared = node(2, "shared", Kind::RegularFile, 100, 128);
+        shared.link_count = 2;
+        source.children.insert(1, vec![shared]);
+        source
+    }
+    #[test]
+    fn shared_pool_cannot_be_overbooked_by_scanners_and_recovers_after_owner_drop() {
+        let budgets = ManagedBudgets {
+            hardlinks: crate::runtime::memory::ByteBudget::new(SHARED_BYTES),
+            ..ManagedBudgets::default()
+        };
+        let mut first = charged_scanner(shared_source(), &budgets, "first");
+        first.step(1, STAMP);
+        assert_eq!(budgets.hardlinks.used(), SHARED_BYTES);
+        let mut second = charged_scanner(shared_source(), &budgets, "second");
+        second.run(STAMP);
+        let usage = second.index.usage(second.root_id()).unwrap().unwrap();
+        assert_eq!(bytes(&usage.logical), 10);
+        assert!(
+            matches!(usage.logical, Measure::Partial { reasons, .. } if reasons.contains(&Reason::ResourceLimit))
+        );
+        assert_eq!(budgets.hardlinks.used(), SHARED_BYTES);
+        drop(first);
+        assert_eq!(budgets.hardlinks.used(), 0);
+        let mut third = charged_scanner(shared_source(), &budgets, "third");
+        third.run(STAMP);
+        assert_eq!(
+            bytes(&third.index.usage(third.root_id()).unwrap().unwrap().logical),
+            110
+        );
+        assert_eq!(budgets.hardlinks.used(), 0);
+        assert!(budgets.work.used() > 0);
+        drop((second, third));
+        assert_eq!(budgets.work.used(), 0);
+    }
+    #[test]
+    fn work_pool_exhaustion_precedes_child_open_and_returns_observed_partial() {
+        let limit = SCANNER_BASE_BYTES + FRAME_BYTES + 2 * VISITED_BYTES;
+        let budgets = ManagedBudgets {
+            work: crate::runtime::memory::ByteBudget::new(limit),
+            ..ManagedBudgets::default()
+        };
+        let mut source = Source::default();
+        source
+            .children
+            .insert(1, vec![node(2, "child", Kind::Directory, 1, 1)]);
+        let mut scan = charged_scanner(source, &budgets, "bounded");
+        scan.run(STAMP);
+        assert_eq!(scan.source.opened, vec![1]);
+        let usage = scan.index.usage(scan.root_id()).unwrap().unwrap();
+        assert_eq!(bytes(&usage.logical), 11);
+        assert!(
+            matches!(usage.logical, Measure::Partial { reasons, .. } if reasons.contains(&Reason::ResourceLimit))
+        );
+        assert!(budgets.work.peak() <= limit);
+        drop(scan);
+        assert_eq!(budgets.work.used(), 0);
+    }
+    #[test]
+    fn stack_replacement_reserves_both_buffers_without_mutating_on_budget_failure() {
+        let final_bytes = SCANNER_BASE_BYTES + 2 * FRAME_BYTES + 2 * VISITED_BYTES;
+        let budgets = ManagedBudgets {
+            work: crate::runtime::memory::ByteBudget::new(
+                final_bytes + std::mem::size_of::<Frame<Cursor>>(),
+            ),
+            ..ManagedBudgets::default()
+        };
+        let mut scan = charged_scanner(Source::default(), &budgets, "stack-transaction");
+        let previous = scan.work_memory.bytes();
+        let blocker = budgets.work.reserve(1).unwrap();
+        assert!(!scan.reserve_child());
+        assert_eq!(scan.stack.capacity(), 1);
+        assert_eq!(scan.work_memory.bytes(), previous);
+        assert_eq!(budgets.work.used(), previous + 1);
+        drop(blocker);
+        assert!(scan.reserve_child());
+        assert_eq!(scan.stack.capacity(), 2);
+        assert_eq!(budgets.work.used(), final_bytes);
+        assert_eq!(budgets.work.peak(), budgets.work.limit());
+        drop(scan);
+        assert_eq!(budgets.work.used(), 0);
+    }
+    #[test]
+    fn missing_hardlink_identity_preserves_only_proven_unique_bytes() {
+        let mut source = shared_source();
+        let mut ambiguous = source.children[&1][0].clone();
+        ambiguous.raw_name = b"ambiguous-link".to_vec();
+        ambiguous.identity = None;
+        source.children.get_mut(&1).unwrap().push(ambiguous);
+        let mut scan = scanner(source, ScanLimits::default());
+        scan.run(STAMP);
+        let usage = scan.index.usage(scan.root_id()).unwrap().unwrap();
+        assert!(
+            matches!(usage.logical, Measure::Partial { observed_bytes, reasons }
+            if observed_bytes == 110_u64.into() && reasons == vec![Reason::Unsupported])
+        );
+    }
+    #[test]
+    fn scanner_charges_remain_live_while_the_owned_source_is_destroyed() {
+        struct CheckedSource {
+            source: Source,
+            budgets: ManagedBudgets,
+        }
+        impl ObservationSource for CheckedSource {
+            type Cursor = Cursor;
+            fn open(&mut self, root: &Observation) -> Result<Cursor, FsIssue> {
+                self.source.open(root)
+            }
+            fn next(&mut self, cursor: &mut Cursor) -> Result<Option<Observation>, FsIssue> {
+                self.source.next(cursor)
+            }
+        }
+        impl Drop for CheckedSource {
+            fn drop(&mut self) {
+                assert!(self.budgets.work.used() >= SCANNER_BASE_BYTES);
+                assert_eq!(self.budgets.hardlinks.used(), SHARED_BYTES);
+            }
+        }
+        let budgets = ManagedBudgets::default();
+        let source = CheckedSource {
+            source: shared_source(),
+            budgets: budgets.clone(),
+        };
+        let mut scan = UsageScanner::with_budgets(
+            source,
+            node(1, "root", Kind::Directory, 10, 20),
+            DirectoryIndex::new("drop".into(), 1_000_000, 1_000_000),
+            ScanLimits::default(),
+            Cancellation::default(),
+            &budgets,
+        )
+        .unwrap();
+        scan.step(1, STAMP);
+        drop(scan);
+        assert_eq!(budgets.work.used(), 0);
+        assert_eq!(budgets.hardlinks.used(), 0);
     }
     #[test]
     fn arithmetic_overflow_remains_explicit() {

@@ -37,6 +37,9 @@ export class ReplyInbox {
         this.used += bytes;
       }
     }
+    // Ack means this slot is settled, including a local resource/format error.
+    // It is not application success: read() propagates the recorded error after
+    // native completion. Returning false here would lose the specific error.
     return true;
   };
   read(key: string): string {

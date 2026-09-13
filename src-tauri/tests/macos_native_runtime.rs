@@ -802,3 +802,64 @@ fn abandoning_active_preparation_keeps_old_root_and_discards_late_candidate() {
     drop(runtime);
     until(|| resources.budgets.used() == 0);
 }
+
+#[test]
+fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
+    use directory_ui_viewer_lib::{
+        domain::model::Reason,
+        runtime::{events::DiscardEvents, memory::ByteBudget},
+    };
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new();
+    fs::write(fixture.p("root/first"), b"shared payload").unwrap();
+    fs::hard_link(fixture.p("root/first"), fixture.p("root/second")).unwrap();
+    let own = fs::symlink_metadata(fixture.p("root")).unwrap().size() as u128;
+    let shared = fs::symlink_metadata(fixture.p("root/first"))
+        .unwrap()
+        .size() as u128;
+    for limit in [0, 160] {
+        let resources = RuntimeResources {
+            scheduler: Arc::new(Scheduler::default()),
+            budgets: ManagedBudgets {
+                hardlinks: ByteBudget::new(limit),
+                ..ManagedBudgets::default()
+            },
+            clock: Arc::new(SystemClock::default()),
+            events: Arc::new(DiscardEvents),
+        };
+        let runtime = NativeRuntime::new(context(1), resources.clone()).unwrap();
+        let epoch = runtime.connect(&context(1), "budget").unwrap();
+        let root = choose(&runtime, epoch, &fixture.p("root"));
+        let current = scope(&root);
+        let baseline = resources.budgets.work.used();
+        let task = runtime.start_usage(&context(1), epoch, &current).unwrap();
+        until(|| {
+            runtime
+                .read_task(&context(1), epoch, &current, &task.task_id)
+                .unwrap()
+                .phase
+                .terminal()
+        });
+        let usage = runtime
+            .read_usage(&context(1), epoch, &current, &[root.root.entry_id])
+            .unwrap()
+            .remove(0);
+        if limit == 0 {
+            assert!(
+                matches!(usage.logical, Measure::Partial { observed_bytes, reasons } if observed_bytes == own.into() && reasons.contains(&Reason::ResourceLimit))
+            );
+        } else {
+            assert!(
+                matches!(usage.logical, Measure::Complete { bytes } if bytes == (own + shared).into())
+            );
+            assert_eq!(resources.budgets.hardlinks.peak(), 160);
+        }
+        assert!(resources.budgets.work.peak() >= baseline + 64 * 1024);
+        assert!(resources.budgets.hardlinks.peak() <= limit);
+        runtime
+            .close_session(&context(1), epoch, &current.session_id)
+            .unwrap();
+        drop(runtime);
+        until(|| resources.budgets.used() == 0);
+    }
+}

@@ -16,6 +16,7 @@ use crate::{
     runtime::{
         clock::Clock,
         events::{EventSink, TaskEvents},
+        memory::{ManagedBudgets, Reservation},
     },
     scheduler::{HandleBudget, Job, JobStep, Lane, Scheduler, Status, Ticket, Wait},
 };
@@ -42,6 +43,7 @@ struct State {
     ticket: Option<Ticket>,
     closed: bool,
     cancel_requested: bool,
+    _memory: Reservation,
 }
 pub struct UsageService {
     scope: Scope,
@@ -52,6 +54,7 @@ pub struct UsageService {
     sink: Arc<dyn EventSink>,
     state: Arc<Mutex<State>>,
     admission: Mutex<()>,
+    budgets: ManagedBudgets,
 }
 static NEXT_TASK: AtomicU64 = AtomicU64::new(1);
 fn issue(code: &str) -> FsIssue {
@@ -135,6 +138,29 @@ impl UsageService {
         clock: Arc<dyn Clock>,
         sink: Arc<dyn EventSink>,
     ) -> Result<Self, UsageError> {
+        Self::with_budgets(
+            scope,
+            root_id,
+            index,
+            scheduler,
+            clock,
+            sink,
+            ManagedBudgets::default(),
+        )
+    }
+    pub fn with_budgets(
+        scope: Scope,
+        root_id: String,
+        index: SharedDirectoryIndex,
+        scheduler: Arc<Scheduler>,
+        clock: Arc<dyn Clock>,
+        sink: Arc<dyn EventSink>,
+        budgets: ManagedBudgets,
+    ) -> Result<Self, UsageError> {
+        let memory = budgets
+            .work
+            .reserve(32 * 1024)
+            .map_err(|_| UsageError::ResourceLimit)?;
         if scope.session_id.is_empty()
             || scope.session_id.len() > 128
             || scope.generation == 0
@@ -165,12 +191,14 @@ impl UsageService {
             clock,
             sink,
             state: Arc::new(Mutex::new(State {
+                _memory: memory,
                 work: None,
                 ticket: None,
                 closed: false,
                 cancel_requested: false,
             })),
             admission: Mutex::new(()),
+            budgets,
         })
     }
     /// Source construction and root observation are supplied by the trusted
@@ -205,6 +233,11 @@ impl UsageService {
         {
             return Err(UsageError::InvalidArgument);
         }
+        let job_memory = self
+            .budgets
+            .work
+            .reserve(32 * 1024)
+            .map_err(|_| UsageError::ResourceLimit)?;
         let number = NEXT_TASK
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| UsageError::ResourceLimit)?;
@@ -232,6 +265,8 @@ impl UsageService {
             state.work = Some(work);
         }
         let job = UsageJob {
+            _memory: job_memory,
+            budgets: self.budgets.clone(),
             source: Some(source),
             root: Some(root),
             scanner: None,
@@ -417,6 +452,7 @@ impl Drop for UsageService {
     }
 }
 struct UsageJob<S: ObservationSource> {
+    budgets: ManagedBudgets,
     source: Option<S>,
     root: Option<Observation>,
     scanner: Option<UsageScanner<BudgetedSource<S>>>,
@@ -428,6 +464,7 @@ struct UsageJob<S: ObservationSource> {
     sink: Arc<dyn EventSink>,
     events: TaskEvents,
     failure: Option<FsIssue>,
+    _memory: Reservation,
 }
 impl<S: ObservationSource> UsageJob<S> {
     fn publish(&mut self, terminal: Option<Phase>) {
@@ -487,12 +524,13 @@ where
             return JobStep::Completed;
         }
         if self.scanner.is_none() {
-            match UsageScanner::new(
+            match UsageScanner::with_budgets(
                 BudgetedSource::new(self.source.take().unwrap(), handles.clone()),
                 self.root.take().unwrap(),
                 self.index.clone(),
                 self.limits.clone(),
                 cancel.clone(),
+                &self.budgets,
             ) {
                 Ok(scanner) => self.scanner = Some(scanner),
                 Err(code) => {
