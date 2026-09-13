@@ -94,6 +94,7 @@ export class FrontendBudget {
   private usedBytes = 0;
   private peakBytes = 0;
   private readonly tracked = new WeakMap<object, number>();
+  private readonly opaque = new WeakSet<object>();
   private readonly collector: Collector;
   constructor(
     readonly limit = FRONTEND_BYTES,
@@ -146,11 +147,39 @@ export class FrontendBudget {
   }
   /** Fixed manager/listener metadata only; variable collections are tracked separately. */
   retainLifetime(owner: object, bytes: number) {
-    if (this.tracked.has(owner)) throw new Error('INVALID_RESERVATION');
+    this.allocateLifetime(bytes, () => owner);
+  }
+  /** Preallocate opaque runtime owners (e.g. Promise/Map), whose variable
+   * children are separately charged by the caller. Never traverse their internals. */
+  allocateLifetime<T extends object>(bytes: number, factory: () => T): T {
     const memory = this.reserve(bytes);
-    this.collector.register(owner, bytes);
-    this.tracked.set(owner, bytes);
-    memory.transfer(bytes);
+    try {
+      const owner = factory();
+      if (this.tracked.has(owner)) throw new Error('INVALID_RESERVATION');
+      this.collector.register(owner, bytes);
+      this.tracked.set(owner, bytes);
+      this.opaque.add(owner);
+      memory.transfer(bytes);
+      return owner;
+    } finally {
+      memory.close();
+    }
+  }
+  hasReservation(owner: object): boolean {
+    return this.tracked.has(owner);
+  }
+  /** Mutable container capacity never shrinks on delete. Each growth charge
+   * remains attached to that actual container until it is garbage-collected. */
+  growLifetime(owner: object, bytes: number) {
+    if (!this.opaque.has(owner)) throw new Error('INVALID_RESERVATION');
+    const memory = this.reserve(bytes);
+    try {
+      this.collector.register(owner, bytes);
+      this.tracked.set(owner, this.tracked.get(owner)! + bytes);
+      memory.transfer(bytes);
+    } finally {
+      memory.close();
+    }
   }
   private track(value: unknown, memory: FrontendReservation, depth = 0) {
     if (value === null || typeof value !== 'object' || this.tracked.has(value))

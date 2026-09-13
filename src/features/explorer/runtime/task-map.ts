@@ -1,0 +1,76 @@
+import type { FrontendBudget } from './memory';
+
+type Value = number | boolean | Promise<unknown>;
+
+/** Private mutable metadata. Charge insertions before Map growth; keep all
+ * capacity/tombstone costs until the Map itself is collected. Delete/clear do
+ * not allocate and never release a retained container's cost prematurely. */
+export class TaskMap<T extends Value> {
+  private map?: Map<string, T>;
+  constructor(private readonly budget: FrontendBudget) {
+    budget.retainLifetime(this, 512);
+  }
+  get size() {
+    return this.map?.size ?? 0;
+  }
+  get(key: string) {
+    return this.map?.get(key);
+  }
+  has(key: string) {
+    return this.map?.has(key) ?? false;
+  }
+  delete(key: string) {
+    const map = this.map;
+    if (!map) return false;
+    const removed = map.delete(key);
+    if (map.size === 0) this.map = undefined;
+    return removed;
+  }
+  clear() {
+    this.map = undefined;
+  }
+  private prepare(key: string): Map<string, T> {
+    const map = (this.map ??= this.budget.allocateLifetime(
+      512,
+      () => new Map<string, T>(),
+    ));
+    try {
+      if (!map.has(key)) this.budget.growLifetime(map, 256 + key.length * 2);
+    } catch (error) {
+      if (map.size === 0) this.map = undefined;
+      throw error;
+    }
+    return map;
+  }
+  set(key: string, value: T) {
+    if (typeof value === 'object' && !this.budget.hasReservation(value))
+      throw new Error('INVALID_RESERVATION');
+    this.prepare(key).set(key, value);
+  }
+  run<R>(
+    this: TaskMap<Promise<R>>,
+    key: string,
+    start: () => Promise<R>,
+  ): Promise<R> {
+    const existing = this.get(key);
+    if (existing) return existing;
+    if (this.size >= 64) throw new Error('RESOURCE_LIMIT');
+    // Admission happens before starting the async operation. Its promise and
+    // captured ID retain their charge after a generation clears the table.
+    const map = this.prepare(key);
+    let pending!: Promise<R>;
+    try {
+      pending = this.budget.allocateLifetime(4096 + key.length * 2, () =>
+        start().finally(() => {
+          // An older completion must never remove the replacement generation's job.
+          if (this.get(key) === pending) this.delete(key);
+        }),
+      );
+    } catch (error) {
+      if (map.size === 0 && this.map === map) this.map = undefined;
+      throw error;
+    }
+    map.set(key, pending);
+    return pending;
+  }
+}

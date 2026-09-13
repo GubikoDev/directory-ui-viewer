@@ -13,6 +13,7 @@ try {
   // Compile only repository-owned modules into an ephemeral isolated ESM tree.
   for (const file of [
     'runtime/memory',
+    'runtime/task-map',
     'model/types',
     'model/store',
     'adapters/fixture',
@@ -39,6 +40,7 @@ try {
   const load = (file) => import(pathToFileURL(path.join(dir, `${file}.mjs`)));
   const { FrontendBudget } = await load('runtime/memory');
   const { ExplorerStore } = await load('model/store');
+  const { TaskMap } = await load('runtime/task-map');
   const { fixtureEntry } = await load('adapters/fixture');
   const budget = new FrontendBudget();
   const store = new ExplorerStore(budget);
@@ -84,6 +86,44 @@ try {
       whileRetained,
       afterRelease: budget.used,
       peak: budget.peak,
+    }),
+  );
+  const jobBudget = new FrontendBudget();
+  const jobs = new TaskMap(jobBudget);
+  const jobBaseline = jobBudget.used;
+  let finish;
+  let pending = jobs.run(
+    'job',
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  jobs.clear();
+  await settle();
+  const whilePending = jobBudget.used;
+  assert(whilePending >= jobBaseline + 4096 + 6);
+  finish();
+  await pending;
+  await settle();
+  const whilePromiseRetained = jobBudget.used;
+  assert(whilePromiseRetained >= jobBaseline + 4096 + 6);
+  pending = undefined;
+  finish = undefined;
+  for (let i = 0; i < 200 && jobBudget.used !== jobBaseline; i++) {
+    global.gc();
+    await setTimeout(10);
+  }
+  assert.equal(jobs.size, 0);
+  assert.equal(jobBudget.used, jobBaseline);
+  console.log(
+    JSON.stringify({
+      engine: 'Node V8; not WKWebView',
+      jobBaseline,
+      whilePending,
+      whilePromiseRetained,
+      afterPromiseRelease: jobBudget.used,
+      peak: jobBudget.peak,
     }),
   );
 } finally {

@@ -1,4 +1,5 @@
 import { ExplorerStore } from '../model/store';
+import { TaskMap } from '../runtime/task-map';
 import {
   sameScope,
   terminal,
@@ -43,18 +44,24 @@ export class SessionClient {
   private subscription?: () => void;
   private timer?: ReturnType<typeof setInterval>;
   private connection?: Promise<void>;
-  private recovery = new Map<string, Promise<void>>();
-  private pageReads = new Map<string, Promise<boolean>>();
-  private lastPage = new Map<string, number>();
-  private pageDemand = new Set<string>();
-  private lastEvent = new Map<string, number>();
+  private recovery: TaskMap<Promise<void>>;
+  private pageReads: TaskMap<Promise<boolean>>;
+  private lastPage: TaskMap<number>;
+  private pageDemand: TaskMap<boolean>;
+  private lastEvent: TaskMap<number>;
   private deferredErrors: Error[] = [];
   constructor(
     readonly adapter: FilesystemAdapter,
     readonly store = new ExplorerStore(),
     private readonly nonce: string = crypto.randomUUID(),
     private readonly now = () => Date.now(),
-  ) {}
+  ) {
+    this.recovery = new TaskMap(store.budget);
+    this.pageReads = new TaskMap(store.budget);
+    this.lastPage = new TaskMap(store.budget);
+    this.pageDemand = new TaskMap(store.budget);
+    this.lastEvent = new TaskMap(store.budget);
+  }
   get errors(): readonly Error[] {
     return this.deferredErrors;
   }
@@ -106,6 +113,8 @@ export class SessionClient {
     this.connection = undefined;
     this.epoch = null;
     this.currentScope = null;
+    this.recovery.clear();
+    this.pageReads.clear();
     this.store.reset(null);
     this.lastPage.clear();
     this.pageDemand.clear();
@@ -221,14 +230,26 @@ export class SessionClient {
     }
   }
   nextPage(taskId: string): Promise<boolean> {
-    this.pageDemand.add(taskId);
-    const existing = this.pageReads.get(taskId);
-    if (existing) return existing;
-    const promise = this.readPage(taskId).finally(() =>
-      this.pageReads.delete(taskId),
-    );
-    this.pageReads.set(taskId, promise);
-    return promise;
+    const state = this.store.getSnapshot();
+    const task = state.tasks.get(taskId);
+    if (!task || task.operation === 'scanUsage') return Promise.resolve(false);
+    let available = false;
+    for (const listing of state.listings.values()) {
+      if (
+        listing.taskId === taskId &&
+        listing.snapshot &&
+        listing.loadState === 'loading'
+      ) {
+        available = true;
+        break;
+      }
+    }
+    if (!available) {
+      this.pageDemand.delete(taskId);
+      return Promise.resolve(false);
+    }
+    this.pageDemand.set(taskId, true);
+    return this.pageReads.run(taskId, () => this.readPage(taskId));
   }
   private pageRequest(taskId: string) {
     const state = this.store.getSnapshot();
@@ -266,11 +287,7 @@ export class SessionClient {
     return applied;
   }
   private synchronize(taskId: string): Promise<void> {
-    const existing = this.recovery.get(taskId);
-    if (existing) return existing;
-    const work = this.sync(taskId).finally(() => this.recovery.delete(taskId));
-    this.recovery.set(taskId, work);
-    return work;
+    return this.recovery.run(taskId, () => this.sync(taskId));
   }
   private async sync(taskId: string) {
     const scope = this.store.getSnapshot().session;
@@ -348,7 +365,7 @@ export class SessionClient {
   private async pollOnce() {
     const scope = this.store.getSnapshot().session;
     const lifecycle = this.lifecycle;
-    if (!scope) return;
+    if (!scope || this.store.getSnapshot().resourceLimited) return;
     const ids = this.observationIds('pendingTasks');
     for (const taskId of ids) {
       if (
