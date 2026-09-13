@@ -5,6 +5,7 @@ use crate::domain::{
     model::{DirectoryUsage, FsIssue, Issues, Kind, Measure, Reason, ScanState},
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FileIdentity {
@@ -385,7 +386,11 @@ impl<S: ObservationSource> UsageScanner<S> {
         if self.phase != ScanPhase::Running {
             return self.phase;
         }
-        for _ in 0..items {
+        let quantum_started = Instant::now();
+        for iteration in 0..items {
+            if iteration > 0 && quantum_started.elapsed() >= Duration::from_millis(20) {
+                break;
+            }
             if self.cancellation.is_cancelled() {
                 self.stop_partial(Reason::Cancelled, observed_at);
                 break;
