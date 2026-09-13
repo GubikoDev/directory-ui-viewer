@@ -50,6 +50,13 @@ Validate the environment with `npm run build`, `npm test`, `npm run lint`,
 
 The application will ask the user to choose a root directory through the native picker. A future Rust boundary will canonicalize that path and expose only read-only directory metadata within the selected tree. Access will not bypass operating-system permissions, follow escaping symlinks, persist silently, or grant a static whole-disk scope.
 
+## Project Notes
+
+Open `project-notes/` as an Obsidian Vault. It is an independent local Git
+repository, excluded from this application repository. Commit documentation
+changes from inside that folder. Obsidian settings are untracked; no remote
+is configured. The Vault is not included when cloning the application.
+
 ## License
 
 [MIT](LICENSE)

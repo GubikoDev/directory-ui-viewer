@@ -22,8 +22,8 @@ test-results/
 .vscode/*
 !.vscode/extensions.json
 
-# Private Obsidian project Vault (never commit)
-.project-notes/
+# Independent Obsidian Vault repository (excluded from app Git)
+project-notes/
 
 # Personal Claude Code overrides
 CLAUDE.local.md

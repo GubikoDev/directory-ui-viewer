@@ -8,7 +8,7 @@ export default tseslint.config(
   {
     ignores: [
       '.claude/worktrees/**',
-      '.project-notes/**',
+      'project-notes/**',
       'dist',
       'playwright-report',
       'src-tauri/gen',

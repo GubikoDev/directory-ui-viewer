@@ -4,4 +4,4 @@ playwright-report
 src-tauri/gen
 src-tauri/target
 .claude/worktrees
-.project-notes
+project-notes
