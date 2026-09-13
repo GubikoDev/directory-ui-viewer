@@ -380,8 +380,8 @@ mod tests {
             phase: Phase::Queued,
             wait_reason: None,
             sequence: 0,
-            processed_entries: 0.into(),
-            processed_directories: 0.into(),
+            processed_entries: 0_u64.into(),
+            processed_directories: 0_u64.into(),
             observed_at: "2026-09-13T00:00:00Z".into(),
             issues: Issues::default(),
         }

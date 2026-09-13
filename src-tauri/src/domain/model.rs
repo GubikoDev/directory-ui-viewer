@@ -10,6 +10,11 @@ impl From<u64> for Bytes {
         Self(value.to_string())
     }
 }
+impl From<u128> for Bytes {
+    fn from(value: u128) -> Self {
+        Self(value.to_string())
+    }
+}
 impl<'de> Deserialize<'de> for Bytes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
@@ -24,7 +29,7 @@ impl<'de> Deserialize<'de> for Bytes {
 }
 macro_rules! wire_enum {
     ($name:ident { $($variant:ident),* $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(rename_all = "camelCase")]
         pub enum $name { $($variant),* }
     }
@@ -139,7 +144,36 @@ pub struct Issues {
     pub samples: Vec<FsIssue>,
 }
 impl Issues {
-    pub fn record(&mut self, issue: FsIssue) {
+    pub fn record(&mut self, mut issue: FsIssue) {
+        const CODES: &[&str] = &[
+            "INVALID_ARGUMENT",
+            "VERSION_UNSUPPORTED",
+            "PERMISSION_DENIED",
+            "NOT_FOUND",
+            "NOT_DIRECTORY",
+            "OUTSIDE_ROOT",
+            "LINK_TRAVERSAL_BLOCKED",
+            "ENTRY_CHANGED",
+            "SESSION_CLOSED",
+            "STALE_GENERATION",
+            "CURSOR_EXPIRED",
+            "TASK_EXPIRED",
+            "REQUEST_EXPIRED",
+            "ENTRY_EXPIRED",
+            "CLIENT_EXPIRED",
+            "RESOURCE_LIMIT",
+            "IO_ERROR",
+            "INTERNAL",
+        ];
+        if !CODES.contains(&issue.code.as_str()) {
+            issue.code = "IO_ERROR".into();
+        }
+        if issue.operation.len() > 64 {
+            issue.operation = "unknown".into();
+        }
+        if issue.entry_id.as_ref().is_some_and(|id| id.len() > 256) {
+            issue.entry_id = None;
+        }
         let prior = self
             .counts
             .get(&issue.code)
@@ -251,9 +285,25 @@ mod tests {
         }
         assert!(serde_json::from_str::<Bytes>("9007199254740993").is_err());
         assert_eq!(
-            serde_json::to_string(&Bytes::from(9007199254740993)).unwrap(),
+            serde_json::to_string(&Bytes::from(9007199254740993_u64)).unwrap(),
             "\"9007199254740993\""
         );
+    }
+    #[test]
+    fn unknown_error_codes_cannot_grow_the_count_map_without_bound() {
+        let mut issues = Issues::default();
+        for n in 0..10_000 {
+            issues.record(FsIssue {
+                code: format!("UNEXPECTED_{n}"),
+                operation: "read".into(),
+                scope: IssueScope::Entry,
+                entry_id: None,
+                native_code: Some(5),
+            });
+        }
+        assert_eq!(issues.counts.len(), 1);
+        assert_eq!(issues.counts["IO_ERROR"], Bytes::from(10_000_u64));
+        assert_eq!(issues.samples.len(), 32);
     }
     #[test]
     fn error_samples_are_bounded_without_losing_counts() {
@@ -268,6 +318,6 @@ mod tests {
             });
         }
         assert_eq!(issues.samples.len(), 32);
-        assert_eq!(issues.counts["PERMISSION_DENIED"], Bytes::from(10_000));
+        assert_eq!(issues.counts["PERMISSION_DENIED"], Bytes::from(10_000_u64));
     }
 }
