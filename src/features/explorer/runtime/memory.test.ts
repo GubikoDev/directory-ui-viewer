@@ -21,6 +21,23 @@ function harness(limit = 32 * 1024 * 1024) {
   };
 }
 describe('document-wide managed observation budget', () => {
+  it('keeps control reservations in the same counter and absolute ceiling', () => {
+    const budget = new FrontendBudget(100, undefined, 20);
+    const data = budget.reserve(80);
+    expect(() => budget.reserve(1)).toThrow('RESOURCE_LIMIT');
+    const control = budget.reserve(10, true);
+    control.resize(20);
+    expect(budget.used).toBe(100);
+    expect(budget.available).toBe(0);
+    expect(() => control.resize(21)).toThrow('RESOURCE_LIMIT');
+    data.resize(70);
+    expect(() => data.resize(71)).toThrow('RESOURCE_LIMIT');
+    control.close();
+    expect(budget.available).toBe(10);
+    data.close();
+    expect(budget.used).toBe(0);
+    expect(budget.peak).toBe(100);
+  });
   it('checks the entire new graph before transferring any reservation to finalizers', () => {
     const { budget } = harness();
     const value = { child: { name: 'owned' }, sibling: { count: 10 } };

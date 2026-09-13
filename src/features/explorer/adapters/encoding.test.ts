@@ -3,6 +3,19 @@ import { FrontendBudget } from '../runtime/memory';
 import { encodeWire } from './encoding';
 
 describe('bounded JSON wire encoding', () => {
+  it('rejects oversized control envelopes before allocating a buffer from headroom', () => {
+    const budget = new FrontendBudget(128 * 1024, undefined, 64 * 1024);
+    const pressure = budget.reserve(budget.available);
+    expect(() => encodeWire(() => 'x'.repeat(4095), budget, true)).toThrow(
+      'RESOURCE_LIMIT',
+    );
+    expect(budget.used).toBe(pressure.bytes);
+    expect(encodeWire(() => 'x'.repeat(4094), budget, true).byteLength).toBe(
+      4096,
+    );
+    expect(budget.used).toBe(pressure.bytes + 4096 + 1024);
+    pressure.close();
+  });
   it('admits buffer and view together before allocating either owner', () => {
     const records: object[] = [];
     const value = { id: 'owned' };

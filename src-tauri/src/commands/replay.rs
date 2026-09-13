@@ -161,6 +161,21 @@ impl ReplayService {
         now: u64,
         reply_allowance: usize,
     ) -> Result<RequestAdmission, ControlError> {
+        self.begin_with_priority(request, hash, now, reply_allowance, false)
+    }
+    pub(crate) fn begin_with_priority(
+        &self,
+        request: RequestNumber,
+        hash: &str,
+        now: u64,
+        reply_allowance: usize,
+        priority: bool,
+    ) -> Result<RequestAdmission, ControlError> {
+        let budget = if priority {
+            self.0.budget.control()
+        } else {
+            self.0.budget.clone()
+        };
         if request.epoch != self.0.epoch {
             return Err(ControlError::ClientExpired);
         }
@@ -176,9 +191,7 @@ impl ReplayService {
         }
         match state.ledger.lookup(request.sequence, hash, now)? {
             Some(existing) => {
-                let memory = self
-                    .0
-                    .budget
+                let memory = budget
                     .reserve(WAITER_BYTES)
                     .map_err(|_| ControlError::ResourceLimit)?;
                 let result = match existing {
@@ -203,9 +216,8 @@ impl ReplayService {
             None => (),
         }
         let (base, allocation) = loop {
-            let reserved = self.0.budget.reserve(CELL_BYTES).and_then(|base| {
-                self.0
-                    .budget
+            let reserved = budget.reserve(CELL_BYTES).and_then(|base| {
+                budget
                     .reserve(reply_allowance)
                     .map(|allocation| (base, allocation))
             });
@@ -216,7 +228,9 @@ impl ReplayService {
             }
         };
         assert!(matches!(
-            state.ledger.admit(request.sequence, hash, now)?,
+            state
+                .ledger
+                .admit_with_priority(request.sequence, hash, now, priority)?,
             Admission::New
         ));
         let (signal, _) = watch::channel(false);
@@ -357,6 +371,73 @@ impl Drop for Completion {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn general_pending_admission_exhausts_bytes_before_slots_and_leaves_control_room() {
+        let budget = ByteBudget::with_headroom(4 * 1024 * 1024, 1024 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 256, 1000).unwrap();
+        let mut owners = Vec::new();
+        let mut sequence = 1;
+        loop {
+            match service.begin(n(sequence), &hash(), 0, CONTROL_REPLY_BYTES) {
+                Ok(RequestAdmission::Execute(owner, _)) => owners.push(owner),
+                Err(ControlError::ResourceLimit) => break,
+                _ => panic!("unexpected admission"),
+            }
+            sequence += 1;
+        }
+        assert!(owners.len() > 1 && owners.len() < 254);
+        // No completed records exist to evict and every ordinary reply keeps
+        // its 32KiB minimum until completion. A close still obtains a slot.
+        let RequestAdmission::Execute(close, _) = service
+            .begin_with_priority(n(sequence), &hash(), 0, CONTROL_REPLY_BYTES, true)
+            .unwrap()
+        else {
+            panic!()
+        };
+        close.complete(json!({"status":"closed"})).unwrap();
+        assert!(budget.peak() <= budget.limit());
+        drop(owners);
+        drop(service);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn priority_admission_and_duplicates_work_under_general_pressure_and_remain_charged() {
+        let budget = ByteBudget::with_headroom(256 * 1024, 128 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 4, 1000).unwrap();
+        let pressure = budget.reserve(budget.available()).unwrap();
+        assert_eq!(
+            error(service.begin(n(1), &hash(), 0, CONTROL_REPLY_BYTES)),
+            ControlError::ResourceLimit
+        );
+        let RequestAdmission::Execute(owner, waiter) = service
+            .begin_with_priority(n(1), &hash(), 0, CONTROL_REPLY_BYTES, true)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let RequestAdmission::Wait(duplicate) = service
+            .begin_with_priority(n(1), &hash(), 0, CONTROL_REPLY_BYTES, true)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            error(service.begin_with_priority(n(1), &"b".repeat(64), 0, CONTROL_REPLY_BYTES, true)),
+            ControlError::InvalidArgument
+        );
+        let reply = owner.complete(json!({"status":"closed"})).unwrap();
+        let one = tauri::async_runtime::block_on(waiter.wait()).unwrap();
+        let two = tauri::async_runtime::block_on(duplicate.wait()).unwrap();
+        assert!(Arc::ptr_eq(&reply, &one));
+        assert!(Arc::ptr_eq(&reply, &two));
+        assert_eq!(budget.available(), 0);
+        assert!(budget.used() <= budget.limit());
+        drop(service);
+        drop(pressure);
+        assert!(budget.used() > 0);
+        drop((reply, one, two));
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn writer_uses_exact_growth_when_rounded_capacity_does_not_fit() {
         let budget = ByteBudget::new(700_000);

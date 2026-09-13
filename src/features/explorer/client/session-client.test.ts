@@ -20,6 +20,96 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('SessionClient with deterministic adapter', () => {
+  it('keeps two dispatch slots for cancel and close behind a full ordinary queue', async () => {
+    const { client, adapter, store } = setup();
+    await client.chooseRoot();
+    const task = [...store.getSnapshot().tasks.values()][0];
+    const ordinary = Array.from({ length: 62 }, () =>
+      client.list('B', 'directories'),
+    );
+    const overflow = client.list('B', 'directories');
+    const cancelled = client.cancel(task.taskId);
+    const closed = client.close();
+    const results = await Promise.allSettled([
+      ...ordinary,
+      overflow,
+      cancelled,
+      closed,
+    ]);
+    expect(results[62]).toMatchObject({
+      status: 'rejected',
+      reason: { message: 'RESOURCE_LIMIT' },
+    });
+    expect(results[63].status).toBe('fulfilled');
+    expect(results[64].status).toBe('fulfilled');
+    expect(adapter.calls.cancelTask).toBe(1);
+    expect(adapter.calls.closeSession).toBe(1);
+    expect(store.getSnapshot().session).toBeNull();
+  });
+  it('returns accepted cancellation without waiting for a recovery read', async () => {
+    const { client, adapter, store } = setup();
+    adapter.deferTasks = true;
+    adapter.dropEvents = true;
+    await client.chooseRoot();
+    const task = [...store.getSnapshot().tasks.values()][0];
+    const original = adapter.readTask.bind(adapter);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = vi
+      .spyOn(adapter, 'readTask')
+      .mockImplementation(async (request) => {
+        await gate;
+        return original(request);
+      });
+    await client.cancel(task.taskId);
+    expect(read).toHaveBeenCalledOnce();
+    expect(store.getSnapshot().tasks.get(task.taskId)?.phase).toBe('cancelled');
+    release();
+    await client.close();
+  });
+  it('accepts cancellation under data pressure and reports recovery failure separately', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter, store } = setup(new FixtureAdapter(), budget);
+    adapter.deferTasks = true;
+    adapter.dropEvents = true;
+    await client.chooseRoot();
+    const task = [...store.getSnapshot().tasks.values()][0];
+    const blocker = budget.reserve(budget.available);
+    try {
+      await expect(client.cancel(task.taskId)).resolves.toBeUndefined();
+      expect(adapter.calls.cancelTask).toBe(1);
+      expect(client.errors.at(-1)?.message).toBe('RESOURCE_LIMIT');
+    } finally {
+      blocker.close();
+    }
+  });
+  it('dispatches close while a cancellation response remains unresolved', async () => {
+    const { client, adapter, store } = setup();
+    adapter.deferTasks = true;
+    await client.chooseRoot();
+    const task = [...store.getSnapshot().tasks.values()][0];
+    const original = adapter.cancelTask.bind(adapter);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const cancel = vi
+      .spyOn(adapter, 'cancelTask')
+      .mockImplementation(async (request) => {
+        const response = await original(request);
+        await gate;
+        return response;
+      });
+    const pending = client.cancel(task.taskId);
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    await client.close();
+    expect(store.getSnapshot().session).toBeNull();
+    release();
+    await pending;
+    expect(store.getSnapshot().session).toBeNull();
+  });
   it('does not throw a synchronous recovery admission failure through an event producer', async () => {
     const budget = new FrontendBudget();
     const { client, adapter, store } = setup(new FixtureAdapter(), budget);
@@ -66,14 +156,14 @@ describe('SessionClient with deterministic adapter', () => {
     const results = await Promise.allSettled(requests);
     expect(
       results
-        .slice(0, 64)
+        .slice(0, 62)
         .every(
           (result) =>
             result.status === 'rejected' &&
             result.reason.message === 'CLIENT_EXPIRED',
         ),
     ).toBe(true);
-    expect(results[64]).toMatchObject({
+    expect(results[62]).toMatchObject({
       status: 'rejected',
       reason: { message: 'RESOURCE_LIMIT' },
     });

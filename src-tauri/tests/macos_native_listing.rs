@@ -286,7 +286,7 @@ fn wrong_index_and_work_budget_pressure_fail_without_fallback() {
     let reservation = setup
         .budgets
         .work
-        .reserve(setup.budgets.work.limit() - setup.budgets.work.used())
+        .reserve(setup.budgets.work.available())
         .unwrap();
     assert_eq!(
         source

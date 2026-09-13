@@ -12,6 +12,7 @@ export class ReplyInbox {
       error?: string;
       bytes: number;
       memory: FrontendReservation;
+      priority: boolean;
     }
   >();
   private used = 0;
@@ -19,6 +20,8 @@ export class ReplyInbox {
     private readonly maxBytes = 8 * 1024 * 1024,
     private readonly maxPending = 256,
     readonly budget: FrontendBudget = frontendBudget,
+    private readonly controlSlots = 0,
+    private readonly controlBytes = 0,
   ) {}
   get bytes() {
     return this.used;
@@ -26,12 +29,15 @@ export class ReplyInbox {
   get pending() {
     return this.slots.size;
   }
-  open(key: string) {
+  open(key: string, priority = false) {
     if (this.slots.has(key)) throw new Error('INVALID_ARGUMENT');
-    if (this.slots.size >= this.maxPending || this.used + 512 > this.maxBytes)
+    if (
+      this.slots.size >= this.maxPending - (priority ? 0 : this.controlSlots) ||
+      this.used + 512 > this.maxBytes - (priority ? 0 : this.controlBytes)
+    )
       throw new Error('RESOURCE_LIMIT');
-    const memory = this.budget.reserve(512);
-    this.slots.set(key, { bytes: 512, memory });
+    const memory = this.budget.reserve(512, priority);
+    this.slots.set(key, { bytes: 512, memory, priority });
     this.used += 512;
   }
   receive = (key: string, json: string): boolean => {
@@ -42,7 +48,11 @@ export class ReplyInbox {
       slot.error = 'INVALID_RESPONSE';
     } else {
       const bytes = json.length * 2;
-      if (this.used + bytes > this.maxBytes) slot.error = 'RESOURCE_LIMIT';
+      if (
+        this.used + bytes >
+        this.maxBytes - (slot.priority ? 0 : this.controlBytes)
+      )
+        slot.error = 'RESOURCE_LIMIT';
       else {
         try {
           slot.memory.resize(slot.bytes + bytes);
@@ -68,7 +78,7 @@ export class ReplyInbox {
   parse(key: string): unknown {
     // Parsed descendants keep individual reservations after their response slot
     // is closed; a store/snapshot may retain them longer than the outer reply.
-    return this.budget.parse(this.read(key));
+    return this.budget.parse(this.read(key), this.slots.get(key)?.priority);
   }
   close(key: string) {
     const slot = this.slots.get(key);
@@ -86,7 +96,7 @@ export function nativeInbox(
   const target = window as Window & {
     __DIRECTORY_RECEIVE__?: ReplyInbox['receive'];
   };
-  inbox ??= new ReplyInbox(8 * 1024 * 1024, 256, budget);
+  inbox ??= new ReplyInbox(8 * 1024 * 1024, 256, budget, 2, 64 * 1024);
   if (inbox.budget !== budget) throw new Error('INVALID_RESERVATION');
   if (!target.__DIRECTORY_RECEIVE__)
     Object.defineProperty(target, '__DIRECTORY_RECEIVE__', {

@@ -3,6 +3,19 @@ import { ReplyInbox } from './inbox';
 import { FrontendBudget, ownBytes } from '../runtime/memory';
 
 describe('native response inbox', () => {
+  it('keeps control slot and byte headroom without evicting ordinary waiters', () => {
+    const inbox = new ReplyInbox(2048, 3, new FrontendBudget(), 1, 1024);
+    inbox.open('one');
+    inbox.open('two');
+    expect(() => inbox.open('ordinary')).toThrow('RESOURCE_LIMIT');
+    inbox.open('control', true);
+    expect(inbox.receive('control', '{"closed":true}')).toBe(true);
+    expect(inbox.parse('control')).toEqual({ closed: true });
+    expect(inbox.pending).toBe(3);
+    expect(() => inbox.open('extra', true)).toThrow('RESOURCE_LIMIT');
+    for (const key of ['one', 'two', 'control']) inbox.close(key);
+    expect(inbox.bytes).toBe(0);
+  });
   it('shares admission across inboxes and retains parsed results after closing a slot', () => {
     let collect!: (bytes: number) => void;
     const records = new Map<object, number>();

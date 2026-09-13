@@ -6,11 +6,12 @@ use std::sync::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceLimit;
 #[derive(Clone)]
-pub struct ByteBudget(Arc<Counter>);
+pub struct ByteBudget(Arc<Counter>, bool);
 struct Counter {
     used: AtomicUsize,
     peak: AtomicUsize,
     limit: usize,
+    ordinary_limit: usize,
 }
 pub struct Reservation {
     budget: ByteBudget,
@@ -51,11 +52,33 @@ impl ByteBudget {
         Arc::ptr_eq(&self.0, &other.0)
     }
     pub fn new(limit: usize) -> Self {
-        Self(Arc::new(Counter {
-            used: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
-            limit,
-        }))
+        Self::with_headroom(limit, 0)
+    }
+    /// Both admission classes share one counter and one absolute limit.
+    pub fn with_headroom(limit: usize, headroom: usize) -> Self {
+        assert!(headroom <= limit);
+        Self(
+            Arc::new(Counter {
+                used: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                limit,
+                ordinary_limit: limit - headroom,
+            }),
+            false,
+        )
+    }
+    pub(crate) fn control(&self) -> Self {
+        Self(self.0.clone(), true)
+    }
+    fn ceiling(&self) -> usize {
+        if self.1 {
+            self.0.limit
+        } else {
+            self.0.ordinary_limit
+        }
+    }
+    pub fn available(&self) -> usize {
+        self.ceiling().saturating_sub(self.used())
     }
     pub fn limit(&self) -> usize {
         self.0.limit
@@ -88,7 +111,7 @@ impl Reservation {
                 .used
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(additional)
-                        .filter(|next| *next <= self.budget.0.limit)
+                        .filter(|next| *next <= self.budget.ceiling())
                 })
                 .map_err(|_| ResourceLimit)?;
             self.budget
@@ -126,7 +149,7 @@ impl Default for ManagedBudgets {
             foreground_index: ByteBudget::new(16 * MIB),
             listings: ByteBudget::new(48 * MIB),
             hardlinks: ByteBudget::new(12 * MIB),
-            work: ByteBudget::new(4 * MIB),
+            work: ByteBudget::with_headroom(4 * MIB, MIB),
         }
     }
 }
@@ -143,6 +166,26 @@ impl ManagedBudgets {
 mod tests {
     use super::*;
     use std::{sync::Barrier, thread};
+    #[test]
+    fn control_headroom_shares_ownership_and_never_increases_total_limit() {
+        let budget = ByteBudget::with_headroom(100, 20);
+        let priority = budget.control();
+        assert!(budget.same_pool(&priority));
+        let mut data = budget.reserve(80).unwrap();
+        assert!(budget.reserve(1).is_err());
+        let mut control = priority.reserve(10).unwrap();
+        control.resize(20).unwrap();
+        assert_eq!(budget.used(), 100);
+        assert_eq!(budget.peak(), 100);
+        assert_eq!(budget.available(), 0);
+        assert!(control.resize(21).is_err());
+        data.resize(70).unwrap();
+        assert!(data.resize(71).is_err());
+        drop(control);
+        assert_eq!(budget.available(), 10);
+        drop(data);
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn charged_result_keeps_its_cost_through_serialization_and_value_destruction() {
         struct Value(ByteBudget);

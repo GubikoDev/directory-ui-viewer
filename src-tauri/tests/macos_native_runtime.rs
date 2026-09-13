@@ -225,7 +225,7 @@ fn cancelled_failed_and_resource_limited_choices_preserve_existing_session() {
     let full = resources
         .budgets
         .work
-        .reserve(resources.budgets.work.limit() - resources.budgets.work.used())
+        .reserve(resources.budgets.work.available())
         .unwrap();
     assert_eq!(
         runtime
@@ -331,7 +331,7 @@ fn refresh_failure_keeps_new_generation_failed_and_retry_keeps_original_grant() 
     let full = resources
         .budgets
         .work
-        .reserve(resources.budgets.work.limit() - resources.budgets.work.used())
+        .reserve(resources.budgets.work.available())
         .unwrap();
     let failure = runtime.finish_refresh(ticket, Ok(prepared)).unwrap_err();
     assert_eq!(failure.error.code, "RESOURCE_LIMIT");
@@ -865,4 +865,62 @@ fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
         drop(runtime);
         until(|| resources.budgets.used() == 0);
     }
+}
+
+#[test]
+fn parked_native_task_cancels_and_session_closes_with_general_work_budget_full() {
+    let f = Fixture::new();
+    for i in 0..600 {
+        fs::write(f.p(&format!("root/pressure-{i:03}")), b"x").unwrap();
+    }
+    let (runtime, resources) = setup();
+    let epoch = runtime.connect(&context(1), "control-pressure").unwrap();
+    let root = choose(&runtime, epoch, &f.p("root"));
+    let current = scope(&root);
+    let (task, _) = runtime
+        .start_listing(
+            &context(1),
+            epoch,
+            &current,
+            &root.root.entry_id,
+            Category::Files,
+        )
+        .unwrap();
+    until(|| resources.scheduler.counts().2 == 1);
+    let pressure = resources
+        .budgets
+        .work
+        .reserve(resources.budgets.work.available())
+        .unwrap();
+    assert!(resources.budgets.work.reserve(1).is_err());
+    let (status, work) = runtime
+        .cancel_task(&context(1), epoch, &current, &task.task_id)
+        .unwrap();
+    assert_eq!(
+        status,
+        directory_ui_viewer_lib::scan::service::CancelStatus::Accepted
+    );
+    assert_eq!(work.phase, Phase::Cancelled);
+    until(|| resources.scheduler.handles().open() == 1);
+    let additional = resources
+        .budgets
+        .work
+        .reserve(resources.budgets.work.available())
+        .unwrap();
+    assert!(resources.budgets.work.reserve(1).is_err());
+    assert!(
+        runtime
+            .close_session(&context(1), epoch, &current.session_id)
+            .unwrap()
+    );
+    assert_eq!(
+        runtime
+            .read_task(&context(1), epoch, &current, &task.task_id)
+            .unwrap_err()
+            .code,
+        "SESSION_CLOSED"
+    );
+    until(|| resources.scheduler.handles().open() == 0);
+    drop((pressure, additional, runtime));
+    until(|| resources.budgets.used() == 0);
 }

@@ -12,7 +12,7 @@ use crate::{
     runtime::{
         clock::{Clock, SystemClock},
         events::EventSink,
-        memory::{ManagedBudgets, Reservation},
+        memory::{ByteBudget, ManagedBudgets, Reservation},
     },
     scan::service::CancelStatus,
     scheduler::Scheduler,
@@ -75,6 +75,43 @@ struct Envelope {
     response_key: String,
     request: Request,
 }
+/// Admission hint only: fields borrow input, but serde can use scratch for
+/// escaped keys/errors. Production calls hold Bridge's precharged hint workspace.
+/// The full strict parser and normal validation still precede every effect. Large or escaped
+/// hints cannot use the control reserve. No caller-supplied priority flag exists.
+fn control_request(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Hint<'a> {
+        #[serde(borrow)]
+        request: HintRequest<'a>,
+    }
+    #[derive(Deserialize)]
+    struct HintRequest<'a> {
+        #[serde(borrow)]
+        body: HintBody<'a>,
+    }
+    #[derive(Deserialize)]
+    struct HintBody<'a> {
+        operation: &'a str,
+    }
+    bytes.len() <= 4096
+        && serde_json::from_slice::<Hint<'_>>(bytes)
+            .is_ok_and(|hint| matches!(hint.request.body.operation, "cancelTask" | "closeSession"))
+}
+fn parse_bytes<T: for<'a> Deserialize<'a>>(
+    bytes: &[u8],
+    budget: &ByteBudget,
+) -> Result<(T, Reservation), FsIssue> {
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        return Err(issue("RESOURCE_LIMIT"));
+    }
+    // Input, serde-owned strings/container growth, and authentication future.
+    let memory = budget
+        .reserve(bytes.len() * 4 + 4096)
+        .map_err(|_| issue("RESOURCE_LIMIT"))?;
+    let input = serde_json::from_slice(bytes).map_err(|_| issue("INVALID_ARGUMENT"))?;
+    Ok((input, memory))
+}
 #[derive(Serialize)]
 #[serde(
     tag = "outcome",
@@ -127,6 +164,7 @@ impl EventSink for NativeEvents {
 pub struct Bridge {
     document: Mutex<Document>,
     dispatch: Mutex<()>,
+    hint_memory: Mutex<Reservation>,
     runtime: Arc<NativeRuntime>,
     budgets: ManagedBudgets,
     clock: Arc<dyn Clock>,
@@ -159,6 +197,14 @@ impl Bridge {
         Ok((
             Arc::new(Self {
                 dispatch: Mutex::new(()),
+                // One synchronous hint parser at a time, including escaped-key
+                // scratch, recursion and errors, even when data admission is full.
+                hint_memory: Mutex::new(
+                    budgets
+                        .work
+                        .reserve(32 * 1024)
+                        .map_err(|_| issue("RESOURCE_LIMIT"))?,
+                ),
                 document: Mutex::new(Document {
                     context,
                     replay: None,
@@ -196,6 +242,7 @@ impl Bridge {
         &self,
         window: &WebviewWindow,
         proof: &str,
+        budget: &ByteBudget,
     ) -> Result<NativeContext, FsIssue> {
         // Tauri async IPC runs off the main thread. Enforce that precondition:
         // after didCommitNavigation increments document, a proxy-queued eval
@@ -211,13 +258,12 @@ impl Bridge {
         if context.document == 0 {
             return Err(issue("CLIENT_EXPIRED"));
         }
-        let probe =
-            super::delivery::Delivery::proof_check(proof, &self.budgets.work).map_err(|error| {
-                issue(match error {
-                    super::delivery::DeliveryError::ResourceLimit => "RESOURCE_LIMIT",
-                    _ => "CLIENT_EXPIRED",
-                })
-            })?;
+        let probe = super::delivery::Delivery::proof_check(proof, budget).map_err(|error| {
+            issue(match error {
+                super::delivery::DeliveryError::ResourceLimit => "RESOURCE_LIMIT",
+                _ => "CLIENT_EXPIRED",
+            })
+        })?;
         let receipt = probe
             .submit(|script, callback| {
                 window
@@ -235,21 +281,16 @@ impl Bridge {
     fn parse<T: for<'a> Deserialize<'a>>(
         &self,
         raw: &tauri::ipc::Request<'_>,
+        budget: &ByteBudget,
     ) -> Result<(T, Reservation), FsIssue> {
         let InvokeBody::Raw(bytes) = raw.body() else {
             return Err(issue("INVALID_ARGUMENT"));
         };
-        if bytes.len() > MAX_MESSAGE_BYTES {
-            return Err(issue("RESOURCE_LIMIT"));
-        }
-        // Input, serde-owned strings/container growth, and authentication future.
-        let memory = self
-            .budgets
-            .work
-            .reserve(bytes.len() * 4 + 4096)
-            .map_err(|_| issue("RESOURCE_LIMIT"))?;
-        let input = serde_json::from_slice(bytes).map_err(|_| issue("INVALID_ARGUMENT"))?;
-        Ok((input, memory))
+        parse_bytes(bytes, budget)
+    }
+    fn control_request(&self, request: &tauri::ipc::Request<'_>) -> bool {
+        let _memory = self.hint_memory.lock().unwrap();
+        matches!(request.body(), InvokeBody::Raw(bytes) if control_request(bytes))
     }
     fn replay(&self, context: &NativeContext, epoch: u64) -> Result<Arc<ReplayService>, FsIssue> {
         let document = self.document.lock().unwrap();
@@ -271,14 +312,16 @@ pub async fn connect_client(
     state: tauri::State<'_, Arc<Bridge>>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<InvokeResponseBody, FsIssue> {
-    let (input, _memory): (Connect, _) = state.parse(&request)?;
+    let (input, _memory): (Connect, _) = state.parse(&request, &state.budgets.work)?;
     if input.protocol_version != 1 {
         return Err(issue("VERSION_UNSUPPORTED"));
     }
     if input.client_nonce.is_empty() || input.client_nonce.len() > 128 {
         return Err(issue("INVALID_ARGUMENT"));
     }
-    let context = state.authenticate(&window, &input.document_proof).await?;
+    let context = state
+        .authenticate(&window, &input.document_proof, &state.budgets.work)
+        .await?;
     let mut document = state.document.lock().unwrap();
     if document.context != context {
         return Err(issue("CLIENT_EXPIRED"));
@@ -303,12 +346,20 @@ pub async fn filesystem_request(
     state: tauri::State<'_, Arc<Bridge>>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<InvokeResponseBody, FsIssue> {
-    let (input, memory): (Envelope, _) = state.parse(&request)?;
+    let priority = state.control_request(&request);
+    let budget = if priority {
+        state.budgets.work.control()
+    } else {
+        state.budgets.work.clone()
+    };
+    let (input, memory): (Envelope, _) = state.parse(&request, &budget)?;
     if !super::delivery::valid_key(&input.response_key) {
         return Err(issue("INVALID_ARGUMENT"));
     }
     let number = input.request.validate()?;
-    let context = state.authenticate(&window, &input.document_proof).await?;
+    let context = state
+        .authenticate(&window, &input.document_proof, &budget)
+        .await?;
     let replay = state.replay(&context, number.epoch)?;
     let hash = replay::fingerprint(&input.request).map_err(control)?;
     let epoch = number.epoch;
@@ -317,11 +368,12 @@ pub async fn filesystem_request(
         // picker/worker waits outlive this lock; no filesystem call runs here.
         let _dispatch = state.dispatch.lock().unwrap();
         match replay
-            .begin(
+            .begin_with_priority(
                 number,
                 &hash,
                 state.clock.sample().monotonic_ms,
                 CONTROL_REPLY_BYTES,
+                priority,
             )
             .map_err(control)?
         {
@@ -346,7 +398,7 @@ pub async fn filesystem_request(
         &input.document_proof,
         &input.response_key,
         reply.bytes(),
-        &state.budgets.work,
+        &budget,
     )
     .map_err(|error| {
         issue(match error {
@@ -383,7 +435,15 @@ fn execute(
     let id = request.request_id;
     // Retain bounded control/root/WorkRecord temporaries through serialization.
     // Variable listing/usage clones carry an additional Charged owner themselves.
-    let response_memory = match bridge.budgets.work.reserve(64 * 1024) {
+    let budget = if matches!(
+        request.body,
+        Command::CancelTask { .. } | Command::CloseSession { .. }
+    ) {
+        bridge.budgets.work.control()
+    } else {
+        bridge.budgets.work.clone()
+    };
+    let response_memory = match budget.reserve(64 * 1024) {
         Ok(memory) => memory,
         Err(_) => {
             let _ = completion.complete(result::<()>(id, Err(issue("RESOURCE_LIMIT"))));
@@ -648,6 +708,93 @@ fn allowed_origin(url: &tauri::Url) -> bool {
 mod tests {
     use super::*;
     use crate::commands::protocol::RequestNumber;
+    #[test]
+    fn bounded_control_hint_never_bypasses_strict_validation() {
+        let budget = ByteBudget::with_headroom(128 * 1024, 64 * 1024);
+        let pressure = budget.reserve(budget.available()).unwrap();
+        for operation in ["cancelTask", "closeSession"] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "documentProof":"a".repeat(64), "responseKey":"b".repeat(32),
+                "request":{"protocolVersion":1,"requestId":"native-epoch-1:1","body":{"operation":operation,"sessionId":"s"}}
+            })).unwrap();
+            assert!(control_request(&bytes));
+            assert!(parse_bytes::<Envelope>(&bytes, &budget).is_err());
+            let parsed = parse_bytes::<Envelope>(&bytes, &budget.control());
+            // cancelTask is missing generation and taskId. Classification grants
+            // bounded parsing headroom, never schema or filesystem authority.
+            if operation == "cancelTask" {
+                assert!(parsed.is_err());
+            } else {
+                parsed.unwrap().0.request.validate().unwrap();
+            }
+        }
+        for bytes in [
+            br#"{"request":{"body":{"operation":"chooseRoot"}}}"#.as_slice(),
+            br#"{"priority":true,"request":{"body":{"operation":"readUsage"}}}"#.as_slice(),
+            br#"{"request":{"body":{"operation":"closeSession","operation":"chooseRoot"}}}"#.as_slice(),
+            br#"{"request":{"body":{"operation":"closeSession"}},"request":{"body":{"operation":"chooseRoot"}}}"#.as_slice(),
+        ] { assert!(!control_request(bytes)); }
+        let large = format!(
+            "{{\"request\":{{\"body\":{{\"operation\":\"closeSession\"}}}},\"padding\":\"{}\"}}",
+            "x".repeat(4096)
+        );
+        assert!(!control_request(large.as_bytes()));
+        assert_eq!(budget.used(), pressure.bytes());
+    }
+    #[test]
+    fn control_parse_auth_reply_and_delivery_share_headroom_under_pressure() {
+        use crate::commands::delivery::{Callback, Delivery};
+        let budget = ByteBudget::with_headroom(4 * 1024 * 1024, 1024 * 1024);
+        let replay = ReplayService::new(1, budget.clone(), 256, 1000).unwrap();
+        let pressure = budget.reserve(budget.available()).unwrap();
+        let bytes = br#"{"documentProof":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","responseKey":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","request":{"protocolVersion":1,"requestId":"native-epoch-1:1","body":{"operation":"closeSession","sessionId":"s"}}}"#;
+        assert!(control_request(bytes));
+        let control = budget.control();
+        let (input, input_memory) = parse_bytes::<Envelope>(bytes, &control).unwrap();
+        let number = input.request.validate().unwrap();
+        let proof = Delivery::proof_check(&input.document_proof, &control).unwrap();
+        let proof_receipt = proof
+            .submit(|_, callback| {
+                callback("true".into());
+                Ok(())
+            })
+            .unwrap();
+        tauri::async_runtime::block_on(proof_receipt.wait()).unwrap();
+        let hash = replay::fingerprint(&input.request).unwrap();
+        let RequestAdmission::Execute(owner, waiter) = replay
+            .begin_with_priority(number, &hash, 0, CONTROL_REPLY_BYTES, true)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let temporary = control.reserve(64 * 1024).unwrap();
+        owner.complete(serde_json::json!({"requestId":input.request.request_id,"outcome":"ok","data":{"status":"closed"}})).unwrap();
+        drop(temporary);
+        drop(input_memory);
+        let reply = tauri::async_runtime::block_on(waiter.wait()).unwrap();
+        let delivery = Delivery::prepare(
+            &input.document_proof,
+            &input.response_key,
+            reply.bytes(),
+            &control,
+        )
+        .unwrap();
+        let mut callback: Option<Callback> = None;
+        let receipt = delivery
+            .submit(|_, pending| {
+                callback = Some(pending);
+                Ok(())
+            })
+            .unwrap();
+        drop(receipt); // abandoned await must retain its native callback cost
+        drop(reply);
+        drop(replay);
+        drop(pressure);
+        assert!(budget.used() > 0);
+        callback.take().unwrap()("true".into());
+        assert_eq!(budget.used(), 0);
+        assert!(budget.peak() <= budget.limit());
+    }
     #[test]
     fn only_local_app_navigation_and_strict_envelopes_are_accepted() {
         assert!(allowed_origin(

@@ -142,9 +142,9 @@ export class SessionClient {
       generation: scope.generation,
     };
   }
-  private control<T>(fn: () => Promise<T>): Promise<T> {
+  private control<T>(fn: () => Promise<T>, priority = false): Promise<T> {
     // Bound dispatch closures even if callers enqueue before the next microtask.
-    if (this.queuedControls >= 64)
+    if (this.queuedControls >= (priority ? 64 : 62))
       return Promise.reject(new AdapterError('RESOURCE_LIMIT'));
     this.queuedControls++;
     const lifecycle = this.lifecycle;
@@ -386,12 +386,19 @@ export class SessionClient {
     const scope = this.store.getSnapshot().session;
     if (!scope) return;
     this.store.markCancelPending(taskId);
-    const result = await this.control(async () => {
+    const { request, pending } = await this.control(async () => {
       const request = { ...this.scoped(scope), taskId };
-      return unwrap(await this.adapter.cancelTask(request), request.requestId);
-    });
+      return { request, pending: this.adapter.cancelTask(request) };
+    }, true);
+    const result = unwrap(await pending, request.requestId);
     if (result) this.store.applyTask(result.work);
-    await this.synchronize(taskId);
+    try {
+      void this.synchronize(taskId).catch((error) => this.report(error));
+    } catch (error) {
+      // Native acceptance is authoritative. Observation recovery can fail under
+      // data pressure without turning an accepted cancellation into a failure.
+      this.report(error);
+    }
   }
   private rootScope(): Scope | null {
     const state = this.store.getSnapshot();
@@ -459,10 +466,11 @@ export class SessionClient {
     this.intent++;
     const scope = this.rootScope();
     if (!scope) return;
-    await this.control(async () => {
+    const { request, pending } = await this.control(async () => {
       const request = { ...this.request(), sessionId: scope.sessionId };
-      unwrap(await this.adapter.closeSession(request), request.requestId);
-    });
+      return { request, pending: this.adapter.closeSession(request) };
+    }, true);
+    unwrap(await pending, request.requestId);
     if (sameScope(this.rootScope(), scope)) {
       this.currentScope = null;
       this.store.reset(null);

@@ -39,17 +39,24 @@ function documentProof(): string {
 /** Native wire translation only. Paths and native contexts never enter this API. */
 export class NativeAdapter implements FilesystemAdapter {
   constructor(private readonly budget: FrontendBudget = frontendBudget) {}
-  private call<T>(command: string, make: () => unknown): Promise<T> {
-    const bytes = encodeWire(make, this.budget);
+  private call<T>(
+    command: string,
+    make: () => unknown,
+    priority = false,
+  ): Promise<T> {
+    const bytes = encodeWire(make, this.budget, priority);
     const length = bytes.byteLength;
     // Installed Tauri's postMessage fallback uses Array.from(Uint8Array) and
     // JSON.stringify. Cover numeric array slots, UTF-16 JSON and callback/fetch
     // metadata before invoke. Native/WebView process RSS is measured separately.
-    return this.budget.allocateLifetime(16 * 1024 + length * 96, () =>
-      invoke<T>(command, bytes).finally(() => {
-        // Keep the encoded view alive through completion, including fallback.
-        if (bytes.byteLength !== length) throw new Error('INVALID_RESPONSE');
-      }),
+    return this.budget.allocateLifetime(
+      16 * 1024 + length * 96,
+      () =>
+        invoke<T>(command, bytes).finally(() => {
+          // Keep the encoded view alive through completion, including fallback.
+          if (bytes.byteLength !== length) throw new Error('INVALID_RESPONSE');
+        }),
+      priority,
     );
   }
   async connectClient(
@@ -86,22 +93,27 @@ export class NativeAdapter implements FilesystemAdapter {
     input: Request,
   ): Promise<Response<T>> {
     const { protocolVersion, requestId, ...fields } = input;
+    const priority = operation === 'cancelTask' || operation === 'closeSession';
     let release: (() => void) | undefined;
     try {
       const document = documentProof();
       const inbox = nativeInbox(this.budget);
       const key = responseKey();
-      inbox.open(key);
+      inbox.open(key, priority);
       release = () => inbox.close(key);
-      await this.call('filesystem_request', () => ({
-        documentProof: document,
-        responseKey: key,
-        request: {
-          protocolVersion,
-          requestId,
-          body: { operation, ...fields },
-        },
-      }));
+      await this.call(
+        'filesystem_request',
+        () => ({
+          documentProof: document,
+          responseKey: key,
+          request: {
+            protocolVersion,
+            requestId,
+            body: { ...fields, operation },
+          },
+        }),
+        priority,
+      );
       return inbox.parse(key) as Response<T>;
     } catch (error) {
       const code = errorCode(error);

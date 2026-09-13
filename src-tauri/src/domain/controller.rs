@@ -135,6 +135,15 @@ impl<T: Clone> RequestLedger<T> {
         fingerprint: &str,
         now: u64,
     ) -> Result<Admission<T>, ControlError> {
+        self.admit_with_priority(number, fingerprint, now, false)
+    }
+    pub(crate) fn admit_with_priority(
+        &mut self,
+        number: u64,
+        fingerprint: &str,
+        now: u64,
+        priority: bool,
+    ) -> Result<Admission<T>, ControlError> {
         if let Some(existing) = self.lookup(number, fingerprint, now)? {
             return Ok(existing);
         }
@@ -143,8 +152,13 @@ impl<T: Clone> RequestLedger<T> {
                 return Err(ControlError::ResourceLimit);
             }
         }
+        let budget = if priority {
+            self.budget.control()
+        } else {
+            self.budget.clone()
+        };
         let memory = loop {
-            match self.budget.reserve(256 + fingerprint.len()) {
+            match budget.reserve(256 + fingerprint.len()) {
                 Ok(memory) => break memory,
                 Err(_) if self.evict_completed() => (),
                 Err(_) => return Err(ControlError::ResourceLimit),

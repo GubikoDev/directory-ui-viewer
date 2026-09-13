@@ -65,6 +65,7 @@ export class FrontendReservation {
   constructor(
     private readonly budget: FrontendBudget,
     bytes: number,
+    private readonly priority = false,
   ) {
     this.remaining = bytes;
   }
@@ -76,7 +77,8 @@ export class FrontendReservation {
   }
   resize(bytes: number) {
     validBytes(bytes);
-    if (bytes > this.remaining) this.budget.acquire(bytes - this.remaining);
+    if (bytes > this.remaining)
+      this.budget.acquire(bytes - this.remaining, this.priority);
     else this.budget.release(this.remaining - bytes);
     this.remaining = bytes;
   }
@@ -100,8 +102,11 @@ export class FrontendBudget {
     readonly limit = FRONTEND_BYTES,
     collector: CollectorFactory = (release) =>
       new FinalizationRegistry(release),
+    readonly controlHeadroom = 0,
   ) {
     validBytes(limit);
+    validBytes(controlHeadroom);
+    if (controlHeadroom > limit) throw new Error('INVALID_RESERVATION');
     this.collector = collector((bytes) => this.release(bytes));
   }
   get used() {
@@ -110,9 +115,13 @@ export class FrontendBudget {
   get peak() {
     return this.peakBytes;
   }
-  acquire(bytes: number) {
+  get available() {
+    return Math.max(0, this.limit - this.controlHeadroom - this.usedBytes);
+  }
+  acquire(bytes: number, priority = false) {
     validBytes(bytes);
-    if (bytes > this.limit - this.usedBytes) throw new Error('RESOURCE_LIMIT');
+    const ceiling = this.limit - (priority ? 0 : this.controlHeadroom);
+    if (bytes > ceiling - this.usedBytes) throw new Error('RESOURCE_LIMIT');
     this.usedBytes += bytes;
     this.peakBytes = Math.max(this.peakBytes, this.usedBytes);
   }
@@ -121,9 +130,9 @@ export class FrontendBudget {
     if (bytes > this.usedBytes) throw new Error('INVALID_RESERVATION');
     this.usedBytes -= bytes;
   }
-  reserve(bytes: number) {
-    this.acquire(bytes);
-    return new FrontendReservation(this, bytes);
+  reserve(bytes: number, priority = false) {
+    this.acquire(bytes, priority);
+    return new FrontendReservation(this, bytes, priority);
   }
   /** Pure sizing; shared new references can overcount but never undercount.
    * Cyclic/unreasonably deep inputs are rejected without a traversal allocation. */
@@ -151,8 +160,12 @@ export class FrontendBudget {
   }
   /** Preallocate opaque runtime owners (e.g. Promise/Map), whose variable
    * children are separately charged by the caller. Never traverse their internals. */
-  allocateLifetime<T extends object>(bytes: number, factory: () => T): T {
-    const memory = this.reserve(bytes);
+  allocateLifetime<T extends object>(
+    bytes: number,
+    factory: () => T,
+    priority = false,
+  ): T {
+    const memory = this.reserve(bytes, priority);
     try {
       const owner = factory();
       this.retainLifetimeFrom(owner, memory, bytes);
@@ -221,8 +234,8 @@ export class FrontendBudget {
   /** The caller must bound the factory's whole transient allocation, including
    * objects discarded by the factory. Registered owners retain their own cost
    * until collection, even after the surrounding state or request is replaced. */
-  allocate<T>(bytes: number, factory: () => T): T {
-    const memory = this.reserve(bytes);
+  allocate<T>(bytes: number, factory: () => T, priority = false): T {
+    const memory = this.reserve(bytes, priority);
     try {
       const value = factory();
       this.retain(value, memory);
@@ -231,7 +244,7 @@ export class FrontendBudget {
       memory.close();
     }
   }
-  parse(json: string): unknown {
+  parse(json: string, priority = false): unknown {
     // Count structural tokens outside strings before JSON.parse. String UTF-16
     // storage plus per-node/property/slot headroom bounds native wire objects.
     if (json.length > 1_048_576) throw new Error('RESOURCE_LIMIT');
@@ -254,14 +267,22 @@ export class FrontendBudget {
       } else if (char === '}' || char === ']') depth--;
       else if (char === ':' || char === ',') bytes += 512;
     }
-    return this.allocate(bytes, () => {
-      const value: unknown = JSON.parse(json);
-      if (value === null || typeof value !== 'object')
-        throw new Error('INVALID_RESPONSE');
-      return value;
-    });
+    return this.allocate(
+      bytes,
+      () => {
+        const value: unknown = JSON.parse(json);
+        if (value === null || typeof value !== 'object')
+          throw new Error('INVALID_RESPONSE');
+        return value;
+      },
+      priority,
+    );
   }
 }
 
 /** Exactly one pool for production store, client and adapter in this document. */
-export const frontendBudget = new FrontendBudget();
+export const frontendBudget = new FrontendBudget(
+  FRONTEND_BYTES,
+  undefined,
+  1024 * 1024,
+);

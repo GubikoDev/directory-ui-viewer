@@ -107,15 +107,19 @@ function visit(value: unknown, emit: Emit, depth = 0): void {
 export function encodeWire(
   make: () => unknown,
   budget: FrontendBudget,
+  priority = false,
 ): Uint8Array {
-  const scratch = budget.reserve(16 * 1024);
+  const scratch = budget.reserve(16 * 1024, priority);
   try {
     const value = make();
     let length = 0;
     visit(value, () => {
-      if (++length > MAX_BYTES) throw new Error('RESOURCE_LIMIT');
+      // Match native's small control-envelope admission bound before allocating
+      // a buffer. A malformed large control request cannot occupy its headroom.
+      if (++length > (priority ? 4096 : MAX_BYTES))
+        throw new Error('RESOURCE_LIMIT');
     });
-    const memory = budget.reserve(length + 1024);
+    const memory = budget.reserve(length + 1024, priority);
     try {
       const buffer = new ArrayBuffer(length);
       const bytes = new Uint8Array(buffer);

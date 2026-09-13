@@ -4,7 +4,7 @@ import { NativeAdapter } from './native';
 import { nativeInbox } from './inbox';
 import { nativeEvents } from './events';
 import wire from '../model/wire-fixture.json';
-import { FrontendBudget, ownBytes } from '../runtime/memory';
+import { frontendBudget, FrontendBudget, ownBytes } from '../runtime/memory';
 function deliverOnce(response: unknown) {
   vi.mocked(invoke).mockImplementationOnce(async (_command, args) => {
     const envelope = JSON.parse(new TextDecoder().decode(args as Uint8Array));
@@ -25,6 +25,50 @@ beforeEach(() => {
   });
 });
 describe('native wire boundary', () => {
+  it('dispatches cancel and close and parses replies while ordinary admission is full', async () => {
+    const adapter = new NativeAdapter();
+    const blocker = frontendBudget.reserve(frontendBudget.available);
+    const before = frontendBudget.used;
+    try {
+      expect(await adapter.chooseRoot(request)).toMatchObject({
+        error: { code: 'RESOURCE_LIMIT' },
+      });
+      expect(invoke).not.toHaveBeenCalled();
+      const cancelled = {
+        requestId: request.requestId,
+        outcome: 'ok',
+        data: { status: 'accepted', work: wire.work },
+      };
+      deliverOnce(cancelled);
+      expect(
+        await adapter.cancelTask({
+          ...request,
+          sessionId: 'fixture-session',
+          generation: 1,
+          taskId: 'scan-1',
+        }),
+      ).toEqual(cancelled);
+      const closed = {
+        requestId: request.requestId,
+        outcome: 'ok',
+        data: { status: 'closed' },
+      };
+      deliverOnce(closed);
+      expect(
+        await adapter.closeSession({
+          ...request,
+          sessionId: 'fixture-session',
+        }),
+      ).toEqual(closed);
+      expect(invoke).toHaveBeenCalledTimes(2);
+      expect(nativeInbox().pending).toBe(0);
+      expect(frontendBudget.used).toBeGreaterThan(before);
+      expect(frontendBudget.peak).toBeLessThanOrEqual(frontendBudget.limit);
+      expect(frontendBudget.available).toBe(0);
+    } finally {
+      blocker.close();
+    }
+  });
   it('does not split one document receiver across independent budgets', () => {
     nativeInbox();
     nativeEvents();
