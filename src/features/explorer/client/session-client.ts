@@ -34,6 +34,7 @@ export class SessionClient {
   private number = 0;
   private lifecycle = 0;
   private intent = 0;
+  private currentScope: Scope | null = null;
   private picker?: Promise<boolean>;
   private refreshing?: Promise<void>;
   private controlTail: Promise<unknown> = Promise.resolve();
@@ -54,6 +55,9 @@ export class SessionClient {
   ) {}
   get errors(): readonly Error[] {
     return this.deferredErrors;
+  }
+  get hasSession(): boolean {
+    return this.rootScope() !== null;
   }
   private report(error: unknown) {
     this.deferredErrors = [
@@ -99,6 +103,7 @@ export class SessionClient {
     clearInterval(this.timer);
     this.connection = undefined;
     this.epoch = null;
+    this.currentScope = null;
     this.store.reset(null);
     this.lastPage.clear();
     this.pageDemand.clear();
@@ -152,7 +157,13 @@ export class SessionClient {
     return true;
   }
   private async activate(root: RootData) {
-    this.store.reset(root);
+    this.currentScope = root.session;
+    if (!this.store.reset(root)) {
+      // Native has already accepted this scope. Keep its control identity even
+      // if the view cannot admit its observations; never operate on the old one.
+      this.store.reset(null);
+      throw new AdapterError('RESOURCE_LIMIT');
+    }
     this.lastPage.clear();
     this.pageDemand.clear();
     this.lastEvent.clear();
@@ -293,7 +304,9 @@ export class SessionClient {
   }
   private rootScope(): Scope | null {
     const state = this.store.getSnapshot();
-    return state.session ?? state.failedRoot?.scope ?? null;
+    return (
+      this.currentScope ?? state.session ?? state.failedRoot?.scope ?? null
+    );
   }
   refresh(): Promise<void> {
     if (this.refreshing) return this.refreshing;
@@ -337,11 +350,13 @@ export class SessionClient {
           advanced.generation !== scope.generation + 1
         )
           throw new AdapterError('INVALID_RESPONSE');
-        this.store.failRoot(advanced, {
+        this.currentScope = advanced;
+        const admitted = this.store.failRoot(advanced, {
           code: error.code,
           operation: 'refreshRoot',
           scope: 'root',
         });
+        if (!admitted) this.store.reset(null);
         this.lastPage.clear();
         this.pageDemand.clear();
         this.lastEvent.clear();
@@ -358,6 +373,7 @@ export class SessionClient {
       unwrap(await this.adapter.closeSession(request), request.requestId);
     });
     if (sameScope(this.rootScope(), scope)) {
+      this.currentScope = null;
       this.store.reset(null);
       this.lastPage.clear();
       this.pageDemand.clear();

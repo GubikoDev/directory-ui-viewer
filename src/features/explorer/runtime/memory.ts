@@ -71,6 +71,9 @@ export class FrontendReservation {
   get bytes() {
     return this.remaining;
   }
+  belongsTo(budget: FrontendBudget) {
+    return this.budget === budget;
+  }
   resize(bytes: number) {
     validBytes(bytes);
     if (bytes > this.remaining) this.budget.acquire(bytes - this.remaining);
@@ -134,6 +137,21 @@ export class FrontendBudget {
     validBytes(bytes);
     return bytes;
   }
+  retain<T>(value: T, memory: FrontendReservation): T {
+    if (!memory.belongsTo(this)) throw new Error('INVALID_RESERVATION');
+    if (this.untrackedBytes(value) > memory.bytes)
+      throw new Error('RESOURCE_LIMIT');
+    this.track(value, memory);
+    return value;
+  }
+  /** Fixed manager/listener metadata only; variable collections are tracked separately. */
+  retainLifetime(owner: object, bytes: number) {
+    if (this.tracked.has(owner)) throw new Error('INVALID_RESERVATION');
+    const memory = this.reserve(bytes);
+    this.collector.register(owner, bytes);
+    this.tracked.set(owner, bytes);
+    memory.transfer(bytes);
+  }
   private track(value: unknown, memory: FrontendReservation, depth = 0) {
     if (value === null || typeof value !== 'object' || this.tracked.has(value))
       return;
@@ -154,7 +172,7 @@ export class FrontendBudget {
   adopt<T>(value: T): T {
     const memory = this.reserve(this.untrackedBytes(value));
     try {
-      this.track(value, memory);
+      this.retain(value, memory);
       return value;
     } finally {
       memory.close();
@@ -167,7 +185,7 @@ export class FrontendBudget {
     const memory = this.reserve(bytes);
     try {
       const value = factory();
-      this.track(value, memory);
+      this.retain(value, memory);
       return value;
     } finally {
       memory.close();

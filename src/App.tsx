@@ -69,13 +69,13 @@ export function App({ client: provided }: { client?: SessionClient }) {
           폴더 선택
         </button>
         <button
-          disabled={!state.session && !state.failedRoot}
+          disabled={!client.hasSession}
           onClick={() => run(() => client.refresh())}
         >
           새로고침
         </button>
         <button
-          disabled={!state.session && !state.failedRoot}
+          disabled={!client.hasSession}
           onClick={() => run(() => client.close())}
         >
           연결 닫기

@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FixtureAdapter, fixtureEntry } from '../adapters/fixture';
 import { ExplorerStore } from '../model/store';
+import { FrontendBudget } from '../runtime/memory';
 import { SessionClient, unwrap } from './session-client';
 import type { Request, Response, RootData } from '../model/types';
 const clients: SessionClient[] = [];
-function setup(adapter = new FixtureAdapter()) {
+function setup(adapter = new FixtureAdapter(), budget?: FrontendBudget) {
   const client = new SessionClient(
     adapter,
-    new ExplorerStore(),
+    new ExplorerStore(budget),
     'test-document',
   );
   clients.push(client);
@@ -19,6 +20,35 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('SessionClient with deterministic adapter', () => {
+  it('keeps native control ownership when a chosen root cannot fit the view', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter, store } = setup(new FixtureAdapter(), budget);
+    const blocker = budget.reserve(budget.limit - budget.used);
+    await expect(client.chooseRoot()).rejects.toThrow('RESOURCE_LIMIT');
+    expect(client.hasSession).toBe(true);
+    expect(store.getSnapshot().session).toBeNull();
+    expect(adapter.calls.startUsageScan ?? 0).toBe(0);
+    expect(adapter.calls.startListing ?? 0).toBe(0);
+    await client.close();
+    expect(adapter.calls.closeSession).toBe(1);
+    expect(client.hasSession).toBe(false);
+    blocker.close();
+  });
+  it('retries the native advanced generation even when its failure view was rejected', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter, store } = setup(new FixtureAdapter(), budget);
+    await client.chooseRoot();
+    const blocker = budget.reserve(budget.limit - budget.used);
+    adapter.failNextRefresh = true;
+    await expect(client.refresh()).rejects.toThrow('IO_ERROR');
+    expect(store.getSnapshot().session).toBeNull();
+    expect(store.getSnapshot().failedRoot).toBeNull();
+    expect(client.hasSession).toBe(true);
+    blocker.close();
+    await client.refresh();
+    expect(store.getSnapshot().session?.generation).toBe(3);
+    expect(adapter.calls.startUsageScan).toBe(2);
+  });
   it('loads only requested direct entries, starts independent scan, and does not rescan on view switch', async () => {
     const { client, adapter, store } = setup();
     await client.chooseRoot();

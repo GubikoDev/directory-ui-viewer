@@ -21,6 +21,22 @@ function harness(limit = 32 * 1024 * 1024) {
   };
 }
 describe('document-wide managed observation budget', () => {
+  it('checks the entire new graph before transferring any reservation to finalizers', () => {
+    const { budget } = harness();
+    const value = { child: { name: 'owned' }, sibling: { count: 10 } };
+    const required = budget.untrackedBytes(value);
+    expect(() => budget.allocate(required - 1, () => value)).toThrow(
+      'RESOURCE_LIMIT',
+    );
+    expect(budget.used).toBe(0);
+    expect(budget.untrackedBytes(value)).toBe(required);
+    const other = new FrontendBudget();
+    const memory = other.reserve(required);
+    expect(() => budget.retain(value, memory)).toThrow('INVALID_RESERVATION');
+    expect(budget.used).toBe(0);
+    memory.close();
+    expect(other.used).toBe(0);
+  });
   it('rejects allocation before entering a factory and preserves existing reservations', () => {
     const budget = new FrontendBudget(1000);
     const held = budget.reserve(800);

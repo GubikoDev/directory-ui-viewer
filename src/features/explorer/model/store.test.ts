@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { fixtureEntry } from '../adapters/fixture';
 import { ExplorerStore } from './store';
+import { FrontendBudget } from '../runtime/memory';
 import {
   parseBytes,
   type DirectoryUsage,
@@ -210,13 +211,86 @@ describe('ExplorerStore observations', () => {
     expect(store.getSnapshot().expandedIds.has('A')).toBe(true);
   });
   it('signals memory pressure before adding an oversized page', () => {
-    const store = new ExplorerStore(1);
+    const budget = new FrontendBudget();
+    const store = new ExplorerStore(budget);
     store.reset(root);
     store.registerListing(page(), 1);
+    const before = store.getSnapshot();
+    const blocker = budget.reserve(budget.limit - budget.used);
     expect(store.applyPage(page({ entries: [fixtureEntry('B', 'A')] }))).toBe(
       false,
     );
     expect(store.getSnapshot().resourceLimited).toBe(true);
     expect(store.getSnapshot().entries.size).toBe(1);
+    expect(store.getSnapshot().entries).toBe(before.entries);
+    expect(store.getSnapshot().tasks).toBe(before.tasks);
+    expect(budget.used).toBe(budget.limit);
+    store.reset(null);
+    expect(store.getSnapshot().session).toBeNull();
+    expect(store.getSnapshot().entries.size).toBe(0);
+    // Closing cannot free old snapshots still held by React/a caller.
+    expect(budget.used).toBe(budget.limit);
+    blocker.close();
+  });
+  it('does not reserve retained issue payloads again when only a task-map slot changes', () => {
+    const budget = new FrontendBudget();
+    const store = new ExplorerStore(budget);
+    store.reset(root);
+    const first: WorkRecord = {
+      ...work,
+      issues: {
+        counts: { PERMISSION_DENIED: '32' },
+        samples: Array.from({ length: 32 }, () => ({
+          code: 'PERMISSION_DENIED',
+          operation: 'x'.repeat(64),
+          scope: 'entry',
+          entryId: 'e'.repeat(256),
+          nativeCode: 13,
+        })),
+      },
+    };
+    expect(store.applyTask(first)).toBe(true);
+    const next = budget.adopt({ ...first, sequence: 2 });
+    const blocker = budget.reserve(budget.limit - budget.used - 64 * 1024);
+    expect(store.applyTask(next)).toBe(true);
+    expect(store.getSnapshot().tasks.get('t')?.sequence).toBe(2);
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    blocker.close();
+  });
+  it('charges task and usage maps, preserves older snapshots and rejects both under shared pressure', () => {
+    const budget = new FrontendBudget();
+    const store = new ExplorerStore(budget);
+    store.reset(root);
+    const baseline = budget.used;
+    expect(store.applyTask(work)).toBe(true);
+    expect(budget.used).toBeGreaterThan(baseline);
+    const old = store.getSnapshot();
+    expect(store.applyTask({ ...work, sequence: 2 })).toBe(true);
+    expect(old.tasks.get('t')?.sequence).toBe(1);
+    expect(store.getSnapshot().tasks.get('t')?.sequence).toBe(2);
+    const beforeUsage = budget.used;
+    const usage: DirectoryUsage = {
+      directoryId: 'A',
+      usageRevision: 1,
+      scanState: 'settled',
+      logical: { state: 'complete', bytes: '123' },
+      allocated: { state: 'complete', bytes: '4096' },
+      observedAt: work.observedAt,
+    };
+    store.applyUsage(root.session, [usage]);
+    expect(budget.used).toBeGreaterThan(beforeUsage);
+    const before = store.getSnapshot();
+    const blocker = budget.reserve(budget.limit - budget.used);
+    store.applyUsage(root.session, [{ ...usage, usageRevision: 2 }]);
+    expect(store.getSnapshot().usages).toBe(before.usages);
+    expect(store.applyTask({ ...work, taskId: 'new', sequence: 3 })).toBe(
+      false,
+    );
+    expect(store.getSnapshot().tasks).toBe(before.tasks);
+    expect(store.getSnapshot().resourceLimited).toBe(true);
+    expect(budget.peak).toBe(budget.limit);
+    blocker.close();
+    expect(store.applyTask({ ...work, sequence: 3 })).toBe(true);
+    expect(old.tasks.get('t')?.sequence).toBe(1);
   });
 });

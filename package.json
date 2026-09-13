@@ -19,6 +19,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "test:gc": "node --expose-gc e2e/frontend-gc.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
