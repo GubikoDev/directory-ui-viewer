@@ -31,6 +31,7 @@ const HANDLE_BYTES: usize = 2048;
 #[derive(Debug)]
 pub enum BoundaryError {
     Native(io::Error),
+    EntryNative(io::Error),
     InvalidComponent,
     Revoked,
     ResourceLimit,
@@ -98,11 +99,11 @@ struct ParentTag;
 pub struct Directory {
     fd: OwnedFd,
     _permit: HandlePermit,
-    _memory: Reservation,
     grant: Arc<Grant>,
     mount: Mount,
     identity: Identity,
     tag: Arc<ParentTag>,
+    _memory: Reservation,
 }
 pub struct ApprovedRoot {
     directory: Directory,
@@ -207,6 +208,12 @@ impl Drop for ApprovedRoot {
     }
 }
 impl Directory {
+    pub fn work_budget(&self) -> &ByteBudget {
+        &self.grant.memory
+    }
+    pub fn handle_budget(&self) -> &HandleBudget {
+        &self.grant.handles
+    }
     pub fn identity(&self) -> Identity {
         self.identity
     }
@@ -292,7 +299,7 @@ impl Directory {
             .resize(HANDLE_BYTES + BUFFER_BYTES)
             .map_err(|_| BoundaryError::ResourceLimit)?;
         Ok(DirectoryCursor {
-            directory: self,
+            directory: Arc::new(self),
             buffer: Box::new([0; BUFFER_BYTES / 8]),
             offset: 0,
             remaining: 0,
@@ -302,13 +309,16 @@ impl Directory {
 }
 /// Exclusively owned cursor with a fixed aligned buffer. No libc DIR caches.
 pub struct DirectoryCursor {
-    directory: Directory,
     buffer: Box<[u64; BUFFER_BYTES / 8]>,
+    directory: Arc<Directory>,
     offset: usize,
     remaining: usize,
     ended: bool,
 }
 impl DirectoryCursor {
+    pub fn parent_handle(&self) -> Arc<Directory> {
+        self.directory.clone()
+    }
     pub fn directory(&self) -> &Directory {
         &self.directory
     }
@@ -362,7 +372,10 @@ impl DirectoryCursor {
                 Ok((length, name)) => {
                     self.offset += length;
                     self.remaining -= 1;
-                    let name = name?;
+                    let name = name.map_err(|e| match e {
+                        BoundaryError::Native(e) => BoundaryError::EntryNative(e),
+                        other => other,
+                    })?;
                     if name == b"." || name == b".." {
                         continue;
                     }

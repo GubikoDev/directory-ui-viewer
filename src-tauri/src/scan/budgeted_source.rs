@@ -12,7 +12,7 @@ pub struct BudgetedSource<S> {
 pub struct BudgetedCursor<C> {
     // Close the actual cursor before releasing its accounting permit.
     cursor: C,
-    _permit: HandlePermit,
+    _permit: Option<HandlePermit>,
 }
 impl<S> BudgetedSource<S> {
     pub fn new(source: S, handles: HandleBudget) -> Self {
@@ -24,14 +24,23 @@ impl<S> BudgetedSource<S> {
 }
 impl<S: ObservationSource> ObservationSource for BudgetedSource<S> {
     type Cursor = BudgetedCursor<S::Cursor>;
+    fn refresh_root(&mut self, root: &Observation) -> Result<Observation, FsIssue> {
+        self.check_pool()?;
+        self.source.refresh_root(root)
+    }
     fn open(&mut self, directory: &Observation) -> Result<Self::Cursor, FsIssue> {
-        let permit = self.handles.acquire().map_err(|_| FsIssue {
-            code: "RESOURCE_LIMIT".into(),
-            operation: "openDirectory".into(),
-            scope: IssueScope::Subtree,
-            entry_id: None,
-            native_code: None,
-        })?;
+        self.check_pool()?;
+        let permit = if self.source.handle_budget().is_some() {
+            None
+        } else {
+            Some(self.handles.acquire().map_err(|_| FsIssue {
+                code: "RESOURCE_LIMIT".into(),
+                operation: "openDirectory".into(),
+                scope: IssueScope::Subtree,
+                entry_id: None,
+                native_code: None,
+            })?)
+        };
         let cursor = self.source.open(directory)?;
         Ok(BudgetedCursor {
             cursor,
@@ -40,5 +49,24 @@ impl<S: ObservationSource> ObservationSource for BudgetedSource<S> {
     }
     fn next(&mut self, cursor: &mut Self::Cursor) -> Result<Option<Observation>, FsIssue> {
         self.source.next(&mut cursor.cursor)
+    }
+}
+
+impl<S: ObservationSource> BudgetedSource<S> {
+    fn check_pool(&self) -> Result<(), FsIssue> {
+        if self
+            .source
+            .handle_budget()
+            .is_some_and(|pool| !pool.same_pool(&self.handles))
+        {
+            return Err(FsIssue {
+                code: "INVALID_ARGUMENT".into(),
+                operation: "openDirectory".into(),
+                scope: IssueScope::Root,
+                entry_id: None,
+                native_code: None,
+            });
+        }
+        Ok(())
     }
 }

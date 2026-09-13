@@ -126,6 +126,9 @@ pub struct HandlePermit {
     inner: Arc<HandleCount>,
 }
 impl HandleBudget {
+    pub fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
     pub fn new(limit: usize) -> Self {
         Self {
             inner: Arc::new(HandleCount {

@@ -17,6 +17,9 @@ pub struct Reservation {
     bytes: usize,
 }
 impl ByteBudget {
+    pub fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub fn new(limit: usize) -> Self {
         Self(Arc::new(Counter {
             used: AtomicUsize::new(0),

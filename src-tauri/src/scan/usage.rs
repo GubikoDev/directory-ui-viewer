@@ -2,7 +2,7 @@
 use crate::domain::{
     controller::Cancellation,
     index::{DirectoryKey, Origin, SharedDirectoryIndex},
-    model::{DirectoryUsage, FsIssue, Issues, Kind, Measure, Reason, ScanState},
+    model::{DirectoryUsage, FsIssue, IssueScope, Issues, Kind, Measure, Reason, ScanState},
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -31,14 +31,25 @@ pub struct Observation {
     pub allocated: Metric,
 }
 fn source_error_reason(issue: &FsIssue) -> Reason {
-    if issue.code == "RESOURCE_LIMIT" {
-        Reason::ResourceLimit
-    } else {
-        Reason::ReadError
+    match issue.code.as_str() {
+        "RESOURCE_LIMIT" => Reason::ResourceLimit,
+        "OUTSIDE_ROOT" | "LINK_TRAVERSAL_BLOCKED" => Reason::ExcludedByPolicy,
+        "ENTRY_CHANGED" => Reason::ChangedDuringScan,
+        _ => Reason::ReadError,
     }
 }
 pub trait ObservationSource {
     type Cursor;
+    /// Native capability sources account every handle themselves, including
+    /// retained parents and validation opens. Wrappers verify the same pool.
+    fn handle_budget(&self) -> Option<&crate::scheduler::HandleBudget> {
+        None
+    }
+    /// Runs on the scanner worker, never on the control thread. Fixture sources
+    /// can retain their supplied observation; native sources resample the root.
+    fn refresh_root(&mut self, root: &Observation) -> Result<Observation, FsIssue> {
+        Ok(root.clone())
+    }
     fn open(&mut self, directory: &Observation) -> Result<Self::Cursor, FsIssue>;
     fn next(&mut self, cursor: &mut Self::Cursor) -> Result<Option<Observation>, FsIssue>;
 }
@@ -261,7 +272,7 @@ pub struct UsageScanner<S: ObservationSource> {
 impl<S: ObservationSource> UsageScanner<S> {
     pub fn new(
         mut source: S,
-        root: Observation,
+        mut root: Observation,
         index: impl Into<SharedDirectoryIndex>,
         limits: ScanLimits,
         cancellation: Cancellation,
@@ -292,7 +303,25 @@ impl<S: ObservationSource> UsageScanner<S> {
             aggregate.reason(Reason::ResourceLimit);
             None
         } else {
-            let opened = source.open(&root);
+            let opened = match source.refresh_root(&root) {
+                Ok(fresh) if !cancellation.is_cancelled() => {
+                    if fresh.kind != Kind::Directory || fresh.raw_name != root.raw_name {
+                        return Err("INVALID_ARGUMENT");
+                    }
+                    root = fresh;
+                    aggregate = Aggregate::default();
+                    aggregate.add_own(&root);
+                    source.open(&root)
+                }
+                Ok(_) => Err(FsIssue {
+                    code: "SESSION_CLOSED".into(),
+                    operation: "scan".into(),
+                    scope: IssueScope::Root,
+                    entry_id: None,
+                    native_code: None,
+                }),
+                Err(issue) => Err(issue),
+            };
             if cancellation.is_cancelled() {
                 aggregate.reason(Reason::Cancelled);
                 None
@@ -447,10 +476,13 @@ impl<S: ObservationSource> UsageScanner<S> {
                 }
                 Err(issue) => {
                     let reason = source_error_reason(&issue);
+                    let entry_only = issue.scope == IssueScope::Entry;
                     self.issues.record(issue);
                     let frame = self.stack.last_mut().unwrap();
                     frame.aggregate.reason(reason);
-                    frame.cursor = None;
+                    if !entry_only {
+                        frame.cursor = None;
+                    }
                     continue;
                 }
             };
@@ -515,7 +547,21 @@ impl<S: ObservationSource> UsageScanner<S> {
                 continue;
             }
             self.visited.insert(observation.identity.unwrap());
-            let cursor = match self.source.open(&observation) {
+            let opened = self.source.open(&observation);
+            if self.cancellation.is_cancelled() {
+                // The entry observation preceded cancellation, but the result
+                // of this open did not. Preserve observed bytes, discard late
+                // errors/handles, and settle the new child's partial summary.
+                drop(opened);
+                self.stack.push(Frame {
+                    id,
+                    cursor: None,
+                    aggregate,
+                });
+                self.stop_partial(Reason::Cancelled, observed_at);
+                break;
+            }
+            let cursor = match opened {
                 Ok(cursor) => Some(cursor),
                 Err(issue) => {
                     aggregate.reason(source_error_reason(&issue));
@@ -912,5 +958,93 @@ mod tests {
         );
         scan.run(STAMP);
         assert_eq!(complete(&scan, scan.root_id()).0, u64::MAX as u128 * 2 + 10);
+    }
+    #[test]
+    fn entry_error_preserves_later_siblings_but_marks_parent_partial() {
+        struct EntryErrorSource(u8);
+        impl ObservationSource for EntryErrorSource {
+            type Cursor = ();
+            fn open(&mut self, _: &Observation) -> Result<(), FsIssue> {
+                Ok(())
+            }
+            fn next(&mut self, _: &mut ()) -> Result<Option<Observation>, FsIssue> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Err(FsIssue {
+                        code: "NOT_FOUND".into(),
+                        operation: "metadata".into(),
+                        scope: IssueScope::Entry,
+                        entry_id: None,
+                        native_code: Some(2),
+                    }),
+                    2 => Ok(Some(node(2, "healthy", Kind::RegularFile, 42, 4096))),
+                    _ => Ok(None),
+                }
+            }
+        }
+        let mut scan = UsageScanner::new(
+            EntryErrorSource(0),
+            node(1, "", Kind::Directory, 1, 1),
+            DirectoryIndex::new("entry".into(), 100_000, 100_000),
+            ScanLimits::default(),
+            Cancellation::default(),
+        )
+        .unwrap();
+        scan.run(STAMP);
+        assert_eq!(scan.stats.processed_entries, 1);
+        let usage = scan.index.usage(scan.root_id()).unwrap().unwrap();
+        assert!(
+            matches!(usage.logical,Measure::Partial{observed_bytes,reasons} if observed_bytes == 43u64.into() && reasons.contains(&Reason::ReadError))
+        );
+        assert_eq!(scan.issues.samples[0].native_code, Some(2));
+    }
+    #[test]
+    fn late_child_open_error_is_discarded_after_cancel() {
+        struct LateChild {
+            cancellation: Cancellation,
+            emitted: bool,
+        }
+        impl ObservationSource for LateChild {
+            type Cursor = ();
+            fn open(&mut self, observation: &Observation) -> Result<(), FsIssue> {
+                if observation.node == 2 {
+                    self.cancellation.cancel();
+                    return Err(FsIssue {
+                        code: "PERMISSION_DENIED".into(),
+                        operation: "open".into(),
+                        scope: IssueScope::Subtree,
+                        entry_id: None,
+                        native_code: Some(13),
+                    });
+                }
+                Ok(())
+            }
+            fn next(&mut self, _: &mut ()) -> Result<Option<Observation>, FsIssue> {
+                if self.emitted {
+                    Ok(None)
+                } else {
+                    self.emitted = true;
+                    Ok(Some(node(2, "child", Kind::Directory, 5, 5)))
+                }
+            }
+        }
+        let cancellation = Cancellation::default();
+        let mut scan = UsageScanner::new(
+            LateChild {
+                cancellation: cancellation.clone(),
+                emitted: false,
+            },
+            node(1, "", Kind::Directory, 1, 1),
+            DirectoryIndex::new("late".into(), 100_000, 100_000),
+            ScanLimits::default(),
+            cancellation,
+        )
+        .unwrap();
+        assert_eq!(scan.run(STAMP), ScanPhase::Cancelled);
+        assert!(scan.issues.samples.is_empty());
+        let usage = scan.index.usage(scan.root_id()).unwrap().unwrap();
+        assert!(
+            matches!(usage.logical,Measure::Partial{observed_bytes,reasons} if observed_bytes == 6u64.into() && reasons==vec![Reason::Cancelled])
+        );
     }
 }

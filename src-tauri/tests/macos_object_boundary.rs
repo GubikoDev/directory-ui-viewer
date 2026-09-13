@@ -296,7 +296,7 @@ fn s03_actual_disk_image_mount_is_not_traversed_without_separate_approval() {
     let mounted = Mounted(Some(f));
     let f = mounted.0.as_ref().unwrap();
     fs::write(f.p("root/mounted/inside-mount"), b"").unwrap();
-    let root = f.approve();
+    let root = std::sync::Arc::new(f.approve());
     let observed = root.directory().observe(b"mounted").unwrap();
     assert!(matches!(
         root.directory().open_observed(&observed),
@@ -309,6 +309,34 @@ fn s03_actual_disk_image_mount_is_not_traversed_without_separate_approval() {
     )
     .unwrap();
     assert!(names(separate.directory()).contains(&b"inside-mount".to_vec()));
+    // The actual production scan source must propagate the same mount boundary
+    // into partial aggregates, without traversing the mounted contents.
+    use directory_ui_viewer_lib::{
+        domain::{
+            controller::Cancellation,
+            index::DirectoryIndex,
+            model::{Measure, Reason},
+        },
+        platform::macos_usage::NativeUsageSource,
+        scan::usage::{ScanLimits, UsageScanner},
+    };
+    let source = NativeUsageSource::new(root.clone(), root.directory().work_budget()).unwrap();
+    let mut scan = UsageScanner::new(
+        source,
+        NativeUsageSource::root_request(),
+        DirectoryIndex::new("mount-scan".into(), 1024 * 1024, 1024 * 1024),
+        ScanLimits::default(),
+        Cancellation::default(),
+    )
+    .unwrap();
+    scan.run("2026-09-14T00:00:00Z");
+    let result = scan.index.usage(scan.root_id()).unwrap().unwrap();
+    assert!(
+        matches!(result.logical,Measure::Partial{reasons,..} if reasons==vec![Reason::ExcludedByPolicy])
+    );
+    assert_eq!(scan.stats.processed_directories, 2);
+    assert_eq!(scan.issues.samples[0].code, "OUTSIDE_ROOT");
+    drop(scan);
     drop(separate);
     drop(root);
     drop(mounted);
