@@ -2,7 +2,7 @@
 use super::protocol::MAX_MESSAGE_BYTES;
 use crate::runtime::memory::{ByteBudget, Reservation};
 use std::{
-    io::{self, Write},
+    io::Write,
     sync::{Arc, Mutex},
 };
 use tokio::sync::oneshot;
@@ -41,19 +41,9 @@ impl Delivery {
         let json = std::str::from_utf8(json).map_err(|_| DeliveryError::InvalidArgument)?;
         // JSON string escaping can double already-serialized JSON. Count first,
         // without creating an uncharged second payload. Includes non-ASCII UTF-8.
-        struct Count(usize);
-        impl Write for Count {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0 += bytes.len();
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut count = Count(0);
-        serde_json::to_writer(&mut count, json).map_err(|_| DeliveryError::InvalidArgument)?;
-        let capacity = count.0 + 512;
+        let capacity = crate::runtime::serialization::json_bytes(json)
+            .map_err(|_| DeliveryError::InvalidArgument)?
+            + 512;
         // Rust script plus UTF-16 NSString copy and conservative native handoff
         // headroom. Framework/WebView process RSS is measured separately.
         let memory = budget

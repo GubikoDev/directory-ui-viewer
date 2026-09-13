@@ -2,6 +2,7 @@
 use super::controller::Scope;
 use super::model::{Capacity, CapacityState, DirectoryUsage, Entry, Kind};
 use crate::runtime::memory::{ByteBudget, Reservation};
+use crate::runtime::serialization::json_bytes;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -42,8 +43,8 @@ struct Record {
 /// charged separately to the foreground reservation, including UTF-8 storage.
 const SUMMARY_BYTES: usize = 2048;
 fn entry_cost(entry: &Entry) -> usize {
-    serde_json::to_vec(entry).map_or(usize::MAX, |v| {
-        v.len()
+    json_bytes(entry).map_or(usize::MAX, |bytes| {
+        bytes
             .saturating_mul(2)
             .saturating_add(std::mem::size_of::<Entry>() * 2 + 256)
     })
@@ -226,7 +227,7 @@ impl DirectoryIndex {
     pub fn set_usage(&mut self, usage: DirectoryUsage) -> Result<bool, IndexError> {
         // All summary fields are bounded by protocol enums plus a decimal u128.
         // Reject unexpected oversized data instead of hiding it outside accounting.
-        if serde_json::to_vec(&usage).map_or(true, |v| v.len() > SUMMARY_BYTES / 2) {
+        if json_bytes(&usage).map_or(true, |bytes| bytes > SUMMARY_BYTES / 2) {
             return Err(IndexError::ResourceLimit);
         }
         let record = self

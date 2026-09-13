@@ -4,6 +4,7 @@ use crate::domain::model::{
     Category, Coverage, Entry, FsIssue, IssueScope, ListingPage, Phase, WorkRecord,
 };
 use crate::runtime::memory::{ByteBudget, Reservation};
+use crate::runtime::serialization::json_bytes;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,8 +40,8 @@ struct Snapshot {
 /// Budget estimates deliberately overcount serialization, container storage, and
 /// spare allocation capacity. They are managed-data budgets, not process RSS.
 fn estimate<T: serde::Serialize>(value: &T) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |json| {
-        json.len()
+    json_bytes(value).map_or(usize::MAX, |bytes| {
+        bytes
             .saturating_mul(2)
             .saturating_add(std::mem::size_of::<T>() * 2 + 256)
     })
@@ -340,9 +341,8 @@ impl ListingCache {
             128 + 32 * 2048
         };
         // IPC limit includes every envelope field, not only the entry array.
-        while serde_json::to_vec(&page)
+        while json_bytes(&page)
             .map_err(|_| CacheError::InvalidArgument)?
-            .len()
             .saturating_add(growth_reserve)
             > self.message_limit
         {

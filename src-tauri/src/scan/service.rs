@@ -3,6 +3,7 @@ use super::{
     budgeted_source::BudgetedSource,
     usage::{Observation, ObservationSource, ScanLimits, ScanPhase, UsageScanner},
 };
+use crate::runtime::serialization::json_bytes;
 use crate::{
     domain::controller::Cancellation,
     domain::{
@@ -394,7 +395,7 @@ impl UsageService {
                     .unwrap_or_else(|| unknown(id, &time.observed_at))
             })
             .collect();
-        if serde_json::to_vec(&values).map_or(true, |v| v.len() + 128 > 1_048_576) {
+        if json_bytes(&values).map_or(true, |bytes| bytes.saturating_add(128) > 1_048_576) {
             return Err(UsageError::ResourceLimit);
         }
         if self.state.lock().unwrap().closed {
