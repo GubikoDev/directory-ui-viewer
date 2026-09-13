@@ -3,6 +3,7 @@
 use crate::domain::model::{
     Category, Coverage, Entry, FsIssue, IssueScope, ListingPage, Phase, WorkRecord,
 };
+use crate::runtime::memory::{ByteBudget, Reservation};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,9 +53,14 @@ pub struct ListingCache {
     limit: usize,
     ttl_ms: u64,
     message_limit: usize,
+    reservation: Reservation,
 }
 impl ListingCache {
     pub fn new(limit: usize, ttl_ms: u64, message_limit: usize) -> Self {
+        Self::with_budget(ByteBudget::new(limit), ttl_ms, message_limit)
+    }
+    pub fn with_budget(budget: ByteBudget, ttl_ms: u64, message_limit: usize) -> Self {
+        let limit = budget.limit();
         Self {
             snapshots: BTreeMap::new(),
             serial: 0,
@@ -63,6 +69,7 @@ impl ListingCache {
             limit,
             ttl_ms,
             message_limit,
+            reservation: budget.reserve(0).unwrap(),
         }
     }
     pub fn managed_bytes(&self) -> usize {
@@ -87,7 +94,12 @@ impl ListingCache {
     }
     fn remove(&mut self, id: &str) {
         if let Some(snapshot) = self.snapshots.remove(id) {
-            self.used -= snapshot.bytes;
+            let bytes = snapshot.bytes;
+            drop(snapshot);
+            self.used -= bytes;
+            self.reservation
+                .resize(self.used)
+                .expect("shrinking cache reservation");
             self.eviction_epoch = self.eviction_epoch.saturating_add(1);
         }
     }
@@ -95,7 +107,14 @@ impl ListingCache {
         if bytes > self.limit {
             return false;
         }
-        while self.used.saturating_add(bytes) > self.limit {
+        loop {
+            if self
+                .used
+                .checked_add(bytes)
+                .is_some_and(|total| total <= self.limit && self.reservation.resize(total).is_ok())
+            {
+                return true;
+            }
             let oldest = self
                 .snapshots
                 .iter()
@@ -107,7 +126,6 @@ impl ListingCache {
             };
             self.remove(&oldest);
         }
-        true
     }
     pub fn start(
         &mut self,
@@ -237,6 +255,10 @@ impl ListingCache {
             Coverage::Partial
         };
         Ok(())
+    }
+    /// Internal notification snapshot; does not refresh client inactivity TTL.
+    pub fn peek_work(&self, id: &str) -> Option<WorkRecord> {
+        self.snapshots.get(id).map(|s| s.work.clone())
     }
     pub fn work(&mut self, task_id: &str, now: u64) -> Result<WorkRecord, CacheError> {
         self.expire(now);
@@ -426,6 +448,9 @@ impl ListingCache {
         self.eviction_epoch = self.eviction_epoch.saturating_add(1);
         self.snapshots.clear();
         self.used = 0;
+        self.reservation
+            .resize(0)
+            .expect("clearing cache reservation");
     }
     pub fn retained_task_ids(&self) -> BTreeSet<&str> {
         self.snapshots.keys().map(String::as_str).collect()
@@ -648,5 +673,29 @@ mod tests {
         assert!(page.entries.is_empty());
         assert!(page.next_cursor.is_none());
         assert!(serde_json::to_vec(&page).unwrap().len() <= 80_000);
+    }
+    #[test]
+    fn caches_in_different_generations_share_one_pool_and_return_their_reservation() {
+        let pool = ByteBudget::new(100_000);
+        let mut old = ListingCache::with_budget(pool.clone(), 100, 1_048_576);
+        let mut current = ListingCache::with_budget(pool.clone(), 100, 1_048_576);
+        old.start(work("old"), Category::Directories, 0).unwrap();
+        assert_eq!(pool.used(), old.managed_bytes());
+        assert_eq!(
+            current.start(work("new"), Category::Directories, 0),
+            Err(CacheError::ResourceLimit)
+        );
+        assert_eq!(pool.used(), old.managed_bytes());
+        assert_eq!(current.managed_bytes(), 0);
+        old.clear();
+        assert_eq!(pool.used(), 0);
+        current
+            .start(work("new"), Category::Directories, 0)
+            .unwrap();
+        current.append("new", entry("B")).unwrap();
+        assert_eq!(pool.used(), current.managed_bytes());
+        drop(current);
+        assert_eq!(pool.used(), 0);
+        assert!(pool.peak() <= pool.limit());
     }
 }

@@ -6,9 +6,13 @@ use crate::{
         controller::{Cancellation, Scope},
         index::{DirectoryKey, IndexError, Origin, SharedDirectoryIndex},
         model::{
-            Category, Entry, FsIssue, IssueScope, Issues, Kind, ListingPage, Operation, Phase,
-            WaitReason, WorkRecord,
+            Category, Entry, EventKind, FsIssue, IssueScope, Issues, Kind, ListingPage, Operation,
+            Phase, WaitReason, WorkRecord,
         },
+    },
+    runtime::{
+        clock::{Clock, SystemClock},
+        events::{DiscardEvents, EventSink, TaskEvents},
     },
     scheduler::{
         HandleBudget, HandlePermit, Job, JobStep, Lane, Scheduler, Status, SubmitError, Ticket,
@@ -16,7 +20,7 @@ use crate::{
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -43,6 +47,7 @@ pub trait ListingSource: Send + 'static {
 struct State {
     cache: ListingCache,
     tickets: BTreeMap<String, Ticket>,
+    cancelled: BTreeSet<String>,
     closed: bool,
     seen_eviction_epoch: u64,
 }
@@ -61,7 +66,10 @@ impl State {
             .cloned()
             .collect();
         ids.into_iter()
-            .filter_map(|id| self.tickets.remove(&id))
+            .filter_map(|id| {
+                self.cancelled.remove(&id);
+                self.tickets.remove(&id)
+            })
             .collect()
     }
 }
@@ -110,6 +118,8 @@ pub struct ListingService {
     state: Arc<Mutex<State>>,
     pub index: SharedDirectoryIndex,
     scheduler: Arc<Scheduler>,
+    clock: Arc<dyn Clock>,
+    sink: Arc<dyn EventSink>,
 }
 static NEXT_TASK: AtomicU64 = AtomicU64::new(1);
 impl ListingService {
@@ -119,14 +129,34 @@ impl ListingService {
         scheduler: Arc<Scheduler>,
         cache: ListingCache,
     ) -> Self {
+        Self::with_events(
+            scope,
+            index,
+            scheduler,
+            cache,
+            Arc::new(SystemClock::default()),
+            Arc::new(DiscardEvents),
+        )
+    }
+    pub fn with_events(
+        scope: Scope,
+        index: SharedDirectoryIndex,
+        scheduler: Arc<Scheduler>,
+        cache: ListingCache,
+        clock: Arc<dyn Clock>,
+        sink: Arc<dyn EventSink>,
+    ) -> Self {
         Self {
             scope,
+            clock,
+            sink,
             start_gate: Mutex::new(()),
             index,
             scheduler,
             state: Arc::new(Mutex::new(State {
                 cache,
                 tickets: BTreeMap::new(),
+                cancelled: BTreeSet::new(),
                 closed: false,
                 seen_eviction_epoch: 0,
             })),
@@ -150,6 +180,13 @@ impl ListingService {
         self.index
             .key(target_id)
             .map_err(|_| CacheError::InvalidArgument)?;
+        self.index.bind_scope(&self.scope).map_err(|e| {
+            if e == IndexError::ResourceLimit {
+                CacheError::ResourceLimit
+            } else {
+                CacheError::InvalidArgument
+            }
+        })?;
         let number = NEXT_TASK
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| CacheError::ResourceLimit)?;
@@ -202,6 +239,9 @@ impl ListingService {
             category,
             observed: 0,
             directories: 0,
+            clock: self.clock.clone(),
+            sink: self.sink.clone(),
+            events: TaskEvents::default(),
         };
         // Submission is outside the store lock. A concurrent close/eviction is
         // checked again after registration and by the worker before opening.
@@ -238,7 +278,17 @@ impl ListingService {
         let ticket = self.state.lock().unwrap().tickets.get(id).cloned();
         if let Some(ticket) = ticket {
             let wait = self.scheduler.wait_reason(&ticket);
-            sync_ticket(&mut self.state.lock().unwrap().cache, &ticket, wait);
+            let mut state = self.state.lock().unwrap();
+            if state.cancelled.contains(id) && ticket.status().terminal() {
+                let _ = state.cache.finish(id, Phase::Cancelled, None);
+            } else {
+                let wait = if state.cancelled.contains(id) && ticket.status() == Status::Running {
+                    Some(Wait::Draining)
+                } else {
+                    wait
+                };
+                sync_ticket(&mut state.cache, &ticket, wait);
+            }
         }
     }
     pub fn page(
@@ -278,21 +328,27 @@ impl ListingService {
         result
     }
     pub fn cancel(&self, id: &str) -> Result<(), CacheError> {
-        let ticket = self
-            .state
-            .lock()
-            .unwrap()
-            .tickets
-            .get(id)
-            .cloned()
-            .ok_or(CacheError::TaskExpired)?;
+        let ticket = {
+            let mut state = self.state.lock().unwrap();
+            let ticket = state
+                .tickets
+                .get(id)
+                .cloned()
+                .ok_or(CacheError::TaskExpired)?;
+            if state
+                .cache
+                .peek_work(id)
+                .is_some_and(|w| w.phase.terminal())
+            {
+                return Ok(());
+            }
+            // Same lock as entry publication: once accepted, no new rows enter
+            // this snapshot even between a source return and scheduler signaling.
+            state.cancelled.insert(id.into());
+            ticket
+        };
         self.scheduler.cancel_task(&ticket);
-        let _ = self
-            .state
-            .lock()
-            .unwrap()
-            .cache
-            .finish(id, Phase::Cancelled, None);
+        self.synchronize(id);
         Ok(())
     }
     pub fn expire(&self, now: u64) {
@@ -309,6 +365,7 @@ impl ListingService {
             state.closed = true;
             state.cache.clear();
             state.tickets.clear();
+            state.cancelled.clear();
         }
         self.scheduler.cancel_scope(&self.scope);
     }
@@ -334,13 +391,38 @@ struct ListingJob<S: ListingSource> {
     category: Category,
     observed: u64,
     directories: u64,
+    clock: Arc<dyn Clock>,
+    sink: Arc<dyn EventSink>,
+    events: TaskEvents,
 }
 impl<S: ListingSource> ListingJob<S> {
-    fn finish(&self, phase: Phase, error: Option<FsIssue>) -> JobStep {
-        if let Some(state) = self.state.upgrade() {
-            let _ = state.lock().unwrap().cache.finish(&self.task, phase, error);
+    fn publish(&mut self) {
+        let work = self
+            .state
+            .upgrade()
+            .and_then(|state| state.lock().unwrap().cache.peek_work(&self.task));
+        if let Some(work) = work {
+            self.events.publish(
+                &work,
+                EventKind::ListingAvailable,
+                self.clock.sample().monotonic_ms,
+                self.sink.as_ref(),
+            );
         }
-        if phase == Phase::Failed {
+    }
+    fn finish(&self, phase: Phase, error: Option<FsIssue>) -> JobStep {
+        let mut actual = phase;
+        if let Some(state) = self.state.upgrade() {
+            let mut state = state.lock().unwrap();
+            let error = if state.cancelled.contains(&self.task) {
+                actual = Phase::Cancelled;
+                None
+            } else {
+                error
+            };
+            let _ = state.cache.finish(&self.task, actual, error);
+        }
+        if actual == Phase::Failed {
             JobStep::Failed
         } else {
             JobStep::Completed
@@ -355,25 +437,38 @@ impl<S: ListingSource> Job for ListingJob<S> {
         let start = Instant::now();
         for item in 0..128 {
             if item > 0 && start.elapsed() >= Duration::from_millis(20) {
+                self.publish();
                 return JobStep::Yield;
             }
             if cancel.is_cancelled() {
                 return self.finish(Phase::Cancelled, None);
             }
-            {
+            let demand = {
                 let guard = state.lock().unwrap();
-                match guard.cache.needs_collection(&self.task) {
-                    Ok(true) if !guard.closed => (),
-                    Ok(false) if !guard.closed => return JobStep::Paused,
-                    _ => return JobStep::Completed,
+                if guard.closed || guard.cancelled.contains(&self.task) {
+                    Err(CacheError::TaskExpired)
+                } else {
+                    guard.cache.needs_collection(&self.task)
                 }
+            };
+            match demand {
+                Ok(true) => (),
+                Ok(false) => {
+                    self.publish();
+                    return JobStep::Paused;
+                }
+                Err(_) => return JobStep::Completed,
             }
             if self.cursor.is_none() {
                 self.permit = match handles.acquire() {
                     Ok(permit) => Some(permit),
                     Err(_) => return self.finish(Phase::Completed, Some(issue("RESOURCE_LIMIT"))),
                 };
-                match self.source.open(&self.target) {
+                let opened = self.source.open(&self.target);
+                if cancel.is_cancelled() {
+                    return self.finish(Phase::Cancelled, None);
+                }
+                match opened {
                     Ok(cursor) => self.cursor = Some(cursor),
                     Err(error) => return self.finish(Phase::Failed, Some(error)),
                 }
@@ -387,7 +482,10 @@ impl<S: ListingSource> Job for ListingJob<S> {
                 return self.finish(Phase::Cancelled, None);
             }
             let mut guard = state.lock().unwrap();
-            if guard.closed || !guard.cache.contains(&self.task) {
+            if guard.closed
+                || guard.cancelled.contains(&self.task)
+                || !guard.cache.contains(&self.task)
+            {
                 return JobStep::Completed;
             }
             let mut row = match observation {
@@ -460,10 +558,22 @@ impl<S: ListingSource> Job for ListingJob<S> {
                 return JobStep::Completed;
             }
             if start.elapsed() >= Duration::from_millis(20) {
+                self.publish();
                 return JobStep::Yield;
             }
         }
+        self.publish();
         JobStep::Yield
+    }
+    fn stopped(&mut self, status: Status) {
+        let (phase, error) = match status {
+            Status::Cancelled => (Phase::Cancelled, None),
+            Status::Failed => (Phase::Failed, Some(issue("INTERNAL"))),
+            Status::ResourceLimit => (Phase::Completed, Some(issue("RESOURCE_LIMIT"))),
+            _ => (Phase::Completed, None),
+        };
+        self.finish(phase, error);
+        self.publish();
     }
 }
 
@@ -495,12 +605,17 @@ mod tests {
         rows: VecDeque<ListedEntry>,
         counts: Arc<Counts>,
         block: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+        block_open: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         open_error: Option<FsIssue>,
         end_error: Option<FsIssue>,
     }
     impl ListingSource for Source {
         type Cursor = Cursor;
         fn open(&mut self, _: &str) -> Result<Cursor, FsIssue> {
+            if let Some((ready, release)) = self.block_open.take() {
+                ready.send(()).unwrap();
+                release.recv().unwrap();
+            }
             if let Some(error) = self.open_error.take() {
                 return Err(error);
             }
@@ -555,6 +670,7 @@ mod tests {
                 rows: rows.into(),
                 counts: counts.clone(),
                 block: None,
+                block_open: None,
                 open_error: None,
                 end_error: None,
             },
@@ -747,12 +863,17 @@ mod tests {
         service.cancel(&handle.task_id).unwrap();
         assert!(start.elapsed() < Duration::from_millis(100));
         let page = service.page(&handle.task_id, None, 2, 1).unwrap();
-        assert_eq!(page.work.phase, Phase::Cancelled);
+        assert_eq!(page.work.phase, Phase::Running);
+        assert_eq!(page.work.wait_reason, Some(WaitReason::Draining));
         assert!(page.entries.is_empty());
         assert_eq!(scheduler.handles().open(), 1);
         release_tx.send(()).unwrap();
         until(|| counts.closed.load(Ordering::SeqCst) == 1 && scheduler.handles().open() == 0);
         assert_eq!(service.index.len(), 1);
+        assert_eq!(
+            service.work(&handle.task_id, 1).unwrap().phase,
+            Phase::Cancelled
+        );
         assert_eq!(scheduler.handles().open(), 0);
     }
     #[test]
@@ -982,5 +1103,65 @@ mod tests {
         assert_eq!(last.entries.len(), 6);
         assert!(last.next_cursor.is_none());
         assert_eq!(unused_counts.opened.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn parked_data_emits_availability_and_cancel_emits_terminal_without_throttle_delay() {
+        use crate::runtime::events::EventChannel;
+        let scheduler = Arc::new(Scheduler::default());
+        let (mut service, root) = setup(2_000_000, 1000, 1, scheduler.clone());
+        let (sink, receiver) = EventChannel::bounded(16);
+        service.sink = Arc::new(sink);
+        let (input, _) = source(
+            (0..8)
+                .map(|n| entry(&format!("file{n}"), Kind::RegularFile))
+                .collect(),
+        );
+        let handle = start(&service, &root, Category::Files, input);
+        until(|| scheduler.counts().2 == 1);
+        let event = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(event.kind, EventKind::ListingAvailable);
+        assert_eq!(event.task_id, handle.task_id);
+        assert!(!serde_json::to_string(&event).unwrap().contains("file0"));
+        service.cancel(&handle.task_id).unwrap();
+        let terminal = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(terminal.kind, EventKind::Terminal);
+        assert!(terminal.sequence > event.sequence);
+        assert_eq!(
+            service.work(&handle.task_id, 1).unwrap().phase,
+            Phase::Cancelled
+        );
+        assert_eq!(
+            service
+                .page(&handle.task_id, None, 2, 1)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        assert_eq!(scheduler.handles().open(), 0);
+    }
+    #[test]
+    fn cancellation_wins_over_a_late_open_error_and_does_not_publish_it() {
+        let scheduler = Arc::new(Scheduler::default());
+        let (service, root) = setup(2_000_000, 1000, 1, scheduler.clone());
+        let (mut input, counts) = source(vec![]);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        input.block_open = Some((ready_tx, release_rx));
+        input.open_error = Some(issue("PERMISSION_DENIED"));
+        let handle = start(&service, &root, Category::Directories, input);
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        service.cancel(&handle.task_id).unwrap();
+        assert_eq!(
+            service.work(&handle.task_id, 1).unwrap().wait_reason,
+            Some(WaitReason::Draining)
+        );
+        release_tx.send(()).unwrap();
+        until(|| service.work(&handle.task_id, 1).unwrap().phase.terminal());
+        let work = service.work(&handle.task_id, 1).unwrap();
+        assert_eq!(work.phase, Phase::Cancelled);
+        assert!(work.issues.counts.is_empty());
+        assert_eq!(counts.next.load(Ordering::SeqCst), 0);
+        until(|| scheduler.handles().open() == 0);
     }
 }

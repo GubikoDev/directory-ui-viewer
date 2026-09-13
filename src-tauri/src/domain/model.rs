@@ -262,6 +262,23 @@ pub struct ListingPage {
     pub coverage: Coverage,
     pub issues: Issues,
 }
+wire_enum!(EventKind {
+    ListingAvailable,
+    UsageChanged,
+    Progress,
+    Terminal
+});
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkEvent {
+    pub protocol_version: u8,
+    pub session_id: String,
+    pub generation: u64,
+    pub task_id: String,
+    pub sequence: u64,
+    pub kind: EventKind,
+    pub observed_at: String,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +291,8 @@ mod tests {
         let root: RootData = serde_json::from_value(fixture["root"].clone()).unwrap();
         let work: WorkRecord = serde_json::from_value(fixture["work"].clone()).unwrap();
         let usage: DirectoryUsage = serde_json::from_value(fixture["usage"].clone()).unwrap();
+        let event: WorkEvent = serde_json::from_value(fixture["event"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), fixture["event"]);
         assert_eq!(serde_json::to_value(root).unwrap(), fixture["root"]);
         assert_eq!(serde_json::to_value(work).unwrap(), fixture["work"]);
         assert_eq!(serde_json::to_value(usage).unwrap(), fixture["usage"]);

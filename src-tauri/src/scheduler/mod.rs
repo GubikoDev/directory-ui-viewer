@@ -32,6 +32,8 @@ pub enum JobStep {
 }
 pub trait Job: Send + 'static {
     fn step(&mut self, cancel: &Cancellation, handles: &HandleBudget) -> JobStep;
+    /// Runs once after retirement, outside all scheduler locks. No new I/O.
+    fn stopped(&mut self, _status: Status) {}
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -83,6 +85,13 @@ struct Pending {
     ticket: Ticket,
     lane: Lane,
     job: Box<dyn Job>,
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let status = self.ticket.status();
+        // A task finalizer must not take down a fixed application worker.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job.stopped(status)));
+    }
 }
 struct State {
     queues: [VecDeque<Pending>; 2],

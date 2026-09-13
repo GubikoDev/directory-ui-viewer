@@ -249,6 +249,7 @@ pub struct UsageScanner<S: ObservationSource> {
     pub index: SharedDirectoryIndex,
     root_id: String,
     root_mount: u64,
+    root_open_failed: bool,
     limits: ScanLimits,
     cancellation: Cancellation,
     phase: ScanPhase,
@@ -281,6 +282,7 @@ impl<S: ObservationSource> UsageScanner<S> {
         let mut aggregate = Aggregate::default();
         aggregate.add_own(&root);
         let mut issues = Issues::default();
+        let mut root_open_failed = false;
         let cursor = if cancellation.is_cancelled() {
             aggregate.reason(Reason::Cancelled);
             None
@@ -290,12 +292,19 @@ impl<S: ObservationSource> UsageScanner<S> {
             aggregate.reason(Reason::ResourceLimit);
             None
         } else {
-            match source.open(&root) {
-                Ok(cursor) => Some(cursor),
-                Err(issue) => {
-                    aggregate.reason(source_error_reason(&issue));
-                    issues.record(issue);
-                    None
+            let opened = source.open(&root);
+            if cancellation.is_cancelled() {
+                aggregate.reason(Reason::Cancelled);
+                None
+            } else {
+                match opened {
+                    Ok(cursor) => Some(cursor),
+                    Err(issue) => {
+                        root_open_failed = issue.code != "RESOURCE_LIMIT";
+                        aggregate.reason(source_error_reason(&issue));
+                        issues.record(issue);
+                        None
+                    }
                 }
             }
         };
@@ -315,6 +324,7 @@ impl<S: ObservationSource> UsageScanner<S> {
             index,
             root_id,
             root_mount: root.mount,
+            root_open_failed,
             limits,
             cancellation,
             phase: ScanPhase::Running,
@@ -331,6 +341,15 @@ impl<S: ObservationSource> UsageScanner<S> {
     }
     pub fn root_id(&self) -> &str {
         &self.root_id
+    }
+    pub fn root_failed(&self) -> bool {
+        self.root_open_failed
+    }
+    /// Finalize collected observations without performing any further source I/O.
+    pub fn abort(&mut self, reason: Reason, observed_at: &str) {
+        if self.phase == ScanPhase::Running {
+            self.stop_partial(reason, observed_at);
+        }
     }
     pub fn phase(&self) -> ScanPhase {
         self.phase
@@ -350,6 +369,8 @@ impl<S: ObservationSource> UsageScanner<S> {
                 ScanState::Running
             } else if self.phase == ScanPhase::Cancelled {
                 ScanState::Cancelled
+            } else if self.root_open_failed && frame.id == self.root_id {
+                ScanState::Failed
             } else {
                 ScanState::Settled
             },

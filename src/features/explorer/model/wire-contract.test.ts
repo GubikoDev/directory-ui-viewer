@@ -5,6 +5,7 @@ import {
   type DirectoryUsage,
   type RootData,
   type WorkRecord,
+  type WorkEvent,
 } from './types';
 
 it('matches the exact Rust serde fixture including enum tags, optional fields and large integers', () => {
@@ -68,6 +69,15 @@ it('matches the exact Rust serde fixture including enum tags, optional fields an
     },
     observedAt,
   };
-  expect(fixture).toEqual({ root, work, usage });
+  const event: WorkEvent = {
+    protocolVersion: 1,
+    sessionId: 'fixture-session',
+    generation: 1,
+    taskId: 'scan-1',
+    sequence: 3,
+    kind: 'usageChanged',
+    observedAt,
+  };
+  expect(fixture).toEqual({ root, work, usage, event });
   expect(parseBytes(fixture.work.processedEntries)).toBe(9007199254740993n);
 });

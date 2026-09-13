@@ -78,5 +78,14 @@
       "reasons": ["unsupported"]
     },
     "observedAt": "2026-09-13T00:00:00.000Z"
+  },
+  "event": {
+    "protocolVersion": 1,
+    "sessionId": "fixture-session",
+    "generation": 1,
+    "taskId": "scan-1",
+    "sequence": 3,
+    "kind": "usageChanged",
+    "observedAt": "2026-09-13T00:00:00.000Z"
   }
 }

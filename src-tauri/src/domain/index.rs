@@ -1,5 +1,7 @@
 //! Generation-owned directory index. Raw component names never cross the IPC boundary.
+use super::controller::Scope;
 use super::model::{Capacity, CapacityState, DirectoryUsage, Entry, Kind};
+use crate::runtime::memory::{ByteBudget, Reservation};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -43,34 +45,58 @@ pub struct DirectoryIndex {
     by_key: BTreeMap<DirectoryKey, String>,
     prefix: String,
     next: u64,
-    background_limit: usize,
-    foreground_limit: usize,
-    background_bytes: usize,
-    foreground_bytes: usize,
+    background: Reservation,
+    foreground: Reservation,
     capacity: Capacity,
+    scope: Option<Scope>,
 }
 impl DirectoryIndex {
     pub fn new(prefix: String, background_limit: usize, foreground_limit: usize) -> Self {
+        Self::with_budgets(
+            prefix,
+            ByteBudget::new(background_limit),
+            ByteBudget::new(foreground_limit),
+        )
+    }
+    pub fn with_budgets(prefix: String, background: ByteBudget, foreground: ByteBudget) -> Self {
         Self {
             records: BTreeMap::new(),
             by_key: BTreeMap::new(),
             prefix,
             next: 0,
-            background_limit,
-            foreground_limit,
-            background_bytes: 0,
-            foreground_bytes: 0,
+            background: background.reserve(0).unwrap(),
+            foreground: foreground.reserve(0).unwrap(),
+            scope: None,
             capacity: Capacity {
                 background: CapacityState::Available,
                 foreground: CapacityState::Available,
             },
         }
     }
+    pub fn bind_scope(&mut self, scope: &Scope) -> Result<(), IndexError> {
+        if scope.session_id.is_empty()
+            || scope.session_id.len() > 128
+            || scope.generation == 0
+            || scope.generation > 9_007_199_254_740_991
+        {
+            return Err(IndexError::InvalidArgument);
+        }
+        if let Some(current) = &self.scope {
+            return if current == scope {
+                Ok(())
+            } else {
+                Err(IndexError::InvalidArgument)
+            };
+        }
+        self.charge(Origin::Foreground, 256 + scope.session_id.len() * 2)?;
+        self.scope = Some(scope.clone());
+        Ok(())
+    }
     pub fn capacity(&self) -> Capacity {
         self.capacity.clone()
     }
     pub fn managed_bytes(&self) -> (usize, usize) {
-        (self.background_bytes, self.foreground_bytes)
+        (self.background.bytes(), self.foreground.bytes())
     }
     pub fn len(&self) -> usize {
         self.records.len()
@@ -79,23 +105,18 @@ impl DirectoryIndex {
         self.records.is_empty()
     }
     fn charge(&mut self, origin: Origin, amount: usize) -> Result<(), IndexError> {
-        let (used, limit, state) = match origin {
-            Origin::Background => (
-                &mut self.background_bytes,
-                self.background_limit,
-                &mut self.capacity.background,
-            ),
-            Origin::Foreground => (
-                &mut self.foreground_bytes,
-                self.foreground_limit,
-                &mut self.capacity.foreground,
-            ),
+        let (reservation, state) = match origin {
+            Origin::Background => (&mut self.background, &mut self.capacity.background),
+            Origin::Foreground => (&mut self.foreground, &mut self.capacity.foreground),
         };
-        if used.saturating_add(amount) > limit {
+        let target = reservation
+            .bytes()
+            .checked_add(amount)
+            .ok_or(IndexError::ResourceLimit)?;
+        if reservation.resize(target).is_err() {
             *state = CapacityState::Limited;
             return Err(IndexError::ResourceLimit);
         }
-        *used += amount;
         Ok(())
     }
     pub fn register(&mut self, key: DirectoryKey, origin: Origin) -> Result<String, IndexError> {
@@ -156,7 +177,9 @@ impl DirectoryIndex {
         if next > previous {
             self.charge(Origin::Foreground, next - previous)?;
         } else {
-            self.foreground_bytes -= previous - next;
+            self.foreground
+                .resize(self.foreground.bytes() - (previous - next))
+                .expect("shrinking a reservation");
         }
         self.records.get_mut(id).unwrap().entry = Some(entry);
         Ok(())
@@ -207,6 +230,9 @@ impl From<DirectoryIndex> for SharedDirectoryIndex {
     }
 }
 impl SharedDirectoryIndex {
+    pub fn bind_scope(&self, scope: &Scope) -> Result<(), IndexError> {
+        self.0.lock().unwrap().bind_scope(scope)
+    }
     pub fn register(&self, key: DirectoryKey, origin: Origin) -> Result<String, IndexError> {
         self.0.lock().unwrap().register(key, origin)
     }
@@ -358,5 +384,38 @@ mod tests {
             );
         }
         assert_eq!(index.key("g1-1"), Err(IndexError::EntryExpired));
+    }
+    #[test]
+    fn an_old_generation_retains_its_shared_charge_until_its_last_owner_drops() {
+        let background = ByteBudget::new(3000);
+        let foreground = ByteBudget::new(7000);
+        let mut old =
+            DirectoryIndex::with_budgets("old".into(), background.clone(), foreground.clone());
+        old.register(key(None, b"root"), Origin::Background)
+            .unwrap();
+        let old: SharedDirectoryIndex = old.into();
+        let draining = old.clone();
+        drop(old);
+        let mut current =
+            DirectoryIndex::with_budgets("new".into(), background.clone(), foreground.clone());
+        assert_eq!(
+            current.register(key(None, b"root"), Origin::Background),
+            Err(IndexError::ResourceLimit)
+        );
+        assert!(background.used() > 0);
+        drop(draining);
+        assert_eq!(background.used(), 0);
+        let root = current
+            .register(key(None, b"root"), Origin::Background)
+            .unwrap();
+        current
+            .register(key(Some(&root), b"child"), Origin::Foreground)
+            .unwrap();
+        assert_eq!(
+            (background.used(), foreground.used()),
+            current.managed_bytes()
+        );
+        drop(current);
+        assert_eq!(background.used() + foreground.used(), 0);
     }
 }
