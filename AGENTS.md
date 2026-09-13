@@ -35,7 +35,7 @@ Treat `project-notes/` as active project memory, not an archive. Before substant
 
 For direct Codex–Claude consultation, read `project-notes/Agent Dialogue.md` and follow its CLI, session ownership, and transcript rules.
 
-Codex and Claude share these instructions through `CLAUDE.md` and coordinate through `Agent Handoff.md`. Before continuing another agent's work, inspect the handoff, current files, and Git state. Record ownership, changed paths, validation, unresolved questions, and the next concrete action. Verify another agent's output before relying on it, preserve concurrent changes, and leave consequential unresolved choices to the user. Commit Vault documents only in their independent local Git repository. Do not add the Vault to the application repository or publish it without an explicit user request.
+Codex and Claude share these instructions through `CLAUDE.md` and coordinate through `Agent Handoff.md`. Before continuing another agent's work, inspect the handoff, current files, and Git state. Record ownership, changed paths, validation, unresolved questions, and the next concrete action. Verify another agent's output before relying on it, preserve concurrent changes, and leave consequential unresolved choices to the user. After each coherent Vault document update, immediately commit it in the independent Vault Git repository and push to its existing private origin; do not wait for a separate user request. Verify push success and report failures without force-pushing. Exclude credentials, raw dialogue logs, and editor state. Commit Vault documents only in their independent local Git repository. Do not add the Vault to the application repository or publish it without an explicit user request.
 
 ## Commit & Pull Request Guidelines
 
