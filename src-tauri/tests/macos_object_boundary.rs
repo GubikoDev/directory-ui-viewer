@@ -336,6 +336,40 @@ fn s03_actual_disk_image_mount_is_not_traversed_without_separate_approval() {
     );
     assert_eq!(scan.stats.processed_directories, 2);
     assert_eq!(scan.issues.samples[0].code, "OUTSIDE_ROOT");
+    // A directory ID discovered by scan also cannot be expanded through listing.
+    use directory_ui_viewer_lib::{
+        domain::index::{DirectoryKey, Origin},
+        listing::service::ListingSource,
+        platform::macos_listing::NativeListingSource,
+        runtime::clock::SystemClock,
+    };
+    let mount_id = scan
+        .index
+        .register(
+            DirectoryKey {
+                parent_id: Some(scan.root_id().into()),
+                raw_name: b"mounted".to_vec(),
+            },
+            Origin::Foreground,
+        )
+        .unwrap();
+    let mut listing = NativeListingSource::new(
+        root.clone(),
+        scan.index.clone(),
+        scan.root_id().into(),
+        std::sync::Arc::new(SystemClock::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        listing
+            .open(&mount_id, &scan.index, &Cancellation::default())
+            .err()
+            .unwrap()
+            .code,
+        "OUTSIDE_ROOT"
+    );
+    assert_eq!(root.directory().handle_budget().open(), 1);
+    drop(listing);
     drop(scan);
     drop(separate);
     drop(root);

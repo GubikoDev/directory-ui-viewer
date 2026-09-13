@@ -488,3 +488,34 @@ mod tests {
         );
     }
 }
+
+pub fn fs_issue(
+    error: BoundaryError,
+    scope: crate::domain::model::IssueScope,
+    operation: &str,
+) -> crate::domain::model::FsIssue {
+    let (code, native_code) = match error {
+        BoundaryError::Revoked => ("SESSION_CLOSED", None),
+        BoundaryError::ResourceLimit => ("RESOURCE_LIMIT", None),
+        BoundaryError::ChangedObject => ("ENTRY_CHANGED", None),
+        BoundaryError::MountBoundary => ("OUTSIDE_ROOT", None),
+        BoundaryError::InvalidComponent => ("INVALID_ARGUMENT", None),
+        BoundaryError::Native(e) | BoundaryError::EntryNative(e) => {
+            let code = match e.raw_os_error() {
+                Some(libc::EACCES | libc::EPERM) => "PERMISSION_DENIED",
+                Some(libc::ENOENT) => "NOT_FOUND",
+                Some(libc::ENOTDIR) => "NOT_DIRECTORY",
+                Some(libc::ELOOP) => "LINK_TRAVERSAL_BLOCKED",
+                _ => "IO_ERROR",
+            };
+            (code, e.raw_os_error())
+        }
+    };
+    crate::domain::model::FsIssue {
+        code: code.into(),
+        operation: operation.into(),
+        scope,
+        entry_id: None,
+        native_code,
+    }
+}

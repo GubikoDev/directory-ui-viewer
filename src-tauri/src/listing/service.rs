@@ -37,11 +37,30 @@ pub struct ListedEntry {
     pub issue: Option<FsIssue>,
 }
 /// Construction must not perform I/O. open/next run only in the fixed worker.
-/// Own at most one directory cursor; the service reserves its handle permit.
+/// The service reserves one cursor permit for unaccounted sources. Native sources
+/// report the same pool and reserve every retained/temporary handle themselves.
 /// Drop must only release owned resources, never perform another filesystem query.
 pub trait ListingSource: Send + 'static {
     type Cursor: Send;
-    fn open(&mut self, directory_id: &str) -> Result<Self::Cursor, FsIssue>;
+    fn handle_budget(&self) -> Option<&HandleBudget> {
+        None
+    }
+    /// Pure binding hook; never performs filesystem I/O while the store is locked.
+    fn bind_directory(
+        &mut self,
+        _id: &str,
+        _row: &ListedEntry,
+        _index: &SharedDirectoryIndex,
+    ) -> Result<(), FsIssue> {
+        Ok(())
+    }
+    /// Worker cancellation and generation index must accompany every open.
+    fn open(
+        &mut self,
+        directory_id: &str,
+        index: &SharedDirectoryIndex,
+        cancel: &Cancellation,
+    ) -> Result<Self::Cursor, FsIssue>;
     fn next(&mut self, cursor: &mut Self::Cursor) -> Result<Option<ListedEntry>, FsIssue>;
 }
 struct State {
@@ -460,11 +479,24 @@ impl<S: ListingSource> Job for ListingJob<S> {
                 Err(_) => return JobStep::Completed,
             }
             if self.cursor.is_none() {
-                self.permit = match handles.acquire() {
-                    Ok(permit) => Some(permit),
-                    Err(_) => return self.finish(Phase::Completed, Some(issue("RESOURCE_LIMIT"))),
+                if self
+                    .source
+                    .handle_budget()
+                    .is_some_and(|pool| !pool.same_pool(handles))
+                {
+                    return self.finish(Phase::Failed, Some(issue("INVALID_ARGUMENT")));
+                }
+                self.permit = if self.source.handle_budget().is_some() {
+                    None
+                } else {
+                    match handles.acquire() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            return self.finish(Phase::Completed, Some(issue("RESOURCE_LIMIT")));
+                        }
+                    }
                 };
-                let opened = self.source.open(&self.target);
+                let opened = self.source.open(&self.target, &self.index, cancel);
                 if cancel.is_cancelled() {
                     return self.finish(Phase::Cancelled, None);
                 }
@@ -495,6 +527,10 @@ impl<S: ListingSource> Job for ListingJob<S> {
                     return self.finish(Phase::Completed, None);
                 }
                 Err(error) => {
+                    if error.scope == IssueScope::Entry {
+                        let _ = guard.cache.record_issue(&self.task, error);
+                        continue;
+                    }
                     drop(guard);
                     return self.finish(Phase::Failed, Some(error));
                 }
@@ -511,7 +547,7 @@ impl<S: ListingSource> Job for ListingJob<S> {
                 continue;
             }
             if row.raw_name.is_empty()
-                || row.raw_name.len() > 255
+                || row.raw_name.len() > crate::domain::index::MAX_COMPONENT_BYTES
                 || row.raw_name.contains(&0)
                 || row.raw_name.contains(&b'/')
                 || row.raw_name == b"."
@@ -526,10 +562,16 @@ impl<S: ListingSource> Job for ListingJob<S> {
                 let registered = index.register(
                     DirectoryKey {
                         parent_id: Some(self.target.clone()),
-                        raw_name: row.raw_name,
+                        raw_name: row.raw_name.clone(),
                     },
                     Origin::Foreground,
                 );
+                if let Ok(id) = &registered {
+                    if let Err(error) = self.source.bind_directory(id, &row, index) {
+                        let _ = guard.cache.record_issue(&self.task, error);
+                        continue;
+                    }
+                }
                 let result = registered.and_then(|id| {
                     row.entry.entry_id = id.clone();
                     index.expose(&id, row.entry.clone())
@@ -611,7 +653,12 @@ mod tests {
     }
     impl ListingSource for Source {
         type Cursor = Cursor;
-        fn open(&mut self, _: &str) -> Result<Cursor, FsIssue> {
+        fn open(
+            &mut self,
+            _: &str,
+            _: &SharedDirectoryIndex,
+            _: &Cancellation,
+        ) -> Result<Cursor, FsIssue> {
             if let Some((ready, release)) = self.block_open.take() {
                 ready.send(()).unwrap();
                 release.recv().unwrap();

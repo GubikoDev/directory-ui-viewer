@@ -260,6 +260,9 @@ impl From<DirectoryIndex> for SharedDirectoryIndex {
     }
 }
 impl SharedDirectoryIndex {
+    pub fn same_index(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub fn bind_identity(
         &self,
         id: &str,

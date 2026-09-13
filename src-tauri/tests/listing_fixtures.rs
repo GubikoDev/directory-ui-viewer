@@ -65,7 +65,12 @@ fn io_issue(error: std::io::Error, scope: IssueScope) -> FsIssue {
 }
 impl ListingSource for Source {
     type Cursor = fs::ReadDir;
-    fn open(&mut self, directory_id: &str) -> Result<fs::ReadDir, FsIssue> {
+    fn open(
+        &mut self,
+        directory_id: &str,
+        _: &directory_ui_viewer_lib::domain::index::SharedDirectoryIndex,
+        _: &directory_ui_viewer_lib::domain::controller::Cancellation,
+    ) -> Result<fs::ReadDir, FsIssue> {
         assert_eq!(directory_id, self.expected_root);
         fs::read_dir(&self.path).map_err(|e| io_issue(e, IssueScope::Subtree))
     }
