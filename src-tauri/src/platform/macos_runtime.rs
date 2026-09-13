@@ -270,6 +270,9 @@ pub struct NativeRuntime {
 }
 impl NativeRuntime {
     pub fn new(context: NativeContext, resources: RuntimeResources) -> Result<Self, FsIssue> {
+        if !resources.scheduler.uses_budget(&resources.budgets.work) {
+            return Err(issue("INVALID_ARGUMENT"));
+        }
         let memory = resources
             .budgets
             .work
@@ -774,6 +777,25 @@ mod tests {
         time::{Duration, Instant},
     };
     #[test]
+    fn native_runtime_rejects_scheduler_from_an_independent_memory_pool() {
+        let budgets = ManagedBudgets::default();
+        let resources = RuntimeResources {
+            scheduler: Arc::new(Scheduler::default()),
+            budgets: budgets.clone(),
+            clock: Arc::new(SystemClock::default()),
+            events: Arc::new(DiscardEvents),
+        };
+        let rejected = NativeRuntime::new(
+            NativeContext {
+                window: "main".into(),
+                document: 1,
+            },
+            resources,
+        );
+        assert!(matches!(rejected, Err(FsIssue { code, .. }) if code == "INVALID_ARGUMENT"));
+        assert_eq!(budgets.used(), 0);
+    }
+    #[test]
     fn close_does_not_wait_for_admitted_reader_and_discards_its_late_snapshot() {
         let path =
             std::env::temp_dir().join(format!("duv-runtime-read-barrier-{}", std::process::id()));
@@ -782,9 +804,10 @@ mod tests {
             window: "main".into(),
             document: 1,
         };
+        let budgets = ManagedBudgets::default();
         let resources = RuntimeResources {
-            scheduler: Arc::new(Scheduler::default()),
-            budgets: ManagedBudgets::default(),
+            scheduler: Arc::new(Scheduler::with_budget(64, 64, 320, budgets.work.clone()).unwrap()),
+            budgets,
             clock: Arc::new(SystemClock::default()),
             events: Arc::new(DiscardEvents),
         };
@@ -831,6 +854,15 @@ mod tests {
         assert_eq!(resources.scheduler.handles().open(), 0);
         assert_eq!(resources.budgets.foreground_index.used(), 0);
         drop(runtime);
+        drop(resources.scheduler);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while resources.budgets.used() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scheduler ownership did not drain"
+            );
+            std::thread::yield_now();
+        }
         assert_eq!(resources.budgets.used(), 0);
         fs::remove_dir(path).unwrap();
     }

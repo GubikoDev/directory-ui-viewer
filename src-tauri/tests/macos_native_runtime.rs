@@ -47,9 +47,10 @@ fn context(document: u64) -> NativeContext {
 }
 fn setup() -> (NativeRuntime, RuntimeResources) {
     let (events, _receiver) = EventChannel::bounded(8);
+    let budgets = ManagedBudgets::default();
     let resources = RuntimeResources {
-        scheduler: Arc::new(Scheduler::default()),
-        budgets: ManagedBudgets::default(),
+        scheduler: Arc::new(Scheduler::with_budget(64, 64, 320, budgets.work.clone()).unwrap()),
+        budgets,
         clock: Arc::new(SystemClock::default()),
         events: Arc::new(events),
     };
@@ -196,6 +197,7 @@ fn real_session_flow_refreshes_same_object_expires_ids_and_closes_all_resources(
     );
     until(|| resources.scheduler.handles().open() == 0);
     drop(runtime);
+    drop(resources.scheduler);
     until(|| resources.budgets.used() == 0);
 }
 #[test]
@@ -430,10 +432,14 @@ fn parked_listing_cancellation_and_document_close_release_resources() {
         "CLIENT_EXPIRED"
     );
     until(|| resources.scheduler.handles().open() == 0);
-    assert!(resources.budgets.work.used() > 32 * 1024);
+    assert!(resources.budgets.work.used() > resources.scheduler.fixed_bytes() + 32 * 1024);
     drop(page);
-    assert_eq!(resources.budgets.work.used(), 32 * 1024);
+    assert_eq!(
+        resources.budgets.work.used(),
+        resources.scheduler.fixed_bytes() + 32 * 1024
+    );
     drop(runtime);
+    drop(resources.scheduler);
     until(|| resources.budgets.used() == 0);
 }
 
@@ -487,7 +493,10 @@ fn superseded_and_closed_refresh_completions_do_not_restore_old_generations() {
         "SESSION_CLOSED"
     );
     assert_eq!(resources.scheduler.handles().open(), 0);
-    assert_eq!(resources.budgets.work.used(), 32 * 1024);
+    assert_eq!(
+        resources.budgets.work.used(),
+        resources.scheduler.fixed_bytes() + 32 * 1024
+    );
 }
 
 #[test]
@@ -599,6 +608,7 @@ fn async_selection_and_refresh_execute_metadata_on_the_same_fixed_foreground_wor
         .close_session(&context(1), epoch, &root.session.session_id)
         .unwrap();
     drop(runtime);
+    drop(resources.scheduler);
     until(|| resources.budgets.used() == 0);
 }
 
@@ -682,6 +692,7 @@ fn closing_queued_preparation_returns_without_waiting_and_does_not_cancel_new_wo
             .is_some()
     );
     drop(runtime);
+    drop(resources.scheduler);
     until(|| resources.budgets.used() == 0);
 }
 #[test]
@@ -691,6 +702,7 @@ fn dropping_async_receiver_cancels_queued_preparation_and_releases_picker_slot()
     let runtime = Arc::new(runtime);
     let epoch = runtime.connect(&context(1), "one").unwrap();
     let release = block_foreground(&resources);
+    let baseline = resources.budgets.work.used();
     let ticket = runtime.begin_selection(&context(1), epoch).unwrap();
     let queued =
         tauri::async_runtime::spawn(runtime.clone().select_path(ticket, Some(f.p("root"))));
@@ -701,14 +713,15 @@ fn dropping_async_receiver_cancels_queued_preparation_and_releases_picker_slot()
     let next = runtime.begin_selection(&context(1), epoch).unwrap();
     runtime.finish_selection(next, Ok(None)).unwrap();
     assert_eq!(resources.scheduler.handles().open(), 0);
-    assert_eq!(resources.budgets.work.used(), 32 * 1024);
+    until(|| resources.budgets.work.used() == baseline);
     release.send(()).unwrap();
 }
 #[test]
 fn queue_admission_failure_preserves_choice_and_returns_advanced_refresh_scope() {
     let f = Fixture::new();
     let (_, mut resources) = setup();
-    resources.scheduler = Arc::new(Scheduler::new(0, 64, 320));
+    resources.scheduler =
+        Arc::new(Scheduler::with_budget(0, 64, 320, resources.budgets.work.clone()).unwrap());
     let runtime = Arc::new(NativeRuntime::new(context(1), resources.clone()).unwrap());
     let epoch = runtime.connect(&context(1), "one").unwrap();
     let root = choose(&runtime, epoch, &f.p("root"));
@@ -803,6 +816,7 @@ fn abandoning_active_preparation_keeps_old_root_and_discards_late_candidate() {
     let next = runtime.begin_selection(&context(1), epoch).unwrap();
     runtime.finish_selection(next, Ok(None)).unwrap();
     drop(runtime);
+    drop(resources.scheduler);
     until(|| resources.budgets.used() == 0);
 }
 
@@ -821,12 +835,13 @@ fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
         .unwrap()
         .size() as u128;
     for limit in [0, 160] {
+        let budgets = ManagedBudgets {
+            hardlinks: ByteBudget::new(limit),
+            ..ManagedBudgets::default()
+        };
         let resources = RuntimeResources {
-            scheduler: Arc::new(Scheduler::default()),
-            budgets: ManagedBudgets {
-                hardlinks: ByteBudget::new(limit),
-                ..ManagedBudgets::default()
-            },
+            scheduler: Arc::new(Scheduler::with_budget(64, 64, 320, budgets.work.clone()).unwrap()),
+            budgets,
             clock: Arc::new(SystemClock::default()),
             events: Arc::new(DiscardEvents),
         };
@@ -863,6 +878,7 @@ fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
             .close_session(&context(1), epoch, &current.session_id)
             .unwrap();
         drop(runtime);
+        drop(resources.scheduler);
         until(|| resources.budgets.used() == 0);
     }
 }
@@ -922,5 +938,6 @@ fn parked_native_task_cancels_and_session_closes_with_general_work_budget_full()
     );
     until(|| resources.scheduler.handles().open() == 0);
     drop((pressure, additional, runtime));
+    drop(resources.scheduler);
     until(|| resources.budgets.used() == 0);
 }

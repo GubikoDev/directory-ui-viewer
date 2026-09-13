@@ -236,9 +236,10 @@ mod macos {
         allocated: Measure,
     }
     fn trial(profile: &str, n: usize, fixture: &Fixture) -> Trial {
+        let budgets = ManagedBudgets::default();
         let resources = RuntimeResources {
-            scheduler: Arc::new(Scheduler::default()),
-            budgets: ManagedBudgets::default(),
+            scheduler: Arc::new(Scheduler::with_budget(64, 64, 320, budgets.work.clone()).unwrap()),
+            budgets,
             clock: Arc::new(SystemClock::default()),
             events: Arc::new(DiscardEvents),
         };
@@ -364,6 +365,15 @@ mod macos {
         });
         assert_eq!(fd_count(), baseline_fd);
         drop(runtime);
+        drop(resources.scheduler);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while resources.budgets.used() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "scheduler ownership did not drain"
+            );
+            std::thread::yield_now();
+        }
         assert_eq!(resources.budgets.used(), 0);
         Trial {
             profile: profile.into(),

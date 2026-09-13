@@ -1,5 +1,8 @@
 //! Two fixed application-wide OS workers. Never recreate this pool per root.
-use crate::domain::controller::{Cancellation, Scope};
+use crate::{
+    domain::controller::{Cancellation, Scope},
+    runtime::memory::{ByteBudget, Reservation},
+};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
@@ -61,30 +64,35 @@ pub enum Wait {
 }
 #[derive(Clone)]
 pub struct Ticket {
+    inner: Arc<TicketData>,
+}
+struct TicketData {
     id: String,
     scope: Scope,
     cancel: Cancellation,
     status: Arc<Mutex<Status>>,
     wake_requested: Arc<AtomicBool>,
+    _memory: Reservation,
 }
 impl Ticket {
     fn cancel(&self) {
-        self.cancel.cancel();
+        self.inner.cancel.cancel();
     }
     pub fn status(&self) -> Status {
-        *self.status.lock().unwrap()
+        *self.inner.status.lock().unwrap()
     }
     pub fn id(&self) -> &str {
-        &self.id
+        &self.inner.id
     }
     fn set(&self, status: Status) {
-        *self.status.lock().unwrap() = status;
+        *self.inner.status.lock().unwrap() = status;
     }
 }
 struct Pending {
+    // Drop the job before the ticket can release its shared reservation.
+    job: Box<dyn Job>,
     ticket: Ticket,
     lane: Lane,
-    job: Box<dyn Job>,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
@@ -105,6 +113,8 @@ struct Shared {
     queue_limit: usize,
     parked_limit: usize,
     handles: HandleBudget,
+    budget: ByteBudget,
+    _memory: Reservation,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitError {
@@ -121,6 +131,7 @@ struct HandleCount {
     open: AtomicUsize,
     peak: AtomicUsize,
     limit: usize,
+    _memory: Reservation,
 }
 pub struct HandlePermit {
     inner: Arc<HandleCount>,
@@ -130,13 +141,20 @@ impl HandleBudget {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
     pub fn new(limit: usize) -> Self {
-        Self {
+        Self::with_budget(limit, &ByteBudget::new(usize::MAX)).expect("standalone handle counter")
+    }
+    fn with_budget(limit: usize, budget: &ByteBudget) -> Result<Self, SubmitError> {
+        let memory = budget
+            .reserve(512)
+            .map_err(|_| SubmitError::ResourceLimit)?;
+        Ok(Self {
             inner: Arc::new(HandleCount {
                 open: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 limit,
+                _memory: memory,
             }),
-        }
+        })
     }
     pub fn acquire(&self) -> Result<HandlePermit, SubmitError> {
         let count = self
@@ -173,13 +191,51 @@ impl Default for Scheduler {
     }
 }
 impl Scheduler {
+    /// Standalone fixture scheduler. NativeRuntime requires with_budget instead.
     pub fn new(queue_limit: usize, parked_limit: usize, handle_limit: usize) -> Self {
+        Self::with_budget(
+            queue_limit,
+            parked_limit,
+            handle_limit,
+            ByteBudget::new(usize::MAX),
+        )
+        .expect("valid standalone scheduler")
+    }
+    pub fn with_budget(
+        queue_limit: usize,
+        parked_limit: usize,
+        handle_limit: usize,
+        budget: ByteBudget,
+    ) -> Result<Self, SubmitError> {
+        let slots = queue_limit
+            .checked_add(1)
+            .ok_or(SubmitError::ResourceLimit)?;
+        // Ring capacity rounding, parked nodes, fixed worker/condvar/handle
+        // metadata and bounded stack work. OS thread stacks/RSS are separate.
+        let bytes = slots
+            .checked_mul(4 * std::mem::size_of::<Pending>())
+            .and_then(|n| {
+                parked_limit
+                    .checked_mul(std::mem::size_of::<Pending>() + 512)
+                    .and_then(|p| n.checked_add(p))
+            })
+            .and_then(|n| n.checked_add(32 * 1024))
+            .ok_or(SubmitError::ResourceLimit)?;
+        let memory = budget
+            .reserve(bytes)
+            .map_err(|_| SubmitError::ResourceLimit)?;
+        let mut queues = [VecDeque::new(), VecDeque::new()];
+        for queue in &mut queues {
+            queue
+                .try_reserve_exact(slots)
+                .map_err(|_| SubmitError::ResourceLimit)?;
+            if queue.capacity() > slots.saturating_mul(2) {
+                return Err(SubmitError::ResourceLimit);
+            }
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                queues: [
-                    VecDeque::with_capacity(queue_limit + 1),
-                    VecDeque::with_capacity(queue_limit + 1),
-                ],
+                queues,
                 active: [None, None],
                 parked: BTreeMap::new(),
                 shutdown: false,
@@ -187,11 +243,13 @@ impl Scheduler {
             ready: Condvar::new(),
             queue_limit,
             parked_limit,
-            handles: HandleBudget::new(handle_limit),
+            handles: HandleBudget::with_budget(handle_limit, &budget)?,
+            budget,
+            _memory: memory,
         });
         for lane in [Lane::Foreground, Lane::Background] {
-            let shared = shared.clone();
-            thread::Builder::new()
+            let worker_shared = shared.clone();
+            if thread::Builder::new()
                 .name(
                     match lane {
                         Lane::Foreground => "directory-foreground",
@@ -199,10 +257,21 @@ impl Scheduler {
                     }
                     .into(),
                 )
-                .spawn(move || worker(shared, lane))
-                .expect("create fixed filesystem worker");
+                .spawn(move || worker(worker_shared, lane))
+                .is_err()
+            {
+                shared.state.lock().unwrap().shutdown = true;
+                shared.ready.notify_all();
+                return Err(SubmitError::ResourceLimit);
+            }
         }
-        Self { shared }
+        Ok(Self { shared })
+    }
+    pub fn fixed_bytes(&self) -> usize {
+        self.shared._memory.bytes() + self.shared.handles.inner._memory.bytes()
+    }
+    pub fn uses_budget(&self, budget: &ByteBudget) -> bool {
+        self.shared.budget.same_pool(budget)
     }
     pub fn handles(&self) -> HandleBudget {
         self.shared.handles.clone()
@@ -221,18 +290,39 @@ impl Scheduler {
         if state.queues.iter().map(VecDeque::len).sum::<usize>() >= self.shared.queue_limit {
             return Err(SubmitError::ResourceLimit);
         }
-        if state.active.iter().flatten().any(|t| t.id == id)
+        if state.active.iter().flatten().any(|t| t.inner.id == id)
             || state.parked.contains_key(&id)
-            || state.queues.iter().flatten().any(|p| p.ticket.id == id)
+            || state
+                .queues
+                .iter()
+                .flatten()
+                .any(|p| p.ticket.inner.id == id)
         {
             return Err(SubmitError::Duplicate);
         }
+        // Arguments are moved, not copied. Ticket clones share this owner;
+        // include the parked map's one copied key and the boxed job allocation.
+        let bytes = id
+            .capacity()
+            .checked_add(scope.session_id.capacity())
+            .and_then(|n| n.checked_add(id.len().saturating_mul(2)))
+            .and_then(|n| n.checked_add(std::mem::size_of_val(&job)))
+            .and_then(|n| n.checked_add(2048))
+            .ok_or(SubmitError::ResourceLimit)?;
+        let memory = self
+            .shared
+            .budget
+            .reserve(bytes)
+            .map_err(|_| SubmitError::ResourceLimit)?;
         let ticket = Ticket {
-            id,
-            scope,
-            cancel: Cancellation::default(),
-            status: Arc::new(Mutex::new(Status::Queued)),
-            wake_requested: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(TicketData {
+                id,
+                scope,
+                cancel: Cancellation::default(),
+                status: Arc::new(Mutex::new(Status::Queued)),
+                wake_requested: Arc::new(AtomicBool::new(false)),
+                _memory: memory,
+            }),
         };
         state.queues[lane.index()].push_back(Pending {
             ticket: ticket.clone(),
@@ -249,11 +339,16 @@ impl Scheduler {
         if state.shutdown {
             return Err(SubmitError::Closed);
         }
-        if let Some(ticket) = state.active.iter().flatten().find(|t| t.id == id) {
-            ticket.wake_requested.store(true, Ordering::Release);
+        if let Some(ticket) = state.active.iter().flatten().find(|t| t.inner.id == id) {
+            ticket.inner.wake_requested.store(true, Ordering::Release);
             return Ok(());
         }
-        if state.queues.iter().flatten().any(|p| p.ticket.id == id) {
+        if state
+            .queues
+            .iter()
+            .flatten()
+            .any(|p| p.ticket.inner.id == id)
+        {
             return Ok(());
         }
         if state.queues.iter().map(VecDeque::len).sum::<usize>() >= self.shared.queue_limit {
@@ -274,23 +369,27 @@ impl Scheduler {
             }
             ticket.cancel();
             if let Some(index) = state.queues.iter().position(|queue| {
-                queue
-                    .iter()
-                    .any(|p| p.ticket.id == ticket.id && p.ticket.scope == ticket.scope)
+                queue.iter().any(|p| {
+                    p.ticket.inner.id == ticket.inner.id
+                        && p.ticket.inner.scope == ticket.inner.scope
+                })
             }) {
                 let position = state.queues[index]
                     .iter()
-                    .position(|p| p.ticket.id == ticket.id && p.ticket.scope == ticket.scope)
+                    .position(|p| {
+                        p.ticket.inner.id == ticket.inner.id
+                            && p.ticket.inner.scope == ticket.inner.scope
+                    })
                     .unwrap();
                 let pending = state.queues[index].remove(position).unwrap();
                 pending.ticket.set(Status::Cancelled);
                 Some(pending)
             } else if state
                 .parked
-                .get(&ticket.id)
-                .is_some_and(|p| p.ticket.scope == ticket.scope)
+                .get(&ticket.inner.id)
+                .is_some_and(|p| p.ticket.inner.scope == ticket.inner.scope)
             {
-                let pending = state.parked.remove(&ticket.id).unwrap();
+                let pending = state.parked.remove(&ticket.inner.id).unwrap();
                 pending.ticket.set(Status::Cancelled);
                 Some(pending)
             } else {
@@ -304,42 +403,54 @@ impl Scheduler {
     /// No disk I/O or worker join while holding the control lock. Parked cursor
     /// destructors run after unlock; active blocking calls retain their slot.
     pub fn cancel_scope(&self, scope: &Scope) {
-        let mut retired = vec![];
         {
-            let mut state = self.shared.state.lock().unwrap();
+            let state = self.shared.state.lock().unwrap();
             for ticket in state.active.iter().flatten() {
-                if &ticket.scope == scope {
+                if &ticket.inner.scope == scope {
                     ticket.cancel();
                 }
             }
-            for queue in &mut state.queues {
-                let mut keep = VecDeque::with_capacity(queue.len());
-                while let Some(pending) = queue.pop_front() {
-                    if &pending.ticket.scope == scope {
-                        pending.ticket.cancel();
-                        pending.ticket.set(Status::Cancelled);
-                        retired.push(pending);
-                    } else {
-                        keep.push_back(pending);
-                    }
+            for pending in state.queues.iter().flatten().chain(state.parked.values()) {
+                if &pending.ticket.inner.scope == scope {
+                    pending.ticket.cancel();
+                    pending.ticket.set(Status::Cancelled);
                 }
-                *queue = keep;
-            }
-            let ids: Vec<_> = state
-                .parked
-                .iter()
-                .filter(|(_, p)| &p.ticket.scope == scope)
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in ids {
-                let pending = state.parked.remove(&id).unwrap();
-                pending.ticket.cancel();
-                pending.ticket.set(Status::Cancelled);
-                retired.push(pending);
             }
         }
         self.shared.ready.notify_all();
-        drop(retired);
+        // Remove marked owners individually. No temporary Vec/String/ring
+        // allocation is required for close under pressure. Destructors run
+        // outside the lock; new submissions are not part of this snapshot.
+        loop {
+            let retired = {
+                let mut state = self.shared.state.lock().unwrap();
+                let matches = |p: &Pending| {
+                    &p.ticket.inner.scope == scope && p.ticket.status() == Status::Cancelled
+                };
+                let mut found = None;
+                for queue in &mut state.queues {
+                    if let Some(index) = queue.iter().position(&matches) {
+                        found = queue.remove(index);
+                        break;
+                    }
+                }
+                if found.is_none() {
+                    let ticket = state
+                        .parked
+                        .values()
+                        .find(|p| matches(p))
+                        .map(|p| p.ticket.clone());
+                    if let Some(ticket) = ticket {
+                        found = state.parked.remove(ticket.id());
+                    }
+                }
+                found
+            };
+            if retired.is_none() {
+                break;
+            }
+            drop(retired);
+        }
     }
     pub fn wait_reason(&self, ticket: &Ticket) -> Option<Wait> {
         let state = self.shared.state.lock().unwrap();
@@ -347,7 +458,7 @@ impl Scheduler {
         if status == Status::Paused {
             return Some(Wait::PageDemand);
         }
-        if status == Status::Running && ticket.cancel.is_cancelled() {
+        if status == Status::Running && ticket.inner.cancel.is_cancelled() {
             return Some(Wait::Draining);
         }
         if status != Status::Queued {
@@ -356,11 +467,11 @@ impl Scheduler {
         let lane = state
             .queues
             .iter()
-            .position(|q| q.iter().any(|p| p.ticket.id == ticket.id))?;
+            .position(|q| q.iter().any(|p| p.ticket.inner.id == ticket.inner.id))?;
         Some(
             if state.active[lane]
                 .as_ref()
-                .is_some_and(|t| t.cancel.is_cancelled())
+                .is_some_and(|t| t.inner.cancel.is_cancelled())
             {
                 Wait::Draining
             } else {
@@ -385,21 +496,19 @@ impl Drop for Scheduler {
             for ticket in state.active.iter().flatten() {
                 ticket.cancel();
             }
-            let mut retired = vec![];
-            for queue in &mut state.queues {
-                retired.extend(queue.drain(..));
+            for pending in state.queues.iter().flatten().chain(state.parked.values()) {
+                pending.ticket.cancel();
+                pending.ticket.set(Status::Cancelled);
             }
-            retired.extend(std::mem::take(&mut state.parked).into_values());
-            retired
+            (
+                std::mem::take(&mut state.queues),
+                std::mem::take(&mut state.parked),
+            )
         };
-        for pending in &retired {
-            pending.ticket.cancel();
-            pending.ticket.set(Status::Cancelled);
-        }
         self.shared.ready.notify_all();
         drop(retired);
-        // A stuck kernel call cannot be joined on the UI thread. The original two
-        // workers exit after it returns; no replacement threads are spawned.
+        // Original workers retain Shared and its reservations through blocked
+        // OS calls. No join on the control thread and no replacement workers.
     }
 }
 fn worker(shared: Arc<Shared>, lane: Lane) {
@@ -423,16 +532,18 @@ fn worker(shared: Arc<Shared>, lane: Lane) {
             }
         };
         pending.ticket.set(Status::Running);
-        let step = if pending.ticket.cancel.is_cancelled() {
+        let step = if pending.ticket.inner.cancel.is_cancelled() {
             JobStep::Completed
         } else {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pending.job.step(&pending.ticket.cancel, &shared.handles)
+                pending
+                    .job
+                    .step(&pending.ticket.inner.cancel, &shared.handles)
             }))
             .unwrap_or(JobStep::Failed)
         };
         let mut state = shared.state.lock().unwrap();
-        if state.shutdown || pending.ticket.cancel.is_cancelled() {
+        if state.shutdown || pending.ticket.inner.cancel.is_cancelled() {
             pending.ticket.set(Status::Cancelled);
             state.active[lane.index()] = None;
             drop(state);
@@ -440,7 +551,11 @@ fn worker(shared: Arc<Shared>, lane: Lane) {
             continue;
         }
         let step = if step == JobStep::Paused
-            && pending.ticket.wake_requested.swap(false, Ordering::AcqRel)
+            && pending
+                .ticket
+                .inner
+                .wake_requested
+                .swap(false, Ordering::AcqRel)
         {
             JobStep::Yield
         } else {
@@ -467,7 +582,9 @@ fn worker(shared: Arc<Shared>, lane: Lane) {
                     continue;
                 }
                 pending.ticket.set(Status::Paused);
-                state.parked.insert(pending.ticket.id.clone(), pending);
+                state
+                    .parked
+                    .insert(pending.ticket.inner.id.clone(), pending);
             }
             terminal => {
                 pending.ticket.set(match terminal {
@@ -538,6 +655,115 @@ mod tests {
             self.permit = Some(handles.acquire().unwrap());
             JobStep::Paused
         }
+    }
+    fn until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "owner did not drain");
+            thread::yield_now();
+        }
+    }
+    #[test]
+    fn handle_counter_charge_follows_external_permits_after_scheduler_shutdown() {
+        let budget = ByteBudget::new(256 * 1024);
+        let scheduler = Scheduler::with_budget(64, 64, 320, budget.clone()).unwrap();
+        let handles = scheduler.handles();
+        let permit = handles.acquire().unwrap();
+        drop(scheduler);
+        until(|| budget.used() == 512);
+        drop(handles);
+        assert_eq!(budget.used(), 512);
+        drop(permit);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn ticket_clones_share_charged_metadata_until_the_last_actual_owner_drops() {
+        let budget = ByteBudget::new(256 * 1024);
+        let scheduler = Scheduler::with_budget(64, 64, 320, budget.clone()).unwrap();
+        let fixed = scheduler.fixed_bytes();
+        assert_eq!(budget.used(), fixed);
+        let ticket = scheduler
+            .submit("retained".into(), scope(1), Lane::Foreground, Once)
+            .unwrap();
+        wait(&ticket, Status::Completed);
+        until(|| Arc::strong_count(&ticket.inner) == 1);
+        let held = budget.used() - fixed;
+        assert!(held >= 2048);
+        let clone = ticket.clone();
+        assert!(Arc::ptr_eq(&ticket.inner, &clone.inner));
+        assert_eq!(budget.used(), fixed + held);
+        drop(ticket);
+        drop(scheduler);
+        until(|| budget.used() == held);
+        drop(clone);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn constructor_and_submission_admit_before_creating_owned_work() {
+        let small = ByteBudget::new(1024);
+        assert!(Scheduler::with_budget(64, 64, 320, small.clone()).is_err());
+        assert_eq!(small.used(), 0);
+        let budget = ByteBudget::new(256 * 1024);
+        let scheduler = Scheduler::with_budget(64, 64, 320, budget.clone()).unwrap();
+        let pressure = budget.reserve(budget.available()).unwrap();
+        assert!(matches!(
+            scheduler.submit("rejected".into(), scope(1), Lane::Foreground, Once),
+            Err(SubmitError::ResourceLimit)
+        ));
+        assert_eq!(scheduler.counts(), (0, 0, 0));
+        assert_eq!(budget.used(), budget.limit());
+        drop(pressure);
+        drop(scheduler);
+        until(|| budget.used() == 0);
+    }
+    #[test]
+    fn saturated_scope_cancel_and_drop_allocate_no_retirement_lists_and_keep_blocked_costs() {
+        let budget = ByteBudget::new(256 * 1024);
+        let scheduler = Scheduler::with_budget(64, 64, 320, budget.clone()).unwrap();
+        let fixed = scheduler.fixed_bytes();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocked = scheduler
+            .submit(
+                "blocked".into(),
+                scope(1),
+                Lane::Foreground,
+                Block {
+                    ready: ready_tx,
+                    release: release_rx,
+                    permit: None,
+                },
+            )
+            .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let parked = scheduler
+            .submit(
+                "parked".into(),
+                scope(1),
+                Lane::Background,
+                Pause {
+                    permit: None,
+                    ran: false,
+                },
+            )
+            .unwrap();
+        wait(&parked, Status::Paused);
+        let pressure = budget.reserve(budget.available()).unwrap();
+        scheduler.cancel_scope(&scope(1));
+        assert_eq!(parked.status(), Status::Cancelled);
+        assert_eq!(scheduler.counts(), (1, 0, 0));
+        drop(scheduler);
+        drop(parked);
+        drop(pressure);
+        assert!(
+            budget.used() > fixed,
+            "blocked OS owner retains pool and ticket"
+        );
+        release_tx.send(()).unwrap();
+        wait(&blocked, Status::Cancelled);
+        drop(blocked);
+        until(|| budget.used() == 0);
+        assert!(budget.peak() <= budget.limit());
     }
     #[test]
     fn demand_arriving_before_park_is_not_lost() {

@@ -188,7 +188,10 @@ impl Bridge {
         let runtime = Arc::new(NativeRuntime::new(
             context.clone(),
             RuntimeResources {
-                scheduler: Arc::new(Scheduler::new(64, 64, 320)),
+                scheduler: Arc::new(
+                    Scheduler::with_budget(64, 64, 320, budgets.work.clone())
+                        .map_err(|_| issue("RESOURCE_LIMIT"))?,
+                ),
                 budgets: budgets.clone(),
                 clock: clock.clone(),
                 events,
