@@ -584,7 +584,13 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tauri::async_runtime::spawn(async move {
+        let event_lane = Arc::new(tokio::sync::Semaphore::new(1));
         while let Some(event) = events.recv().await {
+            let Ok(permit) = event_lane.clone().try_acquire_owned() else {
+                // A timed-out WK callback still owns the lane. Drop hints until
+                // that callback is destroyed; never consume more work budget.
+                continue;
+            };
             // read_task validates current ownership but returns a WorkRecord
             // clone; admit its bounded temporary before acquiring it.
             let Ok(_validation_memory) = bridge.budgets.work.reserve(64 * 1024) else {
@@ -616,7 +622,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             else {
                 continue;
             };
-            let Ok(receipt) = delivery.submit(|script, callback| {
+            let Ok(receipt) = delivery.submit_guarded(permit, |script, callback| {
                 window
                     .eval_with_callback(script, callback)
                     .map_err(|_| super::delivery::DeliveryError::Disconnected)

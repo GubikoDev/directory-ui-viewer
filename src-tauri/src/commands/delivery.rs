@@ -137,6 +137,23 @@ impl Delivery {
             _memory: self.memory,
         })
     }
+    /// An admission permit must follow the native callback, not a timed-out
+    /// waiter. This prevents a best-effort event lane accumulating abandoned evals.
+    pub fn submit_guarded(
+        self,
+        guard: impl Send + 'static,
+        schedule: impl FnOnce(String, Callback) -> Result<(), DeliveryError>,
+    ) -> Result<Receipt, DeliveryError> {
+        self.submit(|script, callback| {
+            schedule(
+                script,
+                Box::new(move |value| {
+                    let _retained = &guard;
+                    callback(value);
+                }),
+            )
+        })
+    }
 }
 impl Receipt {
     /// Requires the evaluated expression to return the boolean true.
@@ -169,14 +186,17 @@ mod tests {
             serde_json::from_value(wire["event"].clone()).unwrap();
         event.task_id = "\");throw Error('injected')//한글".into();
         let mut queued = None;
+        let lane = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = lane.clone().try_acquire_owned().unwrap();
         let receipt = Delivery::work_event(&"a".repeat(64), &event, &budget)
             .unwrap()
-            .submit(|script, callback| {
+            .submit_guarded(permit, |script, callback| {
                 queued = Some((script, callback));
                 Ok(())
             })
             .unwrap();
         drop(receipt);
+        assert!(lane.clone().try_acquire_owned().is_err());
         assert_eq!(budget.used(), 64 * 1024);
         assert!(matches!(
             Delivery::work_event(&"a".repeat(64), &event, &budget),
@@ -195,8 +215,10 @@ mod tests {
         assert!(script.contains("window.__DIRECTORY_DOCUMENT_PROOF__!=="));
         drop(script);
         callback("false".into());
+        assert!(lane.clone().try_acquire_owned().is_err());
         assert_eq!(budget.used(), 64 * 1024);
         drop(callback);
+        assert!(lane.try_acquire_owned().is_ok());
         assert_eq!(budget.used(), 0);
         event.task_id = "x".repeat(4097);
         assert!(matches!(
