@@ -22,6 +22,8 @@ export interface MeasurementClock {
 }
 export interface TrialMeasurement {
   trial: number;
+  startedAtUnixMs: number;
+  cancelStartedAtUnixMs: number;
   refreshMs: number;
   firstPageMs: number;
   fullObservationMs: number;
@@ -100,6 +102,7 @@ export function measureApprovedRoot(
     try {
       for (let trial = 1; trial <= 10; trial++) {
         check();
+        const startedAtUnixMs = Date.now();
         const refreshStarted = clock.now();
         await client.refresh();
         check();
@@ -157,6 +160,8 @@ export function measureApprovedRoot(
               : value.state === 'complete' && value.bytes === bytes;
           return {
             trial,
+            startedAtUnixMs,
+            cancelStartedAtUnixMs: 0,
             refreshMs,
             firstPageMs,
             fullObservationMs,
@@ -198,6 +203,7 @@ export function measureApprovedRoot(
         }
         if (!cancelId) throw new Error('MISSING_USAGE_TASK');
         const cancelStarted = clock.now();
+        result.cancelStartedAtUnixMs = Date.now();
         result.cancelStatus = (await client.cancel(cancelId)) ?? null;
         result.cancelMs = clock.now() - cancelStarted;
         check(cancelScope);

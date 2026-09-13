@@ -5,13 +5,13 @@ Use only freshly generated test folders, through the normal native picker.
 
 ```sh
 node e2e/prepare-native-fixture.mjs hardlinks
-VITE_INTERNAL_BENCHMARK=1 npm run tauri dev
+VITE_INTERNAL_BENCHMARK=1 npm run tauri -- dev --features internal-metrics
 ```
 
 For a standalone local instrumented app:
 
 ```sh
-VITE_INTERNAL_BENCHMARK=1 npm run tauri -- build --debug --bundles app --no-sign --config '{"bundle":{"active":true}}'
+VITE_INTERNAL_BENCHMARK=1 npm run tauri -- build --debug --features internal-metrics --bundles app --no-sign --config '{"bundle":{"active":true}}'
 ```
 
 Choose the generator's `selectionPath` in the picker and paste only its
@@ -64,6 +64,48 @@ audits, and actual WebKit security/picker/lifecycle checks need separate evidenc
 Record build mode, hardware, OS, filesystem, source revision, and OS-cache
 conditions with each real run. OS caches are not flushed by this tool. A normal
 build without `VITE_INTERNAL_BENCHMARK=1` omits the panel and measurement code.
+
+## Native managed counters in the instrumented app
+
+The additional Rust feature `internal-metrics` records `nativeManagedCounters`
+JSON lines to stderr at startup, request entry/exit, connection entry/exit, and
+document invalidation entry/exit. It registers no IPC command or new permission.
+Capture stderr when launching the built app after the Mac is unlocked. Filter
+only these JSON records; unrelated runtime messages are not measurement rows.
+
+Records contain numeric counters, process/time information, and fixed stage
+labels, never directory paths, filenames, document proofs or session IDs.
+`ordinal` is monotonic within that recorder and `spanBeginOrdinal` on an end
+record identifies its begin record even when requests overlap. Gaps, missing
+begins/ends, truncated output, or no expected final record make a trace
+incomplete. An end marker means the command/document callback's local scope
+ended, including errors or dropped futures; it does not certify successful
+execution or that all older native I/O/WK callbacks have drained.
+
+Each of the five existing shared pools reports used, lifetime peak, and limit.
+Counters and managed FD values are independent atomic reads, not a simultaneous
+snapshot. A peak update can still be in flight while a request allocates. Use a
+sample after work has drained for final counter conclusions. Lifetime peaks do
+not reset per trial. Their component sum is an upper bound from the observed
+pool peaks, not the exact simultaneous combined high-water mark. These are
+managed reservations, including retained callbacks and unused reservations;
+they are not RSS or allocator block sizes.
+
+The recorder reserves 4,096 bytes from the existing ordinary work pool before
+construction and uses a mutex-protected fixed 2,048-byte output buffer. That
+cost remains in the 128 MiB total and is reported separately; do not subtract it
+to manufacture a passing total. The maximum-width serialized fields are tested
+against the fixed buffer. Synchronous stderr output and recorder locking can
+increase observed latency, so keep the feature/build mode with run results.
+Output failures drop the measurement record, without changing authorization
+or the command's result. They must not be interpreted as successful evidence.
+
+Frontend trial `startedAtUnixMs` and `cancelStartedAtUnixMs` allow rough alignment
+with native timestamps and the external observer's start timestamp plus elapsed
+time. Latency still uses the monotonic frontend clock. Wall-clock adjustment
+can invalidate alignment; timestamps do not independently prove which native
+task was running. Normal Rust builds omit this recorder unless the feature is
+explicitly enabled. No background service or polling thread is installed.
 
 ## External process metrics on macOS
 

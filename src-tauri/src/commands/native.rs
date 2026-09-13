@@ -3,6 +3,8 @@ use super::{
     protocol::{Command, MAX_MESSAGE_BYTES, Request},
     replay::{self, CONTROL_REPLY_BYTES, ReplayService, RequestAdmission},
 };
+#[cfg(feature = "internal-metrics")]
+use crate::runtime::metrics::{Recorder, Stage};
 use crate::{
     domain::{
         controller::{ControlError, NativeContext, Scope},
@@ -162,6 +164,8 @@ impl EventSink for NativeEvents {
     }
 }
 pub struct Bridge {
+    #[cfg(feature = "internal-metrics")]
+    metrics: Recorder,
     document: Mutex<Document>,
     dispatch: Mutex<()>,
     hint_memory: Mutex<Reservation>,
@@ -185,13 +189,17 @@ impl Bridge {
             window: "main".into(),
             document: 0,
         };
+        let scheduler = Arc::new(
+            Scheduler::with_budget(64, 64, 320, budgets.work.clone())
+                .map_err(|_| issue("RESOURCE_LIMIT"))?,
+        );
+        #[cfg(feature = "internal-metrics")]
+        let metrics = Recorder::new(budgets.clone(), scheduler.handles())
+            .map_err(|_| issue("RESOURCE_LIMIT"))?;
         let runtime = Arc::new(NativeRuntime::new(
             context.clone(),
             RuntimeResources {
-                scheduler: Arc::new(
-                    Scheduler::with_budget(64, 64, 320, budgets.work.clone())
-                        .map_err(|_| issue("RESOURCE_LIMIT"))?,
-                ),
+                scheduler,
                 budgets: budgets.clone(),
                 clock: clock.clone(),
                 events,
@@ -199,6 +207,8 @@ impl Bridge {
         )?);
         Ok((
             Arc::new(Self {
+                #[cfg(feature = "internal-metrics")]
+                metrics,
                 dispatch: Mutex::new(()),
                 // One synchronous hint parser at a time, including escaped-key
                 // scratch, recursion and errors, even when data admission is full.
@@ -221,6 +231,8 @@ impl Bridge {
         ))
     }
     fn loaded(&self) {
+        #[cfg(feature = "internal-metrics")]
+        let _metrics = self.metrics.span(Stage::DocumentBegin, Stage::DocumentEnd);
         let mut document = self.document.lock().unwrap();
         document.proof = None;
         // Exhaustion fails closed; there is no wrapped document identity.
@@ -315,6 +327,8 @@ pub async fn connect_client(
     state: tauri::State<'_, Arc<Bridge>>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<InvokeResponseBody, FsIssue> {
+    #[cfg(feature = "internal-metrics")]
+    let _metrics = state.metrics.span(Stage::ConnectBegin, Stage::ConnectEnd);
     let (input, _memory): (Connect, _) = state.parse(&request, &state.budgets.work)?;
     if input.protocol_version != 1 {
         return Err(issue("VERSION_UNSUPPORTED"));
@@ -349,6 +363,8 @@ pub async fn filesystem_request(
     state: tauri::State<'_, Arc<Bridge>>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<InvokeResponseBody, FsIssue> {
+    #[cfg(feature = "internal-metrics")]
+    let _metrics = state.metrics.span(Stage::RequestBegin, Stage::RequestEnd);
     let priority = state.control_request(&request);
     let budget = if priority {
         state.budgets.work.control()
@@ -646,6 +662,8 @@ fn execute(
 
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let (bridge, mut events) = Bridge::new().map_err(|e| std::io::Error::other(e.code))?;
+    #[cfg(feature = "internal-metrics")]
+    bridge.metrics.emit(Stage::Startup);
     app.manage(bridge.clone());
     let lifecycle = bridge.clone();
     let config = app
