@@ -20,6 +20,89 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('SessionClient with deterministic adapter', () => {
+  it('does not hold close behind an unresolved listing start response', async () => {
+    const { client, adapter, store } = setup();
+    await client.chooseRoot();
+    const original = adapter.startListing.bind(adapter);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const start = vi
+      .spyOn(adapter, 'startListing')
+      .mockImplementation(async (request) => {
+        const response = await original(request);
+        await gate;
+        return response;
+      });
+    const listing = client.list('B', 'directories');
+    await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
+    await client.close();
+    expect(store.getSnapshot().session).toBeNull();
+    release();
+    await listing;
+    expect(store.getSnapshot().session).toBeNull();
+  });
+  it('bounds queued dispatch and drops old lifecycle work before adapter invocation', async () => {
+    const { client, adapter } = setup();
+    await client.chooseRoot();
+    const before = adapter.calls.startListing;
+    const requests = Array.from({ length: 65 }, () =>
+      client.list('B', 'directories'),
+    );
+    client.dispose();
+    const results = await Promise.allSettled(requests);
+    expect(
+      results
+        .slice(0, 64)
+        .every(
+          (result) =>
+            result.status === 'rejected' &&
+            result.reason.message === 'CLIENT_EXPIRED',
+        ),
+    ).toBe(true);
+    expect(results[64]).toMatchObject({
+      status: 'rejected',
+      reason: { message: 'RESOURCE_LIMIT' },
+    });
+    expect(adapter.calls.startListing).toBe(before);
+  });
+  it('coalesces polling across a slow task response and stops on close', async () => {
+    vi.useFakeTimers();
+    const { client, adapter } = setup();
+    adapter.deferTasks = true;
+    adapter.dropEvents = true;
+    await client.chooseRoot();
+    const original = adapter.readTask.bind(adapter);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = vi
+      .spyOn(adapter, 'readTask')
+      .mockImplementation(async (request) => {
+        await gate;
+        return original(request);
+      });
+    vi.setSystemTime(Date.now() + 2000);
+    const first = client.poll();
+    expect(client.poll()).toBe(first);
+    expect(read).toHaveBeenCalledOnce();
+    await client.close();
+    release();
+    await first;
+    expect(read).toHaveBeenCalledOnce();
+  });
+  it('admits usage ID arrays before starting an adapter read', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter } = setup(new FixtureAdapter(), budget);
+    await client.chooseRoot();
+    const calls = adapter.calls.readUsage;
+    const blocker = budget.reserve(budget.limit - budget.used);
+    await expect(client.readUsage()).rejects.toThrow('RESOURCE_LIMIT');
+    expect(adapter.calls.readUsage).toBe(calls);
+    blocker.close();
+  });
   it('keeps native control ownership when a chosen root cannot fit the view', async () => {
     const budget = new FrontendBudget();
     const { client, adapter, store } = setup(new FixtureAdapter(), budget);
