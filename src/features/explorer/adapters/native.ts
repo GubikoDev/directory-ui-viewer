@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { nativeInbox, responseKey } from './inbox';
 import type {
   FilesystemAdapter,
   Request,
@@ -55,11 +56,18 @@ export class NativeAdapter implements FilesystemAdapter {
     input: Request,
   ): Promise<Response<T>> {
     const { protocolVersion, requestId, ...fields } = input;
+    let release: (() => void) | undefined;
     try {
-      return await invoke(
+      const document = documentProof();
+      const inbox = nativeInbox();
+      const key = responseKey();
+      inbox.open(key);
+      release = () => inbox.close(key);
+      await invoke(
         'filesystem_request',
         this.encode({
-          documentProof: documentProof(),
+          documentProof: document,
+          responseKey: key,
           request: {
             protocolVersion,
             requestId,
@@ -67,6 +75,7 @@ export class NativeAdapter implements FilesystemAdapter {
           },
         }),
       );
+      return JSON.parse(inbox.read(key)) as Response<T>;
     } catch (error) {
       const code = errorCode(error);
       return {
@@ -74,6 +83,8 @@ export class NativeAdapter implements FilesystemAdapter {
         outcome: 'error',
         error: { code, operation: 'request', scope: 'root' },
       };
+    } finally {
+      release?.();
     }
   }
   chooseRoot(input: Input<'chooseRoot'>): Promise<Reply<'chooseRoot'>> {

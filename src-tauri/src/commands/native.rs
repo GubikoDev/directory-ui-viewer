@@ -73,6 +73,7 @@ struct Connect {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Envelope {
     document_proof: String,
+    response_key: String,
     request: Request,
 }
 #[derive(Serialize)]
@@ -292,6 +293,9 @@ pub async fn filesystem_request(
     request: tauri::ipc::Request<'_>,
 ) -> Result<InvokeResponseBody, FsIssue> {
     let (input, memory): (Envelope, _) = state.parse(&request)?;
+    if !super::delivery::valid_key(&input.response_key) {
+        return Err(issue("INVALID_ARGUMENT"));
+    }
     let number = input.request.validate()?;
     let context = state.authenticate(&window, &input.document_proof).await?;
     let replay = state.replay(&context, number.epoch)?;
@@ -314,7 +318,7 @@ pub async fn filesystem_request(
             RequestAdmission::Execute(completion, waiter) => {
                 execute(
                     state.inner().clone(),
-                    window,
+                    window.clone(),
                     context.clone(),
                     epoch,
                     input.request,
@@ -327,14 +331,33 @@ pub async fn filesystem_request(
     };
     let reply = waiter.wait().await.map_err(control)?;
     state.current(&context)?;
-    // Framework owns the transport buffer after return; cached bytes stay charged.
-    let _transport = state
-        .budgets
-        .work
-        .reserve(reply.bytes().len())
-        .map_err(|_| issue("RESOURCE_LIMIT"))?;
-    let json = String::from_utf8(reply.bytes().to_vec()).map_err(|_| issue("INTERNAL"))?;
-    Ok(InvokeResponseBody::Json(json))
+    let delivery = super::delivery::Delivery::prepare(
+        &input.document_proof,
+        &input.response_key,
+        reply.bytes(),
+        &state.budgets.work,
+    )
+    .map_err(|error| {
+        issue(match error {
+            super::delivery::DeliveryError::ResourceLimit => "RESOURCE_LIMIT",
+            _ => "CLIENT_EXPIRED",
+        })
+    })?;
+    drop(reply);
+    let receipt = delivery
+        .submit(|script, callback| {
+            window
+                .eval_with_callback(script, callback)
+                .map_err(|_| super::delivery::DeliveryError::Disconnected)
+        })
+        .map_err(|_| issue("CLIENT_EXPIRED"))?;
+    tokio::time::timeout(Duration::from_secs(10), receipt.wait())
+        .await
+        .map_err(|_| issue("CLIENT_EXPIRED"))?
+        .map_err(|_| issue("CLIENT_EXPIRED"))?;
+    state.current(&context)?;
+    // Only a fixed-size acknowledgement uses the ordinary IPC response path.
+    Ok(InvokeResponseBody::Json("null".into()))
 }
 
 fn execute(
@@ -593,8 +616,10 @@ mod tests {
         assert!(valid_proof(&"a".repeat(64)));
         assert!(!valid_proof(&"a".repeat(63)));
         assert!(!valid_proof(&"z".repeat(64)));
+        let valid = serde_json::json!({"documentProof":"a".repeat(64),"responseKey":"b".repeat(32),"request":{"protocolVersion":1,"requestId":"native-epoch-1:1","body":{"operation":"chooseRoot"}}});
+        assert!(serde_json::from_value::<Envelope>(valid).is_ok());
         for extra in ["window", "document", "path"] {
-            let value = serde_json::json!({"documentProof":"a".repeat(64),"request":{"protocolVersion":1,"requestId":"native-epoch-1:1","body":{"operation":"chooseRoot"}},extra:1});
+            let value = serde_json::json!({"documentProof":"a".repeat(64),"responseKey":"b".repeat(32),"request":{"protocolVersion":1,"requestId":"native-epoch-1:1","body":{"operation":"chooseRoot"}},extra:1});
             assert!(serde_json::from_value::<Envelope>(value).is_err());
         }
     }

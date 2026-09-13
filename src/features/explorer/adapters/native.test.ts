@@ -1,6 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { NativeAdapter } from './native';
+import { nativeInbox } from './inbox';
+function deliverOnce(response: unknown) {
+  vi.mocked(invoke).mockImplementationOnce(async (_command, args) => {
+    const envelope = JSON.parse(new TextDecoder().decode(args as Uint8Array));
+    expect(
+      nativeInbox().receive(envelope.responseKey, JSON.stringify(response)),
+    ).toBe(true);
+    return undefined as never;
+  });
+}
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
 const request = { protocolVersion: 1 as const, requestId: 'native-epoch-1:2' };
@@ -22,7 +32,7 @@ describe('native wire boundary', () => {
     ).rejects.toThrow('CLIENT_EXPIRED');
   });
   it('sends a bounded binary envelope with document proof and typed operation', async () => {
-    vi.mocked(invoke).mockResolvedValue({
+    deliverOnce({
       requestId: request.requestId,
       outcome: 'cancelled',
     });
@@ -33,6 +43,7 @@ describe('native wire boundary', () => {
     expect(ArrayBuffer.isView(input)).toBe(true);
     expect(JSON.parse(new TextDecoder().decode(input as Uint8Array))).toEqual({
       documentProof: 'a'.repeat(64),
+      responseKey: expect.stringMatching(/^[0-9a-f]{32}$/),
       request: { ...request, body: { operation: 'chooseRoot' } },
     });
   });
@@ -44,7 +55,7 @@ describe('native wire boundary', () => {
       error: { code: 'IO_ERROR', operation: 'refreshRoot', scope: 'root' },
       currentScope: { sessionId: 's', generation: 2 },
     };
-    vi.mocked(invoke).mockResolvedValueOnce(failure);
+    deliverOnce(failure);
     expect(
       await adapter.refreshRoot({
         ...request,
