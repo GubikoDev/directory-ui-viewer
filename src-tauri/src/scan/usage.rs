@@ -1,7 +1,7 @@
 //! Iterative, resumable aggregation over a typed observation source. No OS paths.
 use crate::domain::{
     controller::Cancellation,
-    index::{DirectoryIndex, DirectoryKey, Origin},
+    index::{DirectoryKey, Origin, SharedDirectoryIndex},
     model::{DirectoryUsage, FsIssue, Issues, Kind, Measure, Reason, ScanState},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +29,13 @@ pub struct Observation {
     pub mount: u64,
     pub logical: Metric,
     pub allocated: Metric,
+}
+fn source_error_reason(issue: &FsIssue) -> Reason {
+    if issue.code == "RESOURCE_LIMIT" {
+        Reason::ResourceLimit
+    } else {
+        Reason::ReadError
+    }
 }
 pub trait ObservationSource {
     type Cursor;
@@ -239,7 +246,7 @@ pub struct UsageScanner<S: ObservationSource> {
     source: S,
     stack: Vec<Frame<S::Cursor>>,
     visited: BTreeSet<FileIdentity>,
-    pub index: DirectoryIndex,
+    pub index: SharedDirectoryIndex,
     root_id: String,
     root_mount: u64,
     limits: ScanLimits,
@@ -254,10 +261,11 @@ impl<S: ObservationSource> UsageScanner<S> {
     pub fn new(
         mut source: S,
         root: Observation,
-        mut index: DirectoryIndex,
+        index: impl Into<SharedDirectoryIndex>,
         limits: ScanLimits,
         cancellation: Cancellation,
     ) -> Result<Self, &'static str> {
+        let index = index.into();
         if root.kind != Kind::Directory {
             return Err("NOT_DIRECTORY");
         }
@@ -285,7 +293,7 @@ impl<S: ObservationSource> UsageScanner<S> {
             match source.open(&root) {
                 Ok(cursor) => Some(cursor),
                 Err(issue) => {
-                    aggregate.reason(Reason::ReadError);
+                    aggregate.reason(source_error_reason(&issue));
                     issues.record(issue);
                     None
                 }
@@ -417,9 +425,10 @@ impl<S: ObservationSource> UsageScanner<S> {
                     }
                 }
                 Err(issue) => {
+                    let reason = source_error_reason(&issue);
                     self.issues.record(issue);
                     let frame = self.stack.last_mut().unwrap();
-                    frame.aggregate.reason(Reason::ReadError);
+                    frame.aggregate.reason(reason);
                     frame.cursor = None;
                     continue;
                 }
@@ -488,7 +497,7 @@ impl<S: ObservationSource> UsageScanner<S> {
             let cursor = match self.source.open(&observation) {
                 Ok(cursor) => Some(cursor),
                 Err(issue) => {
-                    aggregate.reason(Reason::ReadError);
+                    aggregate.reason(source_error_reason(&issue));
                     self.issues.record(issue);
                     None
                 }
@@ -539,6 +548,7 @@ impl<S: ObservationSource> UsageScanner<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::index::DirectoryIndex;
     const STAMP: &str = "2026-09-13T00:00:00Z";
     #[derive(Default)]
     struct Source {

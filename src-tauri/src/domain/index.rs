@@ -1,6 +1,9 @@
 //! Generation-owned directory index. Raw component names never cross the IPC boundary.
 use super::model::{Capacity, CapacityState, DirectoryUsage, Entry, Kind};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -135,7 +138,8 @@ impl DirectoryIndex {
         Ok(id)
     }
     /// Exposes a previously scanned directory using the same ID. No summary copy
-    /// or second summary charge; immutable metadata observations are charged once.
+    /// or second summary charge. New listing revisions may replace metadata;
+    /// published listing pages own their prior immutable observations.
     pub fn expose(&mut self, id: &str, entry: Entry) -> Result<(), IndexError> {
         let record = self.records.get(id).ok_or(IndexError::EntryExpired)?;
         if entry.entry_id != id
@@ -144,14 +148,16 @@ impl DirectoryIndex {
         {
             return Err(IndexError::InvalidArgument);
         }
-        if let Some(existing) = &record.entry {
-            return if existing == &entry {
-                Ok(())
-            } else {
-                Err(IndexError::EntryChanged)
-            };
+        if record.entry.as_ref() == Some(&entry) {
+            return Ok(());
         }
-        self.charge(Origin::Foreground, entry_cost(&entry))?;
+        let previous = record.entry.as_ref().map_or(0, entry_cost);
+        let next = entry_cost(&entry);
+        if next > previous {
+            self.charge(Origin::Foreground, next - previous)?;
+        } else {
+            self.foreground_bytes -= previous - next;
+        }
         self.records.get_mut(id).unwrap().entry = Some(entry);
         Ok(())
     }
@@ -189,6 +195,47 @@ impl DirectoryIndex {
             .get(id)
             .map(|r| r.usage.as_ref())
             .ok_or(IndexError::EntryExpired)
+    }
+}
+/// Shared generation index. Every method releases its lock before returning;
+/// callers cannot accidentally hold this lock during filesystem I/O.
+#[derive(Clone)]
+pub struct SharedDirectoryIndex(Arc<Mutex<DirectoryIndex>>);
+impl From<DirectoryIndex> for SharedDirectoryIndex {
+    fn from(index: DirectoryIndex) -> Self {
+        Self(Arc::new(Mutex::new(index)))
+    }
+}
+impl SharedDirectoryIndex {
+    pub fn register(&self, key: DirectoryKey, origin: Origin) -> Result<String, IndexError> {
+        self.0.lock().unwrap().register(key, origin)
+    }
+    pub fn expose(&self, id: &str, entry: Entry) -> Result<(), IndexError> {
+        self.0.lock().unwrap().expose(id, entry)
+    }
+    pub fn key(&self, id: &str) -> Result<DirectoryKey, IndexError> {
+        self.0.lock().unwrap().key(id).cloned()
+    }
+    pub fn entry(&self, id: &str) -> Option<Entry> {
+        self.0.lock().unwrap().entry(id).cloned()
+    }
+    pub fn usage(&self, id: &str) -> Result<Option<DirectoryUsage>, IndexError> {
+        self.0.lock().unwrap().usage(id).map(|u| u.cloned())
+    }
+    pub fn set_usage(&self, usage: DirectoryUsage) -> Result<bool, IndexError> {
+        self.0.lock().unwrap().set_usage(usage)
+    }
+    pub fn capacity(&self) -> Capacity {
+        self.0.lock().unwrap().capacity()
+    }
+    pub fn managed_bytes(&self) -> (usize, usize) {
+        self.0.lock().unwrap().managed_bytes()
+    }
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
     }
 }
 #[cfg(test)]

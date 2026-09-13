@@ -33,6 +33,7 @@ struct Snapshot {
     coverage: Coverage,
     exhausted: bool,
     bytes: usize,
+    demand_end: usize,
 }
 /// Budget estimates deliberately overcount serialization, container storage, and
 /// spare allocation capacity. They are managed-data budgets, not process RSS.
@@ -46,6 +47,7 @@ fn estimate<T: serde::Serialize>(value: &T) -> usize {
 pub struct ListingCache {
     snapshots: BTreeMap<String, Snapshot>,
     serial: u64,
+    eviction_epoch: u64,
     used: usize,
     limit: usize,
     ttl_ms: u64,
@@ -56,6 +58,7 @@ impl ListingCache {
         Self {
             snapshots: BTreeMap::new(),
             serial: 0,
+            eviction_epoch: 0,
             used: 0,
             limit,
             ttl_ms,
@@ -85,6 +88,7 @@ impl ListingCache {
     fn remove(&mut self, id: &str) {
         if let Some(snapshot) = self.snapshots.remove(id) {
             self.used -= snapshot.bytes;
+            self.eviction_epoch = self.eviction_epoch.saturating_add(1);
         }
     }
     fn reserve(&mut self, bytes: usize, protected: Option<&str>) -> bool {
@@ -133,8 +137,9 @@ impl ListingCache {
             .ok_or(CacheError::ResourceLimit)?;
         let revision = format!("listing-{}", self.serial);
         work.phase = Phase::Queued;
-        let bytes = estimate(&work)
-            .saturating_add(revision.capacity() * 2 + std::mem::size_of::<Snapshot>() * 2 + 4096);
+        let bytes = estimate(&work).saturating_add(
+            revision.capacity() * 2 + std::mem::size_of::<Snapshot>() * 2 + 32 * 2048 + 4096,
+        );
         if !self.reserve(bytes, None) {
             return Err(CacheError::ResourceLimit);
         }
@@ -157,6 +162,7 @@ impl ListingCache {
                 coverage: Coverage::Partial,
                 exhausted: false,
                 bytes,
+                demand_end: 400, // default requested page plus one lookahead
             },
         );
         Ok(handle)
@@ -192,10 +198,6 @@ impl ListingCache {
         let snapshot = self.snapshots.get_mut(task_id).unwrap();
         snapshot.work.observed_at = entry.observed_at.clone();
         snapshot.entries.push(entry);
-        snapshot.work.processed_entries = (snapshot.entries.len() as u64).into();
-        if snapshot.category == Category::Directories {
-            snapshot.work.processed_directories = (snapshot.entries.len() as u64).into();
-        }
         snapshot.work.wait_reason = None;
         snapshot.bytes += bytes;
         self.used += bytes;
@@ -224,6 +226,7 @@ impl ListingCache {
         }
         snapshot.exhausted = true;
         snapshot.work.phase = phase;
+        snapshot.work.wait_reason = None;
         snapshot.work.sequence += 1;
         if let Some(issue) = issue {
             snapshot.work.issues.record(issue);
@@ -306,11 +309,19 @@ impl ListingCache {
             coverage: snapshot.coverage,
             issues: snapshot.work.issues.clone(),
         };
+        // Reserve future issue/counter growth only when first publishing an
+        // active page. Replays consume that already reserved space; adding it
+        // again would reject valid previously published pages.
+        let growth_reserve = if published.is_some() || snapshot.exhausted {
+            0
+        } else {
+            128 + 32 * 2048
+        };
         // IPC limit includes every envelope field, not only the entry array.
         while serde_json::to_vec(&page)
             .map_err(|_| CacheError::InvalidArgument)?
             .len()
-            .saturating_add(128 + 2048) // room for the bounded terminal issue added after publication
+            .saturating_add(growth_reserve)
             > self.message_limit
         {
             if published.is_some() || page.entries.is_empty() {
@@ -335,6 +346,8 @@ impl ListingCache {
         let snapshot = self.snapshots.get_mut(task_id).unwrap();
         snapshot.last_used = now;
         snapshot.page_limit = Some(limit);
+        // Requesting this cursor authorizes just its page plus one lookahead.
+        snapshot.demand_end = snapshot.demand_end.max(offset.saturating_add(limit * 2));
         if needs_record {
             self.serial = self
                 .serial
@@ -357,7 +370,60 @@ impl ListingCache {
         }
         Ok(page)
     }
+    /// Read-only worker check. It does not refresh the client inactivity TTL.
+    pub fn needs_collection(&self, id: &str) -> Result<bool, CacheError> {
+        let s = self.snapshots.get(id).ok_or(CacheError::TaskExpired)?;
+        Ok(!s.exhausted && s.entries.len() < s.demand_end)
+    }
+    /// Prime collection before the first page request. The first *read* chooses
+    /// the immutable page limit, as specified by the wire API.
+    pub fn set_initial_demand(&mut self, id: &str, limit: usize) -> Result<(), CacheError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(CacheError::InvalidArgument);
+        }
+        let s = self.snapshots.get_mut(id).ok_or(CacheError::TaskExpired)?;
+        s.demand_end = limit * 2;
+        Ok(())
+    }
+    pub fn observations(&mut self, id: &str, entries: u64, directories: u64) {
+        if let Some(s) = self.snapshots.get_mut(id) {
+            if !s.exhausted {
+                s.work.processed_entries = entries.into();
+                s.work.processed_directories = directories.into();
+                s.work.sequence += 1;
+            }
+        }
+    }
+    pub fn record_issue(&mut self, id: &str, issue: FsIssue) -> Result<(), CacheError> {
+        let s = self.snapshots.get_mut(id).ok_or(CacheError::TaskExpired)?;
+        if !s.exhausted {
+            s.work.issues.record(issue);
+            s.work.sequence += 1;
+        }
+        Ok(())
+    }
+    pub fn update_status(
+        &mut self,
+        id: &str,
+        phase: Phase,
+        wait: Option<crate::domain::model::WaitReason>,
+    ) {
+        if let Some(s) = self.snapshots.get_mut(id) {
+            if !s.exhausted && (s.work.phase != phase || s.work.wait_reason != wait) {
+                s.work.phase = phase;
+                s.work.wait_reason = wait;
+                s.work.sequence += 1;
+            }
+        }
+    }
+    pub fn contains(&self, id: &str) -> bool {
+        self.snapshots.contains_key(id)
+    }
+    pub fn eviction_epoch(&self) -> u64 {
+        self.eviction_epoch
+    }
     pub fn clear(&mut self) {
+        self.eviction_epoch = self.eviction_epoch.saturating_add(1);
         self.snapshots.clear();
         self.used = 0;
     }
@@ -524,5 +590,63 @@ mod tests {
         assert_eq!(last.entries.len(), 1);
         assert!(last.next_cursor.is_none());
         assert_eq!(last.coverage, Coverage::Partial);
+    }
+    #[test]
+    fn published_page_survives_later_errors_within_its_reserved_wire_headroom() {
+        let mut cache = ListingCache::new(2_000_000, 100, 80_000);
+        cache.start(work("t"), Category::Directories, 0).unwrap();
+        for id in ["B", "C"] {
+            let mut row = entry(id);
+            row.display_name = "n".repeat(6000);
+            cache.append("t", row).unwrap();
+        }
+        let first = cache.page("t", None, 2, 0).unwrap();
+        assert_eq!(first.entries.len(), 2);
+        for _ in 0..32 {
+            let mut error = FsIssue {
+                code: "PERMISSION_DENIED".into(),
+                operation: "lstat".into(),
+                scope: IssueScope::Entry,
+                entry_id: Some("e".repeat(240)),
+                native_code: Some(13),
+            };
+            error.operation = "o".repeat(64);
+            cache.record_issue("t", error).unwrap();
+        }
+        let replay = cache.page("t", None, 2, 1).unwrap();
+        assert_eq!(replay.entries, first.entries);
+        assert_eq!(replay.next_cursor, first.next_cursor);
+        assert!(serde_json::to_vec(&replay).unwrap().len() <= 80_000);
+    }
+    #[test]
+    fn maximum_error_samples_are_precharged_and_terminal_empty_pages_need_no_growth_reserve() {
+        let mut cache = ListingCache::new(2_000_000, 100, 80_000);
+        cache.start(work("t"), Category::Directories, 0).unwrap();
+        cache.limit = cache.managed_bytes();
+        let charged = cache.managed_bytes();
+        for n in 0..10_000 {
+            cache
+                .record_issue(
+                    "t",
+                    FsIssue {
+                        code: format!("UNRECOGNIZED_{n}"),
+                        operation: "o".repeat(64),
+                        scope: IssueScope::Entry,
+                        entry_id: Some("e".repeat(256)),
+                        native_code: Some(i32::MAX),
+                    },
+                )
+                .unwrap();
+        }
+        cache.finish("t", Phase::Completed, None).unwrap();
+        assert_eq!(cache.managed_bytes(), charged);
+        let work = cache.work("t", 1).unwrap();
+        assert_eq!(work.issues.samples.len(), 32);
+        assert_eq!(work.issues.counts.len(), 1);
+        assert!(estimate(&work.issues) <= 32 * 2048);
+        let page = cache.page("t", None, 2, 1).unwrap();
+        assert!(page.entries.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 80_000);
     }
 }

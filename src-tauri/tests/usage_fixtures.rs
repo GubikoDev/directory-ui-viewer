@@ -183,7 +183,7 @@ fn real_metadata_sparse_hidden_symlink_and_hardlink_match_independent_subtree_or
     symlink(f.path("outside-target"), f.path("root/link-outside")).unwrap();
     symlink("missing", f.path("root/broken-link")).unwrap();
     symlink("..", f.path("root/B/cycle-link")).unwrap();
-    let mut scanner = scan(&f.path("root"));
+    let scanner = scan(&f.path("root"));
     let root = scanner.root_id().to_owned();
     for (id, path) in [
         (root.clone(), f.path("root")),

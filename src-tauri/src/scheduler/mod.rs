@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -63,6 +63,7 @@ pub struct Ticket {
     scope: Scope,
     cancel: Cancellation,
     status: Arc<Mutex<Status>>,
+    wake_requested: Arc<AtomicBool>,
 }
 impl Ticket {
     fn cancel(&self) {
@@ -219,6 +220,7 @@ impl Scheduler {
             scope,
             cancel: Cancellation::default(),
             status: Arc::new(Mutex::new(Status::Queued)),
+            wake_requested: Arc::new(AtomicBool::new(false)),
         };
         state.queues[lane.index()].push_back(Pending {
             ticket: ticket.clone(),
@@ -228,10 +230,19 @@ impl Scheduler {
         self.shared.ready.notify_all();
         Ok(ticket)
     }
+    /// Demand may arrive while step() is about to return Paused. Remember that
+    /// wake under the same lock used to park, so the request cannot be lost.
     pub fn resume(&self, id: &str) -> Result<(), SubmitError> {
         let mut state = self.shared.state.lock().unwrap();
         if state.shutdown {
             return Err(SubmitError::Closed);
+        }
+        if let Some(ticket) = state.active.iter().flatten().find(|t| t.id == id) {
+            ticket.wake_requested.store(true, Ordering::Release);
+            return Ok(());
+        }
+        if state.queues.iter().flatten().any(|p| p.ticket.id == id) {
+            return Ok(());
         }
         if state.queues.iter().map(VecDeque::len).sum::<usize>() >= self.shared.queue_limit {
             return Err(SubmitError::ResourceLimit);
@@ -416,6 +427,13 @@ fn worker(shared: Arc<Shared>, lane: Lane) {
             drop(pending);
             continue;
         }
+        let step = if step == JobStep::Paused
+            && pending.ticket.wake_requested.swap(false, Ordering::AcqRel)
+        {
+            JobStep::Yield
+        } else {
+            step
+        };
         match step {
             JobStep::Yield => {
                 pending.ticket.set(Status::Queued);
@@ -508,6 +526,45 @@ mod tests {
             self.permit = Some(handles.acquire().unwrap());
             JobStep::Paused
         }
+    }
+    #[test]
+    fn demand_arriving_before_park_is_not_lost() {
+        struct AboutToPark {
+            ready: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            first: bool,
+        }
+        impl Job for AboutToPark {
+            fn step(&mut self, _: &Cancellation, _: &HandleBudget) -> JobStep {
+                if !self.first {
+                    return JobStep::Completed;
+                }
+                self.first = false;
+                self.ready.send(()).unwrap();
+                self.release.recv().unwrap();
+                JobStep::Paused
+            }
+        }
+        let scheduler = Scheduler::default();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let ticket = scheduler
+            .submit(
+                "demand-race".into(),
+                scope(1),
+                Lane::Foreground,
+                AboutToPark {
+                    ready: ready_tx,
+                    release: release_rx,
+                    first: true,
+                },
+            )
+            .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        scheduler.resume(ticket.id()).unwrap();
+        release_tx.send(()).unwrap();
+        wait(&ticket, Status::Completed);
+        assert_eq!(scheduler.counts(), (0, 0, 0));
     }
     #[test]
     fn blocking_old_generation_retains_slot_but_control_and_other_lane_progress() {
