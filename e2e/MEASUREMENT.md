@@ -64,3 +64,48 @@ audits, and actual WebKit security/picker/lifecycle checks need separate evidenc
 Record build mode, hardware, OS, filesystem, source revision, and OS-cache
 conditions with each real run. OS caches are not flushed by this tool. A normal
 build without `VITE_INTERNAL_BENCHMARK=1` omits the panel and measurement code.
+
+## External process metrics on macOS
+
+```sh
+cargo build --manifest-path src-tauri/Cargo.toml --example app_resources
+src-tauri/target/debug/examples/app_resources 60000 10 APP_PID WEBKIT_PID
+```
+
+Replace the PID placeholders with the **verified** app and associated WebKit
+process IDs. The observer accepts 1–8 explicit PIDs and runs for at most ten
+minutes. It does not discover helpers, infer ownership from process names, or
+claim that the supplied set covers the whole app. Verify each process's role
+before interpreting app totals. Shared WebKit/GPU processes also need careful
+attribution. Record that mapping with the local run evidence, not filenames or
+directory contents. Use a local ignored JSONL file for stdout.
+
+The observer uses the installed SDK's public `proc_pid_rusage` v4 and
+`proc_pidinfo(PROC_PIDLISTFDS)` interfaces. Each sample includes resident bytes,
+physical footprint, the kernel's lifetime maximum physical footprint, and FD
+count. Lifetime physical footprint is **not** an RSS peak and includes activity
+before the observation window. RSS and FD maxima are only the maxima of samples;
+shorter peaks between samples can be missed. Per-process actual sample gaps are
+reported, including delay caused by observation and output. Different PIDs and
+the RSS/FD syscalls are sampled sequentially, not atomically. A sum of individual
+process maxima is neither a simultaneous peak nor a deduplicated physical total.
+
+The start identity is checked around FD sampling and on subsequent samples;
+process exit/reuse, permission failures, or a full fixed 8,192-entry FD buffer
+stop the run with a nonzero exit and `stoppedBy`. They never become zero-valued
+success samples. A live process with no readable FD list is conservatively
+reported unavailable. Partial samples remain in stdout. Output failures or
+external interruption may leave no summary; that is an incomplete run.
+
+No target memory is read and no target files are opened. The observer itself
+does not run in the app's managed memory budget. Its self-tests allocate/touch
+owned memory and create anonymous pipes; its CLI tests launch only owned
+temporary processes:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --example app_resources -- --test-threads=1 --nocapture
+node e2e/process-resources.mjs
+```
+
+These verify the observer, not actual app resource acceptance. Native exact
+managed high-water counters and actual WebKit/app runs are still separate work.
