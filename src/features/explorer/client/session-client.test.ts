@@ -20,6 +20,23 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('SessionClient with deterministic adapter', () => {
+  it('reports an accepted close while further observation admission remains unavailable', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter, store } = setup(undefined, budget);
+    await client.chooseRoot();
+    await client.list('B', 'files');
+    const starts = adapter.calls.startListing;
+    const pressure = vi.spyOn(budget, 'reserve').mockImplementation(() => {
+      throw new Error('RESOURCE_LIMIT');
+    });
+    expect(client.closeListing('B', 'files')).toBe(true);
+    expect(store.getListing('B', 'files').loadState).toBe('notRequested');
+    expect(store.getSnapshot().resourceLimited).toBe(true);
+    pressure.mockRestore();
+    expect(await client.retryObservations()).toBe(true);
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    expect(adapter.calls.startListing).toBe(starts);
+  });
   it('recovers two pending usage requests through replay of the same native task', async () => {
     const budget = new FrontendBudget();
     const { client, adapter, store } = setup(undefined, budget);

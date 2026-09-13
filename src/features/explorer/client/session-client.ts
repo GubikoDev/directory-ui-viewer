@@ -404,6 +404,7 @@ export class SessionClient {
   private synchronize(taskId: string): Promise<void> {
     return this.recovery.run(taskId, () => this.sync(taskId));
   }
+  /** Reports closure, not observation recovery. Check resourceLimited separately. */
   closeListing(directoryId: string, category: Category) {
     if (!this.store.setExpanded(directoryId, false, category)) return false;
     this.store.evictClosedListings();

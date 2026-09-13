@@ -152,7 +152,15 @@ export class ExplorerStore {
     const count = this.state.expandedIds.size + this.state.openFileListIds.size;
     const required = count * this.closeBytes();
     const growth = required - this.closingCapacity.bytes;
-    if (growth <= 0 || !memory) {
+    if (!memory) {
+      // Pressure-only transitions may trim unused capacity, never acquire new
+      // space (including after an earlier operation aborted exceptionally).
+      this.closingCapacity.resize(
+        Math.min(required, this.closingCapacity.bytes),
+      );
+      return;
+    }
+    if (growth <= 0) {
       this.closingCapacity.resize(required);
       return;
     }
@@ -208,6 +216,9 @@ export class ExplorerStore {
       this.reserveClosures(memory);
       return result;
     } catch (error) {
+      // Restore only unused allowance. Any objects already retained by a failed
+      // attempt still own their charges until GC, just like normal rollback.
+      if (closing && memory) memory.moveTo(this.closingCapacity, memory.bytes);
       this.state = previous;
       this.pressureState = pressure;
       this.pressureMetadata = pressureMetadata;

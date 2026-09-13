@@ -52,6 +52,30 @@ function setup() {
   return store;
 }
 describe('ExplorerStore observations', () => {
+  it('restores unused close capacity when validation throws before a close can allocate', () => {
+    const store = setup();
+    const held = store.getSnapshot();
+    const pressure = store.budget.reserve(store.budget.available);
+    const validation = vi
+      .spyOn(store.budget, 'retain')
+      .mockImplementationOnce(() => {
+        throw new Error('INVALID_ARGUMENT');
+      });
+    expect(() => store.setExpanded('A', false)).toThrow('INVALID_ARGUMENT');
+    validation.mockRestore();
+    expect(store.getSnapshot()).toBe(held);
+    expect(store.budget.used).toBe(store.budget.limit);
+    const reservation = vi
+      .spyOn(store.budget, 'reserve')
+      .mockImplementation(() => {
+        throw new Error('unexpected external reservation');
+      });
+    expect(store.setExpanded('A', false)).toBe(true);
+    expect(reservation).not.toHaveBeenCalled();
+    expect(held.expandedIds.has('A')).toBe(true);
+    reservation.mockRestore();
+    pressure.close();
+  });
   it('rolls back an open when its closing allowance cannot grow and preserves earlier close guarantees', () => {
     const store = setup();
     expect(
