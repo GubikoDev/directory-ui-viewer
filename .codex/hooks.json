@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --path-format=absolute --git-common-dir)/../project-notes/automation/vault-autobackup.mjs\"",
+            "timeout": 120,
+            "statusMessage": "Obsidian 문서 커밋·푸시"
+          }
+        ]
+      }
+    ]
+  }
+}

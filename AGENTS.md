@@ -33,7 +33,7 @@ Filesystem access is read-only and user-initiated. Never grant a static whole-di
 
 Treat `project-notes/` as active project memory, not an archive. Before substantive work, read `Home.md` and the notes relevant to the task. Record durable decisions with rationale in `Decisions.md`, update completed work and next actions in `Session Log.md`, and keep `Roadmap.md` current. Maintain wiki links and `Project Map.canvas` when relationships change; omit routine command noise.
 
-A shared macOS LaunchAgent backs up root-level Vault Markdown/canvas changes from both Codex and Claude without model calls. Read `project-notes/Automatic Backup.md` for scope, status, and failure recovery; verify its status before ending documentation work. Automation source/config changes still need explicit Git handling.
+Use only Codex/Claude native lifecycle hooks for automation. Do not install OS background services, launchd jobs, or file watchers. Project Stop hooks back up Vault Markdown/canvas changes; read `project-notes/Automatic Backup.md` for scope and status. Automation source/config changes still need explicit Git handling.
 
 For direct Codex–Claude consultation, read `project-notes/Agent Dialogue.md` and follow its CLI, session ownership, and transcript rules.
 
