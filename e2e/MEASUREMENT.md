@@ -109,3 +109,52 @@ node e2e/process-resources.mjs
 
 These verify the observer, not actual app resource acceptance. Native exact
 managed high-water counters and actual WebKit/app runs are still separate work.
+
+## Isolated data-structure allocation costs
+
+```sh
+cargo run --manifest-path src-tauri/Cargo.toml --release --example managed_costs
+```
+
+This single-thread example exercises the production directory index, usage
+accumulator, listing cache, and charged page builder with synthetic metadata.
+It neither reads the filesystem nor starts the desktop app. Its own global
+allocator delegates to Rust `System` and counts requested layouts and the
+public macOS `malloc_size` of live returned allocations. The product app does
+not use this allocator. Before probing, calibration checks allocation, zeroed
+allocation, growth, shrinking, and deallocation against a directly inspected
+owned buffer. Each whole fixture must release its tracked allocations exactly.
+
+Each row subtracts the live baseline immediately before the measured operation.
+For the index this baseline already includes the initial root and budget
+objects. `items` counts newly registered directories; `fullyExposedItems` counts
+those that also acquired full entry metadata and usage. The 10,000-request case
+preserves an actual foreground resource limit instead of raising the budget.
+An unexposed last registration remains in its count and measured cost. For
+hardlinks, the first-copy and duplicate-copy rows measure the same still-live
+root accumulator in separate phases; `items` is the number of observations in
+that phase, not a claim that duplicate keys were retained. Small temporary
+observation/summary allocations are included in the phase. A duplicate phase
+can have a transient peak even when its retained delta is zero.
+
+Listing retention and a held 200-entry typed response are separate rows. The
+response's reservation must return after its final owner drops. The probe
+compares measured retained block bytes with the associated reservation increase;
+it also reports observed transient peaks and nominal Rust type layouts.
+Live deltas are signed so release of earlier storage is not masked as zero.
+
+The 32/64/127-child chain rows hold the production scanner's growing stack and
+directory index at that depth. They include visited identities and frame
+replacement transients, but use tiny fixture cursors; they do not measure native
+FD holders or bulk buffers. The root frame was already in the baseline.
+
+These are selected concrete shapes, not a proof for all metadata, tree shapes,
+or payloads. `mallocUsablePeakDeltaObserved` is observed at allocator call
+boundaries. It excludes temporary allocations inside `System.realloc`, allocator
+bookkeeping, direct allocations by C/OS/framework code, stack memory, and RSS.
+The row does not establish the whole native 128 MiB or frontend 32 MiB gate.
+Counters cover all Rust allocations in the isolated process, not ownership tags
+on individual blocks. Unrelated lazy initialization would contaminate a delta;
+net retained initialization would fail the final return-to-baseline assertion.
+That assertion alone cannot prove perfect attribution in a different runtime.
+Keep source revision, Rust/SDK versions, build mode and raw JSONL with the run.
