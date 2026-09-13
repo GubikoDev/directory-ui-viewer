@@ -624,9 +624,14 @@ mod tests {
         let first = cache.page("t", None, 200, 0).unwrap();
         let bytes = cache.managed_bytes();
         for now in 1..10_000 {
-            let waiting = cache
-                .page("t", first.next_cursor.as_deref(), 200, now)
-                .unwrap();
+            // Both repeating the first-page request and following its waiting
+            // cursor must reuse the same offset/limit cursor record.
+            let cursor = if now % 2 == 0 {
+                None
+            } else {
+                first.next_cursor.as_deref()
+            };
+            let waiting = cache.page("t", cursor, 200, now).unwrap();
             assert_eq!(waiting.next_cursor, first.next_cursor);
         }
         assert_eq!(cache.managed_bytes(), bytes);

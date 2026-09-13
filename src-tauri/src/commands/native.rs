@@ -356,6 +356,10 @@ pub async fn filesystem_request(
         state.budgets.work.clone()
     };
     let (input, memory): (Envelope, _) = state.parse(&request, &budget)?;
+    // The command future still borrows the framework's incoming request while
+    // awaiting reply delivery. Native execution can finish earlier, or outlive
+    // an abandoned caller, so both lifetimes must retain the parsed/input cost.
+    let request_memory = Arc::new(memory);
     if !super::delivery::valid_key(&input.response_key) {
         return Err(issue("INVALID_ARGUMENT"));
     }
@@ -393,7 +397,7 @@ pub async fn filesystem_request(
                     epoch,
                     input.request,
                     completion,
-                    memory,
+                    request_memory.clone(),
                 );
                 waiter
             }
@@ -458,7 +462,7 @@ fn execute(
     epoch: u64,
     request: Request,
     completion: replay::Completion,
-    memory: Reservation,
+    memory: Arc<Reservation>,
 ) {
     let id = request.request_id;
     // Retain bounded control/root/WorkRecord temporaries through serialization.
