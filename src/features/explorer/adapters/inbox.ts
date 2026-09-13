@@ -18,7 +18,7 @@ export class ReplyInbox {
   constructor(
     private readonly maxBytes = 8 * 1024 * 1024,
     private readonly maxPending = 256,
-    private readonly budget: FrontendBudget = frontendBudget,
+    readonly budget: FrontendBudget = frontendBudget,
   ) {}
   get bytes() {
     return this.used;
@@ -79,11 +79,15 @@ export class ReplyInbox {
     }
   }
 }
-const inbox = new ReplyInbox();
-export function nativeInbox(): ReplyInbox {
+let inbox: ReplyInbox | undefined;
+export function nativeInbox(
+  budget: FrontendBudget = frontendBudget,
+): ReplyInbox {
   const target = window as Window & {
     __DIRECTORY_RECEIVE__?: ReplyInbox['receive'];
   };
+  inbox ??= new ReplyInbox(8 * 1024 * 1024, 256, budget);
+  if (inbox.budget !== budget) throw new Error('INVALID_RESERVATION');
   if (!target.__DIRECTORY_RECEIVE__)
     Object.defineProperty(target, '__DIRECTORY_RECEIVE__', {
       value: inbox.receive,

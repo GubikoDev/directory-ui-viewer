@@ -4,6 +4,7 @@ import { NativeAdapter } from './native';
 import { nativeInbox } from './inbox';
 import { nativeEvents } from './events';
 import wire from '../model/wire-fixture.json';
+import { FrontendBudget, ownBytes } from '../runtime/memory';
 function deliverOnce(response: unknown) {
   vi.mocked(invoke).mockImplementationOnce(async (_command, args) => {
     const envelope = JSON.parse(new TextDecoder().decode(args as Uint8Array));
@@ -24,6 +25,72 @@ beforeEach(() => {
   });
 });
 describe('native wire boundary', () => {
+  it('does not split one document receiver across independent budgets', () => {
+    nativeInbox();
+    nativeEvents();
+    expect(() => nativeInbox(new FrontendBudget())).toThrow(
+      'INVALID_RESERVATION',
+    );
+    expect(() => nativeEvents(new FrontendBudget())).toThrow(
+      'INVALID_RESERVATION',
+    );
+  });
+  it('precharges the IPC fallback before dispatch and retains a connected epoch observation', async () => {
+    const records = new Map<object, number>();
+    const budget = new FrontendBudget(128 * 1024, () => ({
+      register: (owner, bytes) => {
+        records.set(owner, bytes);
+      },
+    }));
+    const reply = { epoch: 'native-epoch-1' };
+    vi.mocked(invoke).mockImplementationOnce(async (_command, args) => {
+      const length = (args as Uint8Array).byteLength;
+      expect(budget.used).toBeGreaterThanOrEqual(
+        16 * 1024 + length * 96 + 4096,
+      );
+      return reply as never;
+    });
+    expect(
+      await new NativeAdapter(budget).connectClient({
+        protocolVersion: 1,
+        clientNonce: 'n',
+      }),
+    ).toBe(reply);
+    expect(records.get(reply)).toBe(ownBytes(reply));
+    vi.mocked(invoke).mockClear();
+    const small = new NativeAdapter(new FrontendBudget(24 * 1024));
+    await expect(
+      small.connectClient({ protocolVersion: 1, clientNonce: 'n' }),
+    ).rejects.toThrow('RESOURCE_LIMIT');
+    expect(invoke).not.toHaveBeenCalled();
+  });
+  it('rejects an unsafe or malformed connected epoch', async () => {
+    for (const epoch of [
+      'native-epoch-9007199254740992',
+      'native-epoch-0',
+      'bad',
+    ]) {
+      vi.mocked(invoke).mockResolvedValueOnce({ epoch });
+      await expect(
+        new NativeAdapter().connectClient({
+          protocolVersion: 1,
+          clientNonce: 'n',
+        }),
+      ).rejects.toThrow('INVALID_RESPONSE');
+    }
+  });
+  it('keeps only a bounded protocol error code instead of retaining framework cause graphs', async () => {
+    vi.mocked(invoke).mockRejectedValueOnce({
+      code: 'x'.repeat(100_000),
+      extra: { retained: true },
+    });
+    const error = await new NativeAdapter()
+      .connectClient({ protocolVersion: 1, clientNonce: 'n' })
+      .catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe('INTERNAL');
+    expect((error as Error).cause).toBeUndefined();
+  });
   it('subscribes through the document receiver without the framework event queue', async () => {
     const listener = vi.fn();
     const stop = await new NativeAdapter().subscribe(listener);

@@ -155,15 +155,26 @@ export class FrontendBudget {
     const memory = this.reserve(bytes);
     try {
       const owner = factory();
-      if (this.tracked.has(owner)) throw new Error('INVALID_RESERVATION');
-      this.collector.register(owner, bytes);
-      this.tracked.set(owner, bytes);
-      this.opaque.add(owner);
-      memory.transfer(bytes);
+      this.retainLifetimeFrom(owner, memory, bytes);
       return owner;
     } finally {
       memory.close();
     }
+  }
+  /** Split an already admitted transaction across independent opaque owners. */
+  retainLifetimeFrom(
+    owner: object,
+    memory: FrontendReservation,
+    bytes: number,
+  ) {
+    validBytes(bytes);
+    if (!memory.belongsTo(this) || this.tracked.has(owner))
+      throw new Error('INVALID_RESERVATION');
+    if (bytes > memory.bytes) throw new Error('RESOURCE_LIMIT');
+    this.collector.register(owner, bytes);
+    this.tracked.set(owner, bytes);
+    this.opaque.add(owner);
+    memory.transfer(bytes);
   }
   hasReservation(owner: object): boolean {
     return this.tracked.has(owner);

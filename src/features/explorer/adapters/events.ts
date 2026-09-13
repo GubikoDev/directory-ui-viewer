@@ -27,7 +27,7 @@ function validEvent(value: unknown): value is WorkEvent {
 export class WorkInbox {
   private listener?: (event: WorkEvent) => void;
   private subscription = 0;
-  constructor(private readonly budget: FrontendBudget = frontendBudget) {
+  constructor(readonly budget: FrontendBudget = frontendBudget) {
     budget.retainLifetime(this, 2048);
   }
   subscribe(listener: (event: WorkEvent) => void): () => void {
@@ -56,11 +56,14 @@ export class WorkInbox {
   };
 }
 let inbox: WorkInbox | undefined;
-export function nativeEvents(): WorkInbox {
+export function nativeEvents(
+  budget: FrontendBudget = frontendBudget,
+): WorkInbox {
   const target = window as Window & {
     __DIRECTORY_WORK_EVENT__?: WorkInbox['receive'];
   };
-  inbox ??= new WorkInbox();
+  inbox ??= new WorkInbox(budget);
+  if (inbox.budget !== budget) throw new Error('INVALID_RESERVATION');
   if (!target.__DIRECTORY_WORK_EVENT__)
     Object.defineProperty(target, '__DIRECTORY_WORK_EVENT__', {
       value: inbox.receive,

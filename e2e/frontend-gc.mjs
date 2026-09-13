@@ -17,6 +17,7 @@ try {
     'model/types',
     'model/store',
     'adapters/fixture',
+    'adapters/encoding',
   ]) {
     const source = fs.readFileSync(
       new URL(`../src/features/explorer/${file}.ts`, import.meta.url),
@@ -41,6 +42,7 @@ try {
   const { FrontendBudget } = await load('runtime/memory');
   const { ExplorerStore } = await load('model/store');
   const { TaskMap } = await load('runtime/task-map');
+  const { encodeWire } = await load('adapters/encoding');
   const { fixtureEntry } = await load('adapters/fixture');
   const budget = new FrontendBudget();
   const store = new ExplorerStore(budget);
@@ -124,6 +126,31 @@ try {
       whilePromiseRetained,
       afterPromiseRelease: jobBudget.used,
       peak: jobBudget.peak,
+    }),
+  );
+  const wireBudget = new FrontendBudget();
+  let view = encodeWire(() => ({ ids: ['owned', '한글', '😀'] }), wireBudget);
+  let backing = view.buffer;
+  const length = view.byteLength;
+  assert.equal(wireBudget.used, length + 1024);
+  view = undefined;
+  await settle();
+  const whileBufferRetained = wireBudget.used;
+  assert.equal(whileBufferRetained, length + 512);
+  assert.equal(new Uint8Array(backing)[0], 123);
+  backing = undefined;
+  for (let i = 0; i < 200 && wireBudget.used !== 0; i++) {
+    global.gc();
+    await setTimeout(10);
+  }
+  assert.equal(wireBudget.used, 0);
+  console.log(
+    JSON.stringify({
+      engine: 'Node V8; not WKWebView',
+      wireBytes: length,
+      whileBufferRetained,
+      afterBufferRelease: wireBudget.used,
+      peak: wireBudget.peak,
     }),
   );
 } finally {
