@@ -315,6 +315,37 @@ try {
       afterCompactStoreReset: retainedBudget.used,
     }),
   );
+  // Abandon an open store without explicit reset. Both its live-data owners and
+  // unused closing allowance must disappear when that store is collected.
+  const abandonedBudget = new FrontendBudget();
+  let abandonedStore = new ExplorerStore(abandonedBudget);
+  abandonedStore.reset({
+    root: fixtureEntry('A', null),
+    session: {
+      sessionId: 'abandoned',
+      generation: 1,
+      rootEntryId: 'A',
+      platform: 'fixture',
+      capacity: { foreground: 'available', background: 'available' },
+    },
+  });
+  assert(abandonedStore.beginListing('A', 'files', 1));
+  await settle();
+  const whileOpenStoreRetained = abandonedBudget.used;
+  assert(whileOpenStoreRetained > 0);
+  abandonedStore = undefined;
+  for (let i = 0; i < 200 && abandonedBudget.used !== 0; i++) {
+    global.gc();
+    await setTimeout(10);
+  }
+  assert.equal(abandonedBudget.used, 0);
+  console.log(
+    JSON.stringify({
+      engine: 'Node V8; not WKWebView',
+      whileOpenStoreRetained,
+      afterOpenStoreRelease: abandonedBudget.used,
+    }),
+  );
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }

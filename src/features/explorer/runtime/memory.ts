@@ -91,6 +91,17 @@ export class FrontendReservation {
     this.transfer(bytes);
     return new FrontendReservation(this.budget, bytes, this.priority);
   }
+  moveTo(destination: FrontendReservation, bytes: number) {
+    validBytes(bytes);
+    if (
+      destination.budget !== this.budget ||
+      destination.priority !== this.priority
+    )
+      throw new Error('INVALID_RESERVATION');
+    validBytes(destination.remaining + bytes);
+    this.transfer(bytes);
+    destination.remaining += bytes;
+  }
   close() {
     this.resize(0);
   }

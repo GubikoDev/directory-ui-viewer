@@ -50,6 +50,12 @@ const emptyState = (): ExplorerState => ({
   resourceLimited: false,
 });
 
+// A live store owns this unused allowance; the held value never refers back to
+// the store. Explicit reset releases it immediately, collection is a backstop.
+const closingOwners = new FinalizationRegistry<FrontendReservation>((memory) =>
+  memory.close(),
+);
+
 /** Pure normalized observations shared by every view; no Tauri or disk access. */
 export class ExplorerStore {
   private state!: ExplorerState;
@@ -71,11 +77,14 @@ export class ExplorerStore {
     { state: ExplorerState; pressure: ExplorerState }
   >;
   private transaction?: FrontendReservation;
+  private readonly closingCapacity: FrontendReservation;
   readonly budget: FrontendBudget;
   constructor(budget: FrontendBudget | number = frontendBudget) {
     this.budget =
       typeof budget === 'number' ? new FrontendBudget(budget) : budget;
     this.budget.retainLifetime(this, 4096);
+    this.closingCapacity = this.budget.reserve(0);
+    closingOwners.register(this, this.closingCapacity);
     this.budget.allocate(64 * 1024, () => {
       const organization = emptyState();
       const mindmap: ExplorerState = { ...emptyState(), mode: 'mindmap' };
@@ -133,6 +142,31 @@ export class ExplorerStore {
     }
     return bytes;
   }
+  private closeBytes(): number {
+    return 16 * 1024 + 3 * this.collectionBytes();
+  }
+  private reserveClosures(memory?: FrontendReservation) {
+    // Each open intent can close once without competing for new space, even
+    // while previous snapshots remain retained. These are unused reservations,
+    // not a second pool or an early refund of any live observation's charge.
+    const count = this.state.expandedIds.size + this.state.openFileListIds.size;
+    const required = count * this.closeBytes();
+    const growth = required - this.closingCapacity.bytes;
+    if (growth <= 0 || !memory) {
+      this.closingCapacity.resize(required);
+      return;
+    }
+    // Fund the guarantee from the transaction's unused allowance first.
+    // Acquire any missing part atomically before moving either reservation.
+    const fromTransaction = Math.min(growth, memory.bytes);
+    const extra =
+      growth > fromTransaction
+        ? this.budget.reserve(growth - fromTransaction)
+        : undefined;
+    memory.moveTo(this.closingCapacity, fromTransaction);
+    extra?.moveTo(this.closingCapacity, extra.bytes);
+    extra?.close();
+  }
   /** Reserve old container copies, page array/Set scratch, new slots and new
    * incoming observations before mutation. Existing record payloads are shared,
    * so their full graphs are not multiplied into the transaction allowance. */
@@ -142,6 +176,7 @@ export class ExplorerStore {
     update: () => T,
     replacing = false,
     growthBytes = 0,
+    closing = false,
   ): T {
     if (this.transaction) return update();
     const previous = this.state;
@@ -157,7 +192,9 @@ export class ExplorerStore {
         this.budget.untrackedBytes(input) +
         growthBytes +
         (replacing ? 0 : 3 * this.collectionBytes());
-      memory = this.budget.reserve(bytes);
+      memory = closing
+        ? this.closingCapacity.take(bytes)
+        : this.budget.reserve(bytes);
       this.transaction = memory;
       this.budget.retain(input, memory);
       const result = update();
@@ -168,6 +205,7 @@ export class ExplorerStore {
       this.budget.retain(this.sequences, memory);
       this.budget.retain(this.listingOrders, memory);
       this.budget.retain(this.cancelPending, memory);
+      this.reserveClosures(memory);
       return result;
     } catch (error) {
       this.state = previous;
@@ -237,6 +275,7 @@ export class ExplorerStore {
     if (this.state.listings === this.pressureState.listings) return false;
     this.state = this.pressureState;
     this.usePressureMetadata();
+    this.reserveClosures();
     this.listeners.forEach((listener) => listener());
     return true;
   }
@@ -244,6 +283,7 @@ export class ExplorerStore {
     const before = this.state;
     this.state = this.pressureState;
     this.usePressureMetadata();
+    this.reserveClosures();
     if (before !== this.state) this.listeners.forEach((listener) => listener());
   }
   isListingRequestCurrent(id: string, category: Category, order: number) {
@@ -266,6 +306,7 @@ export class ExplorerStore {
       this.sequences = this.emptySequences;
       this.listingOrders = this.emptyOrders;
       this.cancelPending = this.emptyCancelled;
+      if (!this.transaction) this.closingCapacity.resize(0);
       if (!this.transaction && before !== this.state)
         this.listeners.forEach((listener) => listener());
       return true;
@@ -311,18 +352,27 @@ export class ExplorerStore {
     expanded: boolean,
     category: Category = 'directories',
   ) {
-    if (this.state.entries.get(id)?.kind !== 'directory') return;
+    if (this.state.entries.get(id)?.kind !== 'directory') return false;
     const key = category === 'directories' ? 'expandedIds' : 'openFileListIds';
-    return this.change(id, undefined, () => {
-      const ids = new Set(this.state[key]);
-      if (expanded) ids.add(id);
-      else {
-        ids.delete(id);
-        this.listingOrders = new Map(this.listingOrders);
-        this.listingOrders.delete(listingKey(id, category));
-      }
-      this.publish({ ...this.state, [key]: ids });
-    });
+    if (this.state[key].has(id) === expanded) return true;
+    return this.change(
+      id,
+      false,
+      () => {
+        const ids = new Set(this.state[key]);
+        if (expanded) ids.add(id);
+        else {
+          ids.delete(id);
+          this.listingOrders = new Map(this.listingOrders);
+          this.listingOrders.delete(listingKey(id, category));
+        }
+        this.publish({ ...this.state, [key]: ids });
+        return true;
+      },
+      false,
+      0,
+      !expanded,
+    );
   }
   select(id: string | null) {
     if (id === null || this.state.entries.has(id))

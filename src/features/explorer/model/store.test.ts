@@ -45,13 +45,110 @@ const page = (changes: Partial<ListingPage> = {}): ListingPage => ({
   ...changes,
 });
 function setup() {
-  const store = new ExplorerStore();
+  const store = new ExplorerStore(new FrontendBudget());
   store.reset(root);
   store.beginListing('A', 'directories', 1);
   store.registerListing(page(), 1);
   return store;
 }
 describe('ExplorerStore observations', () => {
+  it('rolls back an open when its closing allowance cannot grow and preserves earlier close guarantees', () => {
+    const store = setup();
+    expect(
+      store.applyPage(
+        page({
+          entries: [fixtureEntry('B', 'A'), fixtureEntry('C', 'A')],
+          nextCursor: null,
+        }),
+      ),
+    ).toBe(true);
+    expect(store.beginListing('B', 'files', 2)).toBe(true);
+    const before = store.getSnapshot();
+    const reserve = store.budget.reserve.bind(store.budget);
+    let pressure!: ReturnType<typeof reserve>;
+    const admission = vi
+      .spyOn(store.budget, 'reserve')
+      .mockImplementationOnce((bytes, priority) => {
+        const memory = reserve(bytes, priority);
+        pressure = reserve(store.budget.available);
+        return memory;
+      });
+    expect(store.beginListing('C', 'files', 3)).toBe(false);
+    expect(store.getSnapshot().resourceLimited).toBe(true);
+    expect(store.getSnapshot().openFileListIds.has('C')).toBe(false);
+    expect(store.isListingRequestCurrent('C', 'files', 3)).toBe(false);
+    expect(store.getSnapshot().openFileListIds.has('B')).toBe(true);
+    admission.mockRestore();
+    const rest = reserve(store.budget.available);
+    const closed = vi.spyOn(store.budget, 'reserve').mockImplementation(() => {
+      throw new Error('unexpected external reservation');
+    });
+    expect(store.setExpanded('B', false, 'files')).toBe(true);
+    expect(closed).not.toHaveBeenCalled();
+    expect(store.getSnapshot().openFileListIds.has('B')).toBe(false);
+    expect(before.openFileListIds.has('B')).toBe(true);
+    closed.mockRestore();
+    rest.close();
+    pressure.close();
+  });
+  it('closes every admitted listing under full pressure without new reservations or changing held snapshots', () => {
+    const budget = new FrontendBudget(32 * 1024 * 1024, undefined, 1024 * 1024);
+    const store = new ExplorerStore(budget);
+    store.reset(root);
+    store.beginListing('A', 'directories', 1);
+    store.registerListing(page(), 1);
+    const ids = ['B', 'C', 'D'];
+    expect(
+      store.applyPage(
+        page({
+          entries: ids.map((id) => fixtureEntry(id, 'A')),
+          nextCursor: null,
+        }),
+      ),
+    ).toBe(true);
+    for (const [i, id] of ids.entries()) {
+      const files = page({
+        directoryId: id,
+        category: 'files',
+        listingRevision: id,
+        work: { ...work, taskId: id, operation: 'listFiles', targetId: id },
+        entries: [fixtureEntry(`${id}-file`, id, 'regularFile')],
+        nextCursor: null,
+      });
+      expect(store.beginListing(id, 'files', i + 2)).toBe(true);
+      expect(store.registerListing(files, i + 2)).toBe(true);
+      expect(store.applyPage(files)).toBe(true);
+    }
+    store.select('B');
+    const held = store.getSnapshot();
+    const pressure = budget.reserve(budget.available);
+    const control = budget.reserve(1024 * 1024, true);
+    expect(budget.used).toBe(budget.limit);
+    const allocation = vi.spyOn(budget, 'reserve').mockImplementation(() => {
+      throw new Error('unexpected external reservation');
+    });
+    for (const [i, id] of ids.entries()) {
+      expect(store.setExpanded(id, false, 'files')).toBe(true);
+      store.evictClosedListings();
+      expect(store.getSnapshot().openFileListIds.has(id)).toBe(false);
+      expect(store.getSnapshot().entries.has(`${id}-file`)).toBe(false);
+      for (const open of ids.slice(i + 1)) {
+        expect(store.getSnapshot().openFileListIds.has(open)).toBe(true);
+        expect(store.getSnapshot().entries.has(`${open}-file`)).toBe(true);
+      }
+      expect(store.getSnapshot().selectedId).toBe('B');
+      expect(store.getSnapshot().entries.has('B')).toBe(true);
+      expect(held.entries.has(`${id}-file`)).toBe(true);
+      expect(held.openFileListIds.has(id)).toBe(true);
+      expect(budget.used).toBeLessThanOrEqual(budget.limit);
+    }
+    expect(store.setExpanded('A', false)).toBe(true);
+    expect(store.setExpanded('A', false)).toBe(true);
+    expect(allocation).not.toHaveBeenCalled();
+    allocation.mockRestore();
+    control.close();
+    pressure.close();
+  });
   it('fits fully visible retention scratch inside the admitted usage transaction', () => {
     const store = setup();
     expect(
@@ -378,7 +475,12 @@ describe('ExplorerStore observations', () => {
     expect(store.getSnapshot().expandedIds.has('A')).toBe(true);
   });
   it('signals memory pressure before adding an oversized page', () => {
-    const budget = new FrontendBudget();
+    let owned = 0;
+    const budget = new FrontendBudget(32 * 1024 * 1024, () => ({
+      register(_target, bytes) {
+        owned += bytes;
+      },
+    }));
     const store = new ExplorerStore(budget);
     store.reset(root);
     store.beginListing('A', 'directories', 1);
@@ -396,8 +498,10 @@ describe('ExplorerStore observations', () => {
     store.reset(null);
     expect(store.getSnapshot().session).toBeNull();
     expect(store.getSnapshot().entries.size).toBe(0);
-    // Closing cannot free old snapshots still held by React/a caller.
-    expect(budget.used).toBe(budget.limit);
+    // Reset returns unused close capacity, but no object's GC charge. This
+    // collector has released nothing, including the externally held snapshot.
+    expect(budget.used).toBe(blocker.bytes + owned);
+    expect(before.entries.has('A')).toBe(true);
     blocker.close();
   });
   it('does not reserve retained issue payloads again when only a task-map slot changes', () => {

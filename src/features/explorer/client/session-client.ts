@@ -405,9 +405,10 @@ export class SessionClient {
     return this.recovery.run(taskId, () => this.sync(taskId));
   }
   closeListing(directoryId: string, category: Category) {
-    this.store.setExpanded(directoryId, false, category);
+    if (!this.store.setExpanded(directoryId, false, category)) return false;
     this.store.evictClosedListings();
-    return this.store.resumeObservations();
+    this.store.resumeObservations();
+    return true;
   }
   async retryObservations(): Promise<boolean> {
     if (!this.store.resumeObservations()) return false;
