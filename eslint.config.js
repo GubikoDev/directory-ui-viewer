@@ -6,7 +6,14 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist', 'playwright-report', 'src-tauri/gen', 'src-tauri/target'],
+    ignores: [
+      '.claude/worktrees/**',
+      '.project-notes/**',
+      'dist',
+      'playwright-report',
+      'src-tauri/gen',
+      'src-tauri/target',
+    ],
   },
   {
     files: ['**/*.{ts,tsx}'],
@@ -14,6 +21,7 @@ export default tseslint.config(
     languageOptions: {
       ecmaVersion: 2024,
       globals: globals.browser,
+      parserOptions: { tsconfigRootDir: import.meta.dirname },
     },
     plugins: {
       'react-hooks': reactHooks,

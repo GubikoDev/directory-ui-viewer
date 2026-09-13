@@ -24,6 +24,28 @@ npm run tauri dev
 
 For frontend-only development, run `npm run dev`.
 
+### macOS development
+
+Use the Node version in `.nvmrc`; its bundled npm matches `packageManager`.
+With [fnm](https://github.com/Schniz/fnm) installed:
+
+```bash
+eval "$(fnm env --shell zsh)"
+fnm install
+fnm use
+npm ci
+npx playwright install chromium
+npm run tauri dev
+```
+
+After copying the repository from Linux, run `npm ci` to replace native
+dependencies with macOS builds. If linked worktrees were copied too, repair
+their paths with `git worktree repair <copied-worktree-path>`.
+
+Validate the environment with `npm run build`, `npm test`, `npm run lint`,
+`npm run format:check`, `npm run test:e2e`, and
+`cargo check --manifest-path src-tauri/Cargo.toml --locked`.
+
 ## Filesystem Security Direction
 
 The application will ask the user to choose a root directory through the native picker. A future Rust boundary will canonicalize that path and expose only read-only directory metadata within the selected tree. Access will not bypass operating-system permissions, follow escaping symlinks, persist silently, or grant a static whole-disk scope.
