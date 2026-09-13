@@ -1,0 +1,32 @@
+{
+  "flat10k": {
+    "category": "files",
+    "firstPageEntries": 200,
+    "entries": "10000",
+    "partial": false
+  },
+  "flat100k": {
+    "category": "files",
+    "firstPageEntries": 200,
+    "entries": "100000",
+    "partial": false
+  },
+  "wide": {
+    "category": "directories",
+    "firstPageEntries": 200,
+    "entries": "101000",
+    "partial": false
+  },
+  "deep": {
+    "category": "directories",
+    "firstPageEntries": 1,
+    "entries": "256",
+    "partial": true
+  },
+  "hardlinks": {
+    "category": "directories",
+    "firstPageEntries": 200,
+    "entries": "10200",
+    "partial": false
+  }
+}

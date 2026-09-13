@@ -552,6 +552,7 @@ export class SessionClient {
       // data pressure without turning an accepted cancellation into a failure.
       this.report(error);
     }
+    return result?.status ?? null;
   }
   private rootScope(): Scope | null {
     const state = this.store.getSnapshot();

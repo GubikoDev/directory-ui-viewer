@@ -1,7 +1,8 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createAdapter } from './features/explorer/adapters/create';
 import { SessionClient } from './features/explorer/client/session-client';
 import { terminal, type Measure } from './features/explorer/model/types';
+import { VerificationPanel } from './features/explorer/verification/VerificationPanel';
 
 function measure(value?: Measure) {
   if (!value || value.state === 'unknown') return '미확인';
@@ -21,6 +22,7 @@ export function App({ client: provided }: { client?: SessionClient }) {
   );
   const [error, setError] = useState('');
   const [choosing, setChoosing] = useState(false);
+  const renderedList = useRef<HTMLUListElement | null>(null);
   useEffect(() => () => client.dispose(), [client]);
   const run = (action: () => Promise<unknown>) => {
     setError('');
@@ -146,6 +148,8 @@ export function App({ client: provided }: { client?: SessionClient }) {
             <button onClick={() => run(() => client.scan())}>용량 집계</button>
           </div>
           <ul
+            ref={renderedList}
+            data-generation={state.session?.generation}
             aria-label="항목 목록"
             className={
               state.mode === 'mindmap'
@@ -193,6 +197,15 @@ export function App({ client: provided }: { client?: SessionClient }) {
           ))}
         </ul>
       </section>
+      {import.meta.env.VITE_INTERNAL_BENCHMARK === '1' && (
+        <VerificationPanel
+          client={client}
+          rendered={() => ({
+            generation: Number(renderedList.current?.dataset.generation),
+            count: renderedList.current?.childElementCount ?? 0,
+          })}
+        />
+      )}
     </main>
   );
 }

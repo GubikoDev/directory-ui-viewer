@@ -4,7 +4,10 @@ A local-first visual directory explorer for macOS and Linux. The project aims to
 
 ## Status
 
-The repository currently contains the project foundation only. Directory browsing is intentionally not implemented yet.
+The internal directory listing, usage aggregation, cancellation, and typed
+adapters are implemented with a temporary verification screen. Native security,
+whole-application resource accounting, and macOS integration acceptance remain
+in progress; unit tests and engine benchmarks alone do not establish completion.
 
 The first implementation targets macOS. Rust CI checks both macOS and Linux;
 Linux release support remains a later milestone. The frontend uses a typed
@@ -53,7 +56,18 @@ Validate the environment with `npm run build`, `npm test`, `npm run lint`,
 
 ## Filesystem Security Direction
 
-The application will ask the user to choose a root directory through the native picker. A future Rust boundary will canonicalize that path and expose only read-only directory metadata within the selected tree. Access will not bypass operating-system permissions, follow escaping symlinks, persist silently, or grant a static whole-disk scope.
+The native picker approves the successfully opened directory object. Safely
+opened descendant directory objects remain approved after moves; refresh keeps
+the original root handle. A replacement at the old path is never automatically
+approved. The read-only boundary preserves mount boundaries and OS permission
+failures, rejects symlink target traversal, and revokes new operations on close
+while existing calls drain. There is no static whole-disk scope.
+
+## Internal app measurement
+
+See [the measurement procedure](e2e/MEASUREMENT.md) for fixed temporary fixtures
+and the opt-in measurement build. Its reports distinguish fixture results from
+the actual macOS adapter and retain incomplete runs and failed comparisons.
 
 ## Project Notes
 

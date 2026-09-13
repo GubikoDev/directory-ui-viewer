@@ -370,7 +370,7 @@ describe('SessionClient with deterministic adapter', () => {
     const task = [...store.getSnapshot().tasks.values()][0];
     const blocker = budget.reserve(budget.available);
     try {
-      await expect(client.cancel(task.taskId)).resolves.toBeUndefined();
+      await expect(client.cancel(task.taskId)).resolves.toBe('accepted');
       expect(adapter.calls.cancelTask).toBe(1);
       expect(client.errors.at(-1)?.message).toBe('RESOURCE_LIMIT');
     } finally {
