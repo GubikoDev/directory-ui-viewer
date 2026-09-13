@@ -184,3 +184,81 @@ describe('SessionClient with deterministic adapter', () => {
     ).toThrow('OUTSIDE_ROOT');
   });
 });
+
+it('refresh failure discards prior observations and retries using the returned generation', async () => {
+  const { client, adapter, store } = setup();
+  await client.chooseRoot();
+  const sessionId = store.getSnapshot().session!.sessionId;
+  adapter.failNextRefresh = true;
+  const first = client.refresh();
+  expect(client.refresh()).toBe(first);
+  await expect(first).rejects.toThrow('IO_ERROR');
+  expect(store.getSnapshot()).toMatchObject({
+    session: null,
+    failedRoot: {
+      scope: { sessionId, generation: 2 },
+      issue: { code: 'IO_ERROR' },
+    },
+  });
+  expect(store.getSnapshot().entries.size).toBe(0);
+  expect(store.getSnapshot().tasks.size).toBe(0);
+  expect(store.getSnapshot().usages.size).toBe(0);
+  expect(adapter.calls.startUsageScan).toBe(1);
+  await client.refresh();
+  expect(store.getSnapshot().session?.generation).toBe(3);
+  expect(store.getSnapshot().failedRoot).toBeNull();
+  expect(adapter.calls.startUsageScan).toBe(2);
+});
+
+it('can close a failed refreshed root without reselecting it', async () => {
+  const { client, adapter, store } = setup();
+  await client.chooseRoot();
+  adapter.failNextRefresh = true;
+  await expect(client.refresh()).rejects.toThrow('IO_ERROR');
+  await client.close();
+  expect(store.getSnapshot().session).toBeNull();
+  expect(store.getSnapshot().failedRoot).toBeNull();
+  expect(adapter.calls.closeSession).toBe(1);
+});
+
+it('close is not held behind refresh I/O and its late failure cannot restore a root', async () => {
+  const { client, adapter, store } = setup();
+  await client.chooseRoot();
+  const session = store.getSnapshot().session!;
+  let request!: Request;
+  let resolve!: (value: Response<RootData>) => void;
+  vi.spyOn(adapter, 'refreshRoot').mockImplementation((input) => {
+    request = input;
+    return new Promise((done) => {
+      resolve = done;
+    });
+  });
+  const pending = client.refresh();
+  await vi.waitFor(() => expect(request).toBeDefined());
+  await client.close();
+  expect(adapter.calls.closeSession).toBe(1);
+  resolve({
+    requestId: request.requestId,
+    outcome: 'error',
+    error: { code: 'IO_ERROR', operation: 'refreshRoot', scope: 'root' },
+    currentScope: { sessionId: session.sessionId, generation: 2 },
+  });
+  await expect(pending).rejects.toThrow('IO_ERROR');
+  expect(store.getSnapshot().session).toBeNull();
+  expect(store.getSnapshot().failedRoot).toBeNull();
+});
+
+it('rejects a refresh failure that claims a different session scope', async () => {
+  const { client, adapter, store } = setup();
+  await client.chooseRoot();
+  const session = store.getSnapshot().session;
+  vi.spyOn(adapter, 'refreshRoot').mockImplementation(async (request) => ({
+    requestId: request.requestId,
+    outcome: 'error',
+    error: { code: 'IO_ERROR', operation: 'refreshRoot', scope: 'root' },
+    currentScope: { sessionId: 'other', generation: 2 },
+  }));
+  await expect(client.refresh()).rejects.toThrow('INVALID_RESPONSE');
+  expect(store.getSnapshot().session).toBe(session);
+  expect(store.getSnapshot().failedRoot).toBeNull();
+});

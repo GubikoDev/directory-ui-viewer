@@ -13,14 +13,18 @@ import {
 } from '../model/types';
 
 export class AdapterError extends Error {
-  constructor(readonly code: string) {
+  constructor(
+    readonly code: string,
+    readonly currentScope?: Scope,
+  ) {
     super(code);
   }
 }
 export function unwrap<T>(response: Response<T>, requestId: string): T | null {
   if (response.requestId !== requestId)
     throw new AdapterError('INVALID_RESPONSE');
-  if (response.outcome === 'error') throw new AdapterError(response.error.code);
+  if (response.outcome === 'error')
+    throw new AdapterError(response.error.code, response.currentScope);
   return response.outcome === 'cancelled' ? null : response.data;
 }
 
@@ -31,6 +35,7 @@ export class SessionClient {
   private lifecycle = 0;
   private intent = 0;
   private picker?: Promise<boolean>;
+  private refreshing?: Promise<void>;
   private controlTail: Promise<unknown> = Promise.resolve();
   private subscription?: () => void;
   private timer?: ReturnType<typeof setInterval>;
@@ -286,34 +291,73 @@ export class SessionClient {
     if (result) this.store.applyTask(result.work);
     await this.synchronize(taskId);
   }
-  async refresh() {
-    const scope = this.store.getSnapshot().session;
+  private rootScope(): Scope | null {
+    const state = this.store.getSnapshot();
+    return state.session ?? state.failedRoot?.scope ?? null;
+  }
+  refresh(): Promise<void> {
+    if (this.refreshing) return this.refreshing;
+    const pending = this.refreshOnce().finally(() => {
+      if (this.refreshing === pending) this.refreshing = undefined;
+    });
+    this.refreshing = pending;
+    return pending;
+  }
+  private async refreshOnce() {
+    const scope = this.rootScope();
     if (!scope) return;
     const lifecycle = this.lifecycle;
-    const root = await this.control(async () => {
+    const intent = ++this.intent;
+    // Dispatch order is serialized; a disk wait must not block close or cancel.
+    const { request, pending } = await this.control(async () => {
       const request = {
         ...this.request(),
         sessionId: scope.sessionId,
         expectedGeneration: scope.generation,
       };
-      return unwrap(await this.adapter.refreshRoot(request), request.requestId);
+      return { request, pending: this.adapter.refreshRoot(request) };
     });
-    if (
-      root &&
+    const stillCurrent = () =>
       lifecycle === this.lifecycle &&
-      sameScope(this.store.getSnapshot().session, scope)
-    )
-      await this.activate(root);
+      intent === this.intent &&
+      sameScope(this.rootScope(), scope);
+    try {
+      const root = unwrap(await pending, request.requestId);
+      if (root && stillCurrent()) await this.activate(root);
+    } catch (error) {
+      if (
+        error instanceof AdapterError &&
+        error.currentScope &&
+        stillCurrent()
+      ) {
+        const advanced = error.currentScope;
+        if (
+          advanced.sessionId !== scope.sessionId ||
+          !Number.isSafeInteger(advanced.generation) ||
+          advanced.generation !== scope.generation + 1
+        )
+          throw new AdapterError('INVALID_RESPONSE');
+        this.store.failRoot(advanced, {
+          code: error.code,
+          operation: 'refreshRoot',
+          scope: 'root',
+        });
+        this.lastPage.clear();
+        this.pageDemand.clear();
+        this.lastEvent.clear();
+      }
+      throw error;
+    }
   }
   async close() {
     this.intent++;
-    const scope = this.store.getSnapshot().session;
+    const scope = this.rootScope();
     if (!scope) return;
     await this.control(async () => {
       const request = { ...this.request(), sessionId: scope.sessionId };
       unwrap(await this.adapter.closeSession(request), request.requestId);
     });
-    if (sameScope(this.store.getSnapshot().session, scope)) {
+    if (sameScope(this.rootScope(), scope)) {
       this.store.reset(null);
       this.lastPage.clear();
       this.pageDemand.clear();

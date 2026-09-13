@@ -6,6 +6,7 @@ import {
   type DirectoryListing,
   type DirectoryUsage,
   type Entry,
+  type FsIssue,
   type ListingPage,
   type ListingStart,
   type RootData,
@@ -17,6 +18,7 @@ import {
 
 export interface ExplorerState {
   session: RootSession | null;
+  failedRoot: { scope: Scope; issue: FsIssue } | null;
   entries: ReadonlyMap<string, Entry>;
   listings: ReadonlyMap<string, DirectoryListing>;
   usages: ReadonlyMap<string, DirectoryUsage>;
@@ -29,6 +31,7 @@ export interface ExplorerState {
 }
 const emptyState = (): ExplorerState => ({
   session: null,
+  failedRoot: null,
   entries: new Map(),
   listings: new Map(),
   usages: new Map(),
@@ -70,6 +73,10 @@ export class ExplorerStore {
       state.entries = new Map([[root.root.entryId, root.root]]);
     }
     this.publish(state);
+  }
+  failRoot(scope: Scope, issue: FsIssue) {
+    this.reset(null);
+    this.publish({ ...this.state, failedRoot: { scope, issue } });
   }
   setMode(mode: ExplorerState['mode']) {
     this.publish({ ...this.state, mode });

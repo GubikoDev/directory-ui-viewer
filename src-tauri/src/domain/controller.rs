@@ -33,7 +33,8 @@ pub struct NativeContext {
     pub window: String,
     pub document: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Scope {
     pub session_id: String,
     pub generation: u64,
@@ -127,7 +128,7 @@ pub struct SessionController {
     active_selection: Option<u64>,
     cancellation: Cancellation,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionTicket {
     context: NativeContext,
     epoch_serial: u64,
@@ -167,13 +168,14 @@ impl SessionController {
         self.nonce = Some(nonce.into());
         Ok(self.epoch_serial)
     }
-    pub fn document_loaded(&mut self, context: NativeContext) {
+    pub fn document_loaded(&mut self, context: NativeContext) -> bool {
         if context == self.context {
-            return;
+            return false;
         }
         self.close();
         self.nonce = None;
         self.context = context;
+        true
     }
     pub fn validate(
         &self,
@@ -234,6 +236,15 @@ impl SessionController {
         self.cancellation = Cancellation::default();
         self.scope = Some(scope.clone());
         Ok(scope)
+    }
+    /// Check before candidate I/O and again before publishing its result. This
+    /// does not release the native picker slot; late callbacks must still drain.
+    pub fn validate_selection(&self, ticket: &SelectionTicket) -> Result<(), ControlError> {
+        self.validate(&ticket.context, ticket.epoch_serial, None)?;
+        if self.active_selection != Some(ticket.serial) || ticket.serial != self.selection_serial {
+            return Err(ControlError::ClientExpired);
+        }
+        Ok(())
     }
     /// Native callback cleanup, including cancellation/validation failure. Releasing
     /// a stale picker must not release a newer one or change the current session.

@@ -122,7 +122,13 @@ export type ScopedRequest = Request & Scope;
 export type Response<T> =
   | { requestId: string; outcome: 'ok'; data: T }
   | { requestId: string; outcome: 'cancelled' }
-  | { requestId: string; outcome: 'error'; error: FsIssue };
+  | {
+      requestId: string;
+      outcome: 'error';
+      error: FsIssue;
+      /** Only an admitted refresh failure advances the scope without root data. */
+      currentScope?: Scope;
+    };
 export interface RootData {
   session: RootSession;
   root: Entry;

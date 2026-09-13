@@ -56,6 +56,8 @@ export class FixtureAdapter implements FilesystemAdapter {
   private highWater = 0;
   readonly calls: Record<string, number> = {};
   cancelNextChoice = false;
+  failNextRefresh = false;
+  private rootFailed = false;
   dropEvents = false;
   deferTasks = false;
   constructor(
@@ -128,6 +130,8 @@ export class FixtureAdapter implements FilesystemAdapter {
         return this.error<T>(input, 'SESSION_CLOSED');
       if (this.root.session.generation !== input.generation)
         return this.error<T>(input, 'STALE_GENERATION');
+      if (this.rootFailed && name !== 'refreshRoot')
+        return this.error<T>(input, 'IO_ERROR');
       return operation();
     });
   }
@@ -156,6 +160,7 @@ export class FixtureAdapter implements FilesystemAdapter {
       this.pages.clear();
       this.pageLimits.clear();
       this.root = this.newRoot();
+      this.rootFailed = false;
       return this.ok(input, this.root);
     });
   }
@@ -361,10 +366,26 @@ export class FixtureAdapter implements FilesystemAdapter {
       { ...input, generation: input.expectedGeneration },
       () => {
         this.root = this.newRoot(input.expectedGeneration + 1);
+        this.rootFailed = this.failNextRefresh;
+        this.failNextRefresh = false;
         this.tasks.clear();
         this.listings.clear();
         this.pages.clear();
         this.pageLimits.clear();
+        if (this.rootFailed)
+          return {
+            requestId: input.requestId,
+            outcome: 'error' as const,
+            error: {
+              code: 'IO_ERROR',
+              operation: 'refreshRoot',
+              scope: 'root' as const,
+            },
+            currentScope: {
+              sessionId: this.root.session.sessionId,
+              generation: this.root.session.generation,
+            },
+          };
         return this.ok(input, this.root);
       },
     );
@@ -380,6 +401,7 @@ export class FixtureAdapter implements FilesystemAdapter {
         ? ('closed' as const)
         : ('alreadyClosed' as const);
       this.root = null;
+      this.rootFailed = false;
       this.tasks.clear();
       this.listings.clear();
       this.pages.clear();
