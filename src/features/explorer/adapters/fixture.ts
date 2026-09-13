@@ -51,6 +51,7 @@ export class FixtureAdapter implements FilesystemAdapter {
   private tasks = new Map<string, WorkRecord>();
   private listings = new Map<string, ListingStart>();
   private pages = new Map<string, ListingPage>();
+  private pageLimits = new Map<string, number>();
   private records = new Map<string, Response<unknown>>();
   private highWater = 0;
   readonly calls: Record<string, number> = {};
@@ -153,6 +154,7 @@ export class FixtureAdapter implements FilesystemAdapter {
       this.tasks.clear();
       this.listings.clear();
       this.pages.clear();
+      this.pageLimits.clear();
       this.root = this.newRoot();
       return this.ok(input, this.root);
     });
@@ -238,6 +240,10 @@ export class FixtureAdapter implements FilesystemAdapter {
         input.limit > 1000
       )
         return this.error<ListingPage>(input, 'INVALID_ARGUMENT');
+      const existingLimit = this.pageLimits.get(input.taskId);
+      if (existingLimit !== undefined && existingLimit !== input.limit)
+        return this.error<ListingPage>(input, 'INVALID_ARGUMENT');
+      this.pageLimits.set(input.taskId, input.limit);
       const work = this.tasks.get(input.taskId)!;
       let offset = 0;
       if (input.cursor) {
@@ -358,6 +364,7 @@ export class FixtureAdapter implements FilesystemAdapter {
         this.tasks.clear();
         this.listings.clear();
         this.pages.clear();
+        this.pageLimits.clear();
         return this.ok(input, this.root);
       },
     );
@@ -376,6 +383,7 @@ export class FixtureAdapter implements FilesystemAdapter {
       this.tasks.clear();
       this.listings.clear();
       this.pages.clear();
+      this.pageLimits.clear();
       return this.ok(input, { status });
     });
   }

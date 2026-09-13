@@ -98,7 +98,7 @@ describe('fixture API contract', () => {
     };
     expect(await adapter.readListingPage(wrongLimit)).toMatchObject({
       outcome: 'error',
-      error: { code: 'CURSOR_EXPIRED' },
+      error: { code: 'INVALID_ARGUMENT' },
     });
     const next = { ...wrongLimit, ...scoped(), limit: 1 };
     expect(
