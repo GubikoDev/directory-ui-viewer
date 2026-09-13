@@ -24,9 +24,9 @@ export function App({ client: provided }: { client?: SessionClient }) {
   useEffect(() => () => client.dispose(), [client]);
   const run = (action: () => Promise<unknown>) => {
     setError('');
-    void action().catch((e) =>
-      setError(e instanceof Error ? e.message : 'INTERNAL'),
-    );
+    void Promise.resolve()
+      .then(action)
+      .catch((e) => setError(e instanceof Error ? e.message : 'INTERNAL'));
   };
   const selected = state.selectedId ?? state.session?.rootEntryId;
   const entry = selected ? state.entries.get(selected) : undefined;
@@ -36,10 +36,9 @@ export function App({ client: provided }: { client?: SessionClient }) {
   const files = selected
     ? client.store.getListing(selected, 'files')
     : undefined;
-  const ids = [
-    ...(folders?.snapshot?.entryIds ?? []),
-    ...(files?.snapshot?.entryIds ?? []),
-  ];
+  const count =
+    (folders?.snapshot?.entryIds.length ?? 0) +
+    (files?.snapshot?.entryIds.length ?? 0);
   const choose = () =>
     run(async () => {
       setChoosing(true);
@@ -55,6 +54,26 @@ export function App({ client: provided }: { client?: SessionClient }) {
       client.store.setExpanded(id, true);
       await client.list(id, 'directories');
     });
+  const renderItem = (id: string) => {
+    const item = state.entries.get(id);
+    if (!item) return null;
+    return (
+      <li key={id} className="rounded border border-slate-700 p-2">
+        {item.kind === 'directory' ? (
+          <button onClick={() => open(id)}>{item.displayName}</button>
+        ) : (
+          <span>
+            {item.displayName} ({item.kind})
+          </span>
+        )}
+        {item.kind === 'directory' && (
+          <span className="ml-4 text-slate-400">
+            {measure(state.usages.get(id)?.logical)}
+          </span>
+        )}
+      </li>
+    );
+  };
   return (
     <main className="min-h-screen bg-slate-950 p-6 text-slate-100">
       <h1 className="text-2xl font-semibold">Directory UI Viewer</h1>
@@ -122,28 +141,10 @@ export function App({ client: provided }: { client?: SessionClient }) {
                 : 'my-4 space-y-2'
             }
           >
-            {ids.map((id) => {
-              const item = state.entries.get(id);
-              if (!item) return null;
-              return (
-                <li key={id} className="rounded border border-slate-700 p-2">
-                  {item.kind === 'directory' ? (
-                    <button onClick={() => open(id)}>{item.displayName}</button>
-                  ) : (
-                    <span>
-                      {item.displayName} ({item.kind})
-                    </span>
-                  )}
-                  {item.kind === 'directory' && (
-                    <span className="ml-4 text-slate-400">
-                      {measure(state.usages.get(id)?.logical)}
-                    </span>
-                  )}
-                </li>
-              );
-            })}
+            {folders?.snapshot?.entryIds.map(renderItem)}
+            {files?.snapshot?.entryIds.map(renderItem)}
           </ul>
-          {folders?.snapshot?.coverage === 'complete' && ids.length === 0 && (
+          {folders?.snapshot?.coverage === 'complete' && count === 0 && (
             <p>하위 폴더가 없습니다.</p>
           )}
           {[folders, files].map((listing, i) =>
@@ -161,7 +162,7 @@ export function App({ client: provided }: { client?: SessionClient }) {
       <section aria-label="작업 상태">
         <h2 className="my-3 text-xl">작업 상태</h2>
         <ul>
-          {[...state.tasks.values()].map((task) => (
+          {Array.from(state.tasks.values(), (task) => (
             <li key={task.taskId}>
               {task.operation}: {task.phase} {task.waitReason ?? ''} ·{' '}
               {task.processedEntries}개
