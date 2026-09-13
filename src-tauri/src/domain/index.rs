@@ -7,6 +7,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// macOS 64-bit dirent permits up to MAXPATHLEN-1 raw bytes, not 255 bytes.
+pub const MAX_COMPONENT_BYTES: usize = 1023;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Background,
@@ -123,7 +126,7 @@ impl DirectoryIndex {
         if let Some(id) = self.by_key.get(&key) {
             return Ok(id.clone());
         }
-        if key.raw_name.len() > 255
+        if key.raw_name.len() > MAX_COMPONENT_BYTES
             || key.raw_name.contains(&0)
             || key.raw_name.contains(&b'/')
             || key.raw_name == b"."
