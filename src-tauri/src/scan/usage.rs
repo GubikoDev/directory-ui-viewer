@@ -42,6 +42,15 @@ pub trait ObservationSource {
     type Cursor;
     /// Native capability sources account every handle themselves, including
     /// retained parents and validation opens. Wrappers verify the same pool.
+    /// Pure registration hook: never performs filesystem I/O.
+    fn bind_directory(
+        &mut self,
+        _observation: &Observation,
+        _id: &str,
+        _index: &SharedDirectoryIndex,
+    ) -> Result<(), FsIssue> {
+        Ok(())
+    }
     fn handle_budget(&self) -> Option<&crate::scheduler::HandleBudget> {
         None
     }
@@ -308,10 +317,14 @@ impl<S: ObservationSource> UsageScanner<S> {
                     if fresh.kind != Kind::Directory || fresh.raw_name != root.raw_name {
                         return Err("INVALID_ARGUMENT");
                     }
-                    root = fresh;
-                    aggregate = Aggregate::default();
-                    aggregate.add_own(&root);
-                    source.open(&root)
+                    source
+                        .bind_directory(&fresh, &root_id, &index)
+                        .and_then(|()| {
+                            root = fresh;
+                            aggregate = Aggregate::default();
+                            aggregate.add_own(&root);
+                            source.open(&root)
+                        })
                 }
                 Ok(_) => Err(FsIssue {
                     code: "SESSION_CLOSED".into(),
@@ -515,6 +528,12 @@ impl<S: ObservationSource> UsageScanner<S> {
                     break;
                 }
             };
+            if let Err(issue) = self.source.bind_directory(&observation, &id, &self.index) {
+                let reason = source_error_reason(&issue);
+                self.issues.record(issue);
+                self.stack.last_mut().unwrap().aggregate.reason(reason);
+                continue;
+            }
             let mut aggregate = Aggregate::default();
             aggregate.add_own(&observation);
             let excluded = observation.mount != self.root_mount

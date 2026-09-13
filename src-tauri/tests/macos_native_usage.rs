@@ -385,3 +385,91 @@ fn actual_child_permission_failure_keeps_healthy_sibling_bytes_and_native_code()
             .any(|i| i.code == "PERMISSION_DENIED" && i.native_code == Some(libc::EACCES))
     );
 }
+
+#[test]
+fn an_existing_directory_id_cannot_be_rebound_to_a_replacement_object() {
+    let f = Fixture::new();
+    fs::create_dir(f.p("root/child")).unwrap();
+    let b = ManagedBudgets::default();
+    let handles = HandleBudget::new(320);
+    let root = f.approve(&handles, &b);
+    let idx = index(&b);
+    let root_id = idx
+        .register(
+            DirectoryKey {
+                parent_id: None,
+                raw_name: vec![],
+            },
+            Origin::Background,
+        )
+        .unwrap();
+    let child_id = idx
+        .register(
+            DirectoryKey {
+                parent_id: Some(root_id),
+                raw_name: b"child".to_vec(),
+            },
+            Origin::Foreground,
+        )
+        .unwrap();
+    let old = root
+        .directory()
+        .observe(b"child")
+        .unwrap()
+        .identity()
+        .fingerprint();
+    idx.bind_identity(&child_id, old).unwrap();
+    let before = b.foreground_index.used();
+    idx.bind_identity(&child_id, old).unwrap();
+    assert_eq!(b.foreground_index.used(), before);
+    fs::rename(f.p("root/child"), f.p("old")).unwrap();
+    fs::create_dir(f.p("root/child")).unwrap();
+    fs::write(f.p("root/child/new-object-data"), vec![0; 10_000]).unwrap();
+    let scan = run_scan(root, &handles, &b, idx.clone());
+    assert_eq!(idx.identity(&child_id).unwrap(), Some(old));
+    assert!(idx.usage(&child_id).unwrap().is_none());
+    let summary = idx.usage(scan.root_id()).unwrap().unwrap();
+    assert!(
+        matches!(summary.logical,Measure::Partial{reasons,..} if reasons.contains(&Reason::ChangedDuringScan))
+    );
+    assert!(
+        scan.issues
+            .samples
+            .iter()
+            .any(|i| i.code == "ENTRY_CHANGED")
+    );
+    assert_eq!(
+        scan.stats.processed_entries, 1,
+        "replacement contents were not traversed"
+    );
+}
+#[test]
+fn mismatched_root_index_binding_fails_before_root_cursor_is_opened() {
+    use directory_ui_viewer_lib::domain::index::DirectoryFingerprint;
+    let f = Fixture::new();
+    fs::write(f.p("root/data"), b"do not traverse").unwrap();
+    let b = ManagedBudgets::default();
+    let handles = HandleBudget::new(320);
+    let root = f.approve(&handles, &b);
+    let idx = index(&b);
+    let id = idx
+        .register(
+            DirectoryKey {
+                parent_id: None,
+                raw_name: vec![],
+            },
+            Origin::Background,
+        )
+        .unwrap();
+    idx.bind_identity(&id, DirectoryFingerprint([0; 5]))
+        .unwrap();
+    let scan = run_scan(root, &handles, &b, idx);
+    assert!(scan.root_failed());
+    assert_eq!(scan.stats.processed_entries, 0);
+    assert_eq!(handles.peak(), 1);
+    assert_eq!(scan.issues.samples[0].code, "ENTRY_CHANGED");
+    assert_eq!(
+        scan.issues.samples[0].scope,
+        directory_ui_viewer_lib::domain::model::IssueScope::Root
+    );
+}

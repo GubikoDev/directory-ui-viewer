@@ -93,6 +93,8 @@ fn observation(node: u64, name: Vec<u8>, stat: &libc::stat) -> Observation {
             inode: stat.st_ino,
         }),
         link_count: stat.st_nlink as u64,
+        // stat has no mount-point identity. Defer native mount exclusion to
+        // nofollow open + fstatfs in open_observed; st_dev is insufficient.
         mount: 0,
         logical: u64::try_from(stat.st_size).map_or(Metric::Error, Metric::Known),
         allocated: u64::try_from(stat.st_blocks)
@@ -103,6 +105,33 @@ fn observation(node: u64, name: Vec<u8>, stat: &libc::stat) -> Observation {
 }
 impl ObservationSource for NativeUsageSource {
     type Cursor = DirectoryCursor;
+    fn bind_directory(
+        &mut self,
+        observed: &Observation,
+        id: &str,
+        index: &crate::domain::index::SharedDirectoryIndex,
+    ) -> Result<(), FsIssue> {
+        let fingerprint = if observed.node == 0 {
+            self.root.directory().identity().fingerprint()
+        } else {
+            let pending = self
+                .pending
+                .as_ref()
+                .filter(|p| p.node == observed.node && p.child.raw_name() == observed.raw_name)
+                .ok_or_else(|| issue(BoundaryError::ChangedObject, IssueScope::Entry))?;
+            pending.child.identity().fingerprint()
+        };
+        index.bind_identity(id, fingerprint).map_err(|_| {
+            issue(
+                BoundaryError::ChangedObject,
+                if observed.node == 0 {
+                    IssueScope::Root
+                } else {
+                    IssueScope::Entry
+                },
+            )
+        })
+    }
     fn handle_budget(&self) -> Option<&HandleBudget> {
         Some(self.root.directory().handle_budget())
     }

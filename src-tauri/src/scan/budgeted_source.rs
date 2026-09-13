@@ -24,6 +24,14 @@ impl<S> BudgetedSource<S> {
 }
 impl<S: ObservationSource> ObservationSource for BudgetedSource<S> {
     type Cursor = BudgetedCursor<S::Cursor>;
+    fn bind_directory(
+        &mut self,
+        observation: &Observation,
+        id: &str,
+        index: &crate::domain::index::SharedDirectoryIndex,
+    ) -> Result<(), FsIssue> {
+        self.source.bind_directory(observation, id, index)
+    }
     fn refresh_root(&mut self, root: &Observation) -> Result<Observation, FsIssue> {
         self.check_pool()?;
         self.source.refresh_root(root)

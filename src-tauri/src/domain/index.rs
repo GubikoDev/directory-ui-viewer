@@ -27,7 +27,12 @@ pub struct DirectoryKey {
     pub parent_id: Option<String>,
     pub raw_name: Vec<u8>,
 }
+/// Native observation fingerprint, never serialized and never an authority token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryFingerprint(pub [u64; 5]);
+
 struct Record {
+    identity: Option<DirectoryFingerprint>,
     key: DirectoryKey,
     entry: Option<Entry>,
     usage: Option<DirectoryUsage>,
@@ -154,6 +159,7 @@ impl DirectoryIndex {
         self.records.insert(
             id.clone(),
             Record {
+                identity: None,
                 key,
                 entry: None,
                 usage: None,
@@ -186,6 +192,27 @@ impl DirectoryIndex {
         }
         self.records.get_mut(id).unwrap().entry = Some(entry);
         Ok(())
+    }
+    /// The fixed-size identity fits the precharged summary record. Binding is
+    /// immutable for a generation; an old ID must never describe a replacement.
+    pub fn bind_identity(
+        &mut self,
+        id: &str,
+        identity: DirectoryFingerprint,
+    ) -> Result<(), IndexError> {
+        let record = self.records.get_mut(id).ok_or(IndexError::EntryExpired)?;
+        if record.identity.is_some_and(|old| old != identity) {
+            return Err(IndexError::EntryChanged);
+        }
+        record.identity = Some(identity);
+        Ok(())
+    }
+    pub fn identity(&self, id: &str) -> Result<Option<DirectoryFingerprint>, IndexError> {
+        Ok(self
+            .records
+            .get(id)
+            .ok_or(IndexError::EntryExpired)?
+            .identity)
     }
     pub fn key(&self, id: &str) -> Result<&DirectoryKey, IndexError> {
         self.records
@@ -233,6 +260,16 @@ impl From<DirectoryIndex> for SharedDirectoryIndex {
     }
 }
 impl SharedDirectoryIndex {
+    pub fn bind_identity(
+        &self,
+        id: &str,
+        identity: DirectoryFingerprint,
+    ) -> Result<(), IndexError> {
+        self.0.lock().unwrap().bind_identity(id, identity)
+    }
+    pub fn identity(&self, id: &str) -> Result<Option<DirectoryFingerprint>, IndexError> {
+        self.0.lock().unwrap().identity(id)
+    }
     pub fn bind_scope(&self, scope: &Scope) -> Result<(), IndexError> {
         self.0.lock().unwrap().bind_scope(scope)
     }

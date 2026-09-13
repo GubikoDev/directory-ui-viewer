@@ -53,6 +53,15 @@ pub struct Identity {
     birth_nsec: i64,
 }
 impl Identity {
+    pub fn fingerprint(&self) -> crate::domain::index::DirectoryFingerprint {
+        crate::domain::index::DirectoryFingerprint([
+            self.device as u32 as u64,
+            self.inode,
+            self.generation as u64,
+            self.birth_sec as u64,
+            self.birth_nsec as u64,
+        ])
+    }
     fn of(s: &libc::stat) -> Self {
         Self {
             device: s.st_dev,
@@ -114,6 +123,9 @@ pub struct ChildObservation {
     stat: libc::stat,
 }
 impl ChildObservation {
+    pub fn identity(&self) -> Identity {
+        Identity::of(&self.stat)
+    }
     pub fn metadata(&self) -> &libc::stat {
         &self.stat
     }
