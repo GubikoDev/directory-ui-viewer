@@ -1,4 +1,5 @@
 //! Once-only request execution with bounded pending waiters and charged replies.
+use super::delivery::ReplyDelivery;
 use super::protocol::{MAX_MESSAGE_BYTES, RequestNumber};
 use crate::{
     domain::controller::{Admission, ControlError, RequestLedger},
@@ -87,7 +88,9 @@ pub struct Completion {
     inner: Weak<Inner>,
     number: u64,
     cell: Arc<Cell>,
+    bytes: Vec<u8>,
     allocation: Option<Reservation>,
+    max_bytes: Option<usize>,
     done: bool,
 }
 pub struct ReplyWaiter {
@@ -171,6 +174,18 @@ impl ReplayService {
         reply_allowance: usize,
         priority: bool,
     ) -> Result<RequestAdmission, ControlError> {
+        self.begin_for_delivery(request, hash, now, reply_allowance, priority, None)
+            .map(|(admission, _)| admission)
+    }
+    pub(crate) fn begin_for_delivery(
+        &self,
+        request: RequestNumber,
+        hash: &str,
+        now: u64,
+        reply_allowance: usize,
+        priority: bool,
+        delivery_allowance: Option<usize>,
+    ) -> Result<(RequestAdmission, Option<ReplyDelivery>), ControlError> {
         let budget = if priority {
             self.0.budget.control()
         } else {
@@ -189,7 +204,24 @@ impl ReplayService {
         if state.closed {
             return Err(ControlError::ClientExpired);
         }
-        match state.ledger.lookup(request.sequence, hash, now)? {
+        // Hold an existing reply before pressure eviction. A replay waiter can
+        // keep using it even if its ledger record is the one evicted below.
+        let existing = state.ledger.lookup(request.sequence, hash, now)?;
+        let delivery = if let Some(bytes) = delivery_allowance {
+            if bytes > MAX_MESSAGE_BYTES {
+                return Err(ControlError::InvalidArgument);
+            }
+            Some(loop {
+                match ReplyDelivery::reserve(bytes, &budget) {
+                    Ok(delivery) => break delivery,
+                    Err(_) if state.ledger.evict_completed() => (),
+                    Err(_) => return Err(ControlError::ResourceLimit),
+                }
+            })
+        } else {
+            None
+        };
+        match existing {
             Some(existing) => {
                 let memory = budget
                     .reserve(WAITER_BYTES)
@@ -207,15 +239,18 @@ impl ReplayService {
                     }
                     Admission::New => unreachable!(),
                 };
-                return Ok(RequestAdmission::Wait(ReplyWaiter {
-                    inner: Arc::downgrade(&self.0),
-                    result,
-                    _memory: Some(memory),
-                }));
+                return Ok((
+                    RequestAdmission::Wait(ReplyWaiter {
+                        inner: Arc::downgrade(&self.0),
+                        result,
+                        _memory: Some(memory),
+                    }),
+                    delivery,
+                ));
             }
             None => (),
         }
-        let (base, allocation) = loop {
+        let (base, mut allocation) = loop {
             let reserved = budget.reserve(CELL_BYTES).and_then(|base| {
                 budget
                     .reserve(reply_allowance)
@@ -227,6 +262,16 @@ impl ReplayService {
                 Err(_) => return Err(ControlError::ResourceLimit),
             }
         };
+        // Allocate the admitted reply buffer before ledger admission/effects.
+        // Bounded mutation replies then serialize without budget growth or a
+        // later allocation. Read-only replies may still grow via ChargedWriter.
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(reply_allowance)
+            .map_err(|_| ControlError::ResourceLimit)?;
+        allocation
+            .resize(bytes.capacity())
+            .map_err(|_| ControlError::ResourceLimit)?;
         assert!(matches!(
             state
                 .ledger
@@ -249,15 +294,20 @@ impl ReplayService {
             },
             _memory: None,
         };
-        Ok(RequestAdmission::Execute(
-            Completion {
-                inner: Arc::downgrade(&self.0),
-                number: request.sequence,
-                cell,
-                allocation: Some(allocation),
-                done: false,
-            },
-            waiting,
+        Ok((
+            RequestAdmission::Execute(
+                Completion {
+                    inner: Arc::downgrade(&self.0),
+                    number: request.sequence,
+                    cell,
+                    allocation: Some(allocation),
+                    bytes,
+                    max_bytes: delivery_allowance.map(|_| reply_allowance),
+                    done: false,
+                },
+                waiting,
+            ),
+            delivery,
         ))
     }
     pub fn close(&self) {
@@ -280,6 +330,7 @@ impl Drop for ReplayService {
 struct ChargedWriter {
     bytes: Vec<u8>,
     memory: Reservation,
+    max_bytes: usize,
 }
 impl Write for ChargedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -287,7 +338,7 @@ impl Write for ChargedWriter {
             .bytes
             .len()
             .checked_add(bytes.len())
-            .filter(|n| *n <= MAX_MESSAGE_BYTES)
+            .filter(|n| *n <= self.max_bytes)
             .ok_or_else(|| io::Error::other("RESOURCE_LIMIT"))?;
         if length > self.bytes.capacity() {
             let preferred = length.next_power_of_two().max(512).min(MAX_MESSAGE_BYTES);
@@ -321,8 +372,9 @@ impl Write for ChargedWriter {
 impl Completion {
     pub fn complete(mut self, value: impl Serialize) -> Result<Arc<Reply>, ControlError> {
         let mut writer = ChargedWriter {
-            bytes: Vec::new(),
+            bytes: std::mem::take(&mut self.bytes),
             memory: self.allocation.take().expect("one completion"),
+            max_bytes: self.max_bytes.unwrap_or(MAX_MESSAGE_BYTES),
         };
         let serialized = serde_json::to_writer(&mut writer, &value);
         drop(value);
@@ -338,7 +390,14 @@ impl Completion {
             }))
         } else {
             drop(writer);
-            self.cell.failure("RESOURCE_LIMIT")
+            // Mutation overflow is a producer-contract defect, not permission
+            // to compete for post-effect memory. Read-only growth is bounded
+            // by the wire limit and may legitimately exhaust the shared pool.
+            self.cell.failure(if self.max_bytes.is_some() {
+                "INTERNAL"
+            } else {
+                "RESOURCE_LIMIT"
+            })
         };
         self.retire(reply.clone());
         self.done = true;
@@ -371,6 +430,86 @@ impl Drop for Completion {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn delivery_admission_reclaims_completed_cache_and_preserves_current_replay() {
+        let budget = ByteBudget::new(192 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 256, 1000).unwrap();
+        // Each completed reply owns a preallocated48KiB buffer. Two records
+        // leave too little room for the next caller's approximately36KiB eval.
+        drop(
+            execute(&service, 1, 48 * 1024)
+                .complete(json!({"id":1}))
+                .unwrap(),
+        );
+        drop(
+            execute(&service, 2, 48 * 1024)
+                .complete(json!({"id":2}))
+                .unwrap(),
+        );
+        let (RequestAdmission::Wait(waiter), Some(delivery)) = service
+            .begin_for_delivery(n(1), &hash(), 0, 4096, false, Some(4096))
+            .unwrap()
+        else {
+            panic!("must replay, never repeat effects");
+        };
+        let reply = tauri::async_runtime::block_on(waiter.wait()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(reply.bytes()).unwrap(),
+            json!({"id":1})
+        );
+        // New requests also remain admissible after the completed cache was
+        // reclaimed, rather than leaving the request ledger permanently full.
+        drop((reply, delivery));
+        let (RequestAdmission::Execute(owner, _), Some(delivery)) = service
+            .begin_for_delivery(n(3), &hash(), 0, 4096, false, Some(4096))
+            .unwrap()
+        else {
+            panic!("new request");
+        };
+        drop(owner.complete(json!({"id":3})).unwrap());
+        drop((delivery, service));
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn failed_delivery_admission_does_not_execute_or_consume_request_identity() {
+        let budget = ByteBudget::new(128 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 256, 1000).unwrap();
+        let pressure = budget.reserve(budget.available()).unwrap();
+        assert!(matches!(
+            service.begin_for_delivery(n(1), &hash(), 0, 4096, false, Some(4096)),
+            Err(ControlError::ResourceLimit)
+        ));
+        drop(pressure);
+        assert!(matches!(
+            service.begin_for_delivery(n(1), &hash(), 0, 4096, false, Some(4096)),
+            Ok((RequestAdmission::Execute(..), Some(_)))
+        ));
+    }
+    #[test]
+    fn mutation_serialization_never_grows_past_its_admitted_contract() {
+        let budget = ByteBudget::new(128 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 256, 1000).unwrap();
+        let (RequestAdmission::Execute(owner, _), Some(delivery)) = service
+            .begin_for_delivery(n(1), &hash(), 0, 4096, false, Some(4096))
+            .unwrap()
+        else {
+            panic!("new mutation");
+        };
+        let peak = budget.peak();
+        let reply = owner.complete(&"x".repeat(4096)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(reply.bytes()).unwrap()["error"]["code"],
+            "INTERNAL"
+        );
+        assert_eq!(budget.peak(), peak, "no post-effect reservation growth");
+        assert!(
+            delivery
+                .prepare(&"a".repeat(64), &"b".repeat(32), reply.bytes())
+                .is_ok()
+        );
+        drop((reply, service));
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn general_pending_admission_exhausts_bytes_before_slots_and_leaves_control_room() {
         let budget = ByteBudget::with_headroom(4 * 1024 * 1024, 1024 * 1024);
@@ -444,6 +583,7 @@ mod tests {
         let mut writer = ChargedWriter {
             bytes: Vec::new(),
             memory: budget.reserve(0).unwrap(),
+            max_bytes: MAX_MESSAGE_BYTES,
         };
         writer.write_all(&vec![b'x'; 600_001]).unwrap();
         assert_eq!(writer.bytes.len(), 600_001);

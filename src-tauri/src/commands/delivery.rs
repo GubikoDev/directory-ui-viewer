@@ -18,6 +18,71 @@ pub struct Delivery {
     script: String,
     memory: Arc<Reservation>,
 }
+/// Own the script allocation before a mutation can become visible. This is
+/// separate from the replay cache: every waiting caller owns its own delivery.
+pub struct ReplyDelivery {
+    bytes: Vec<u8>,
+    memory: Reservation,
+}
+impl ReplyDelivery {
+    pub fn reserve(max_json_bytes: usize, budget: &ByteBudget) -> Result<Self, DeliveryError> {
+        if max_json_bytes > MAX_MESSAGE_BYTES {
+            return Err(DeliveryError::ResourceLimit);
+        }
+        // A serialized JSON document contains no raw ASCII controls. Quoting
+        // its quotes/backslashes at most doubles its UTF8 length, plus quotes.
+        Self::with_capacity(max_json_bytes * 2 + 514, budget)
+    }
+    fn with_capacity(capacity: usize, budget: &ByteBudget) -> Result<Self, DeliveryError> {
+        let memory = budget
+            .reserve(capacity * 4 + 2048)
+            .map_err(|_| DeliveryError::ResourceLimit)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| DeliveryError::ResourceLimit)?;
+        if bytes.capacity() > capacity {
+            return Err(DeliveryError::ResourceLimit);
+        }
+        Ok(Self { bytes, memory })
+    }
+    pub fn prepare(
+        mut self,
+        proof: &str,
+        key: &str,
+        json: &[u8],
+    ) -> Result<Delivery, DeliveryError> {
+        let (json, capacity) = reply_capacity(proof, key, json)?;
+        if capacity > self.bytes.capacity() {
+            return Err(DeliveryError::ResourceLimit);
+        }
+        write!(&mut self.bytes, "(()=>{{if(window.__DIRECTORY_DOCUMENT_PROOF__!==\"{proof}\")return false;const receive=window.__DIRECTORY_RECEIVE__;if(typeof receive!==\"function\")return false;return receive(\"{key}\",").unwrap();
+        serde_json::to_writer(&mut self.bytes, json).map_err(|_| DeliveryError::ResourceLimit)?;
+        self.bytes.extend_from_slice(b")===true;})()");
+        assert!(self.bytes.len() <= capacity);
+        Ok(Delivery {
+            script: String::from_utf8(self.bytes).expect("UTF-8 script"),
+            memory: Arc::new(self.memory),
+        })
+    }
+}
+fn reply_capacity<'a>(
+    proof: &str,
+    key: &str,
+    json: &'a [u8],
+) -> Result<(&'a str, usize), DeliveryError> {
+    if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) || !valid_key(key) {
+        return Err(DeliveryError::InvalidArgument);
+    }
+    if json.len() > MAX_MESSAGE_BYTES {
+        return Err(DeliveryError::ResourceLimit);
+    }
+    let json = std::str::from_utf8(json).map_err(|_| DeliveryError::InvalidArgument)?;
+    let capacity = crate::runtime::serialization::json_bytes(json)
+        .map_err(|_| DeliveryError::InvalidArgument)?
+        + 512;
+    Ok((json, capacity))
+}
 pub struct Receipt {
     receiver: oneshot::Receiver<bool>,
     _memory: Arc<Reservation>,
@@ -80,38 +145,8 @@ impl Delivery {
         json: &[u8],
         budget: &ByteBudget,
     ) -> Result<Self, DeliveryError> {
-        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) || !valid_key(key) {
-            return Err(DeliveryError::InvalidArgument);
-        }
-        if json.len() > MAX_MESSAGE_BYTES {
-            return Err(DeliveryError::ResourceLimit);
-        }
-        let json = std::str::from_utf8(json).map_err(|_| DeliveryError::InvalidArgument)?;
-        // JSON string escaping can double already-serialized JSON. Count first,
-        // without creating an uncharged second payload. Includes non-ASCII UTF-8.
-        let capacity = crate::runtime::serialization::json_bytes(json)
-            .map_err(|_| DeliveryError::InvalidArgument)?
-            + 512;
-        // Rust script plus UTF-16 NSString copy and conservative native handoff
-        // headroom. Framework/WebView process RSS is measured separately.
-        let memory = budget
-            .reserve(capacity * 4 + 2048)
-            .map_err(|_| DeliveryError::ResourceLimit)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(capacity)
-            .map_err(|_| DeliveryError::ResourceLimit)?;
-        if bytes.capacity() > capacity {
-            return Err(DeliveryError::ResourceLimit);
-        }
-        write!(&mut bytes, "(()=>{{if(window.__DIRECTORY_DOCUMENT_PROOF__!==\"{proof}\")return false;const receive=window.__DIRECTORY_RECEIVE__;if(typeof receive!==\"function\")return false;return receive(\"{key}\",").unwrap();
-        serde_json::to_writer(&mut bytes, json).map_err(|_| DeliveryError::ResourceLimit)?;
-        bytes.extend_from_slice(b")===true;})()");
-        assert!(bytes.len() <= capacity);
-        Ok(Self {
-            script: String::from_utf8(bytes).expect("UTF-8 script"),
-            memory: Arc::new(memory),
-        })
+        let (_, capacity) = reply_capacity(proof, key, json)?;
+        ReplyDelivery::with_capacity(capacity, budget)?.prepare(proof, key, json)
     }
     /// The scheduler must keep the callback alongside the script until execution
     /// completes or the queued/native operation is destroyed. No timeout releases

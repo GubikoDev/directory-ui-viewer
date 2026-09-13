@@ -366,20 +366,24 @@ pub async fn filesystem_request(
     let replay = state.replay(&context, number.epoch)?;
     let hash = replay::fingerprint(&input.request).map_err(control)?;
     let epoch = number.epoch;
-    let waiter = {
+    let mutation_bytes = mutation_reply_bytes(&input.request.body);
+    let (waiter, delivery) = {
         // Admission and immediate control effects have one order. Only native
         // picker/worker waits outlive this lock; no filesystem call runs here.
         let _dispatch = state.dispatch.lock().unwrap();
-        match replay
-            .begin_with_priority(
+        // Replay admission evicts completed cache records when necessary and
+        // reserves this caller's delivery before any effects become visible.
+        let (admission, delivery) = replay
+            .begin_for_delivery(
                 number,
                 &hash,
                 state.clock.sample().monotonic_ms,
-                CONTROL_REPLY_BYTES,
+                mutation_bytes.unwrap_or(CONTROL_REPLY_BYTES),
                 priority,
+                mutation_bytes,
             )
-            .map_err(control)?
-        {
+            .map_err(control)?;
+        let waiter = match admission {
             RequestAdmission::Wait(waiter) => waiter,
             RequestAdmission::Execute(completion, waiter) => {
                 execute(
@@ -393,16 +397,22 @@ pub async fn filesystem_request(
                 );
                 waiter
             }
-        }
+        };
+        (waiter, delivery)
     };
     let reply = waiter.wait().await.map_err(control)?;
     state.current(&context)?;
-    let delivery = super::delivery::Delivery::prepare(
-        &input.document_proof,
-        &input.response_key,
-        reply.bytes(),
-        &budget,
-    )
+    let delivery = match delivery {
+        Some(delivery) => {
+            delivery.prepare(&input.document_proof, &input.response_key, reply.bytes())
+        }
+        None => super::delivery::Delivery::prepare(
+            &input.document_proof,
+            &input.response_key,
+            reply.bytes(),
+            &budget,
+        ),
+    }
     .map_err(|error| {
         issue(match error {
             super::delivery::DeliveryError::ResourceLimit => "RESOURCE_LIMIT",
@@ -424,6 +434,21 @@ pub async fn filesystem_request(
     state.current(&context)?;
     // Only a fixed-size acknowledgement uses the ordinary IPC response path.
     Ok(InvokeResponseBody::Json("null".into()))
+}
+
+fn mutation_reply_bytes(command: &Command) -> Option<usize> {
+    // Root names <=1023 raw bytes; errors and metadata have fixed fields.
+    // WorkRecord has <=32 samples with operation<=64 and entry ID<=256
+    // UTF8 bytes, <=18 canonical counts, and generated opaque identifiers.
+    // Include worst ASCII-control JSON escaping and the response envelope.
+    match command {
+        Command::ChooseRoot {} | Command::RefreshRoot { .. } => Some(16 * 1024),
+        Command::StartListing { .. }
+        | Command::StartUsageScan { .. }
+        | Command::CancelTask { .. } => Some(80 * 1024),
+        Command::CloseSession { .. } => Some(4 * 1024),
+        _ => None,
+    }
 }
 
 fn execute(
@@ -711,6 +736,146 @@ fn allowed_origin(url: &tauri::Url) -> bool {
 mod tests {
     use super::*;
     use crate::commands::protocol::RequestNumber;
+    #[test]
+    fn mutation_reply_and_delivery_are_admitted_before_late_pressure() {
+        use crate::commands::delivery::Callback;
+        use crate::domain::model::{Issues, RootData, WorkRecord};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/features/explorer/model/wire-fixture.json"
+        ))
+        .unwrap();
+        let mut root: RootData = serde_json::from_value(fixture["root"].clone()).unwrap();
+        root.root.display_name = "\u{1}".repeat(1023);
+        root.session.session_id = "s".repeat(128);
+        root.session.root_entry_id = "e".repeat(256);
+        root.root.entry_id = root.session.root_entry_id.clone();
+        let mut work: WorkRecord = serde_json::from_value(fixture["work"].clone()).unwrap();
+        work.issues = Issues::default();
+        for _ in 0..32 {
+            work.issues.record(FsIssue {
+                code: "LINK_TRAVERSAL_BLOCKED".into(),
+                operation: "\u{1}".repeat(64),
+                scope: IssueScope::Entry,
+                entry_id: Some("\u{1}".repeat(256)),
+                native_code: Some(i32::MIN),
+            });
+        }
+        work.session_id = "s".repeat(128);
+        work.task_id = "t".repeat(256);
+        work.target_id = "e".repeat(256);
+        let cases = [
+            (
+                Command::ChooseRoot {},
+                serde_json::to_value(&root).unwrap(),
+                false,
+            ),
+            (
+                Command::RefreshRoot {
+                    session_id: "s".into(),
+                    expected_generation: 1,
+                },
+                serde_json::to_value(root).unwrap(),
+                false,
+            ),
+            (
+                Command::StartListing {
+                    session_id: "s".into(),
+                    generation: 1,
+                    directory_id: "e".into(),
+                    category: crate::domain::model::Category::Files,
+                },
+                serde_json::to_value(&work).unwrap(),
+                false,
+            ),
+            (
+                Command::StartUsageScan {
+                    session_id: "s".into(),
+                    generation: 1,
+                },
+                serde_json::to_value(&work).unwrap(),
+                false,
+            ),
+            (
+                Command::CancelTask {
+                    session_id: "s".into(),
+                    generation: 1,
+                    task_id: "t".into(),
+                },
+                serde_json::json!({"status":"accepted","work":work}),
+                true,
+            ),
+            (
+                Command::CloseSession {
+                    session_id: "s".into(),
+                },
+                serde_json::json!({"status":"closed"}),
+                true,
+            ),
+        ];
+        for (command, data, priority) in cases {
+            let shared = ByteBudget::with_headroom(4 * 1024 * 1024, 1024 * 1024);
+            let replay = ReplayService::new(1, shared.clone(), 256, 1000).unwrap();
+            let general_pressure = priority.then(|| shared.reserve(shared.available()).unwrap());
+            let budget = if priority {
+                shared.control()
+            } else {
+                shared.clone()
+            };
+            let input_and_typed = budget.reserve(96 * 1024).unwrap();
+            let allowance = mutation_reply_bytes(&command).unwrap();
+            let response =
+                serde_json::json!({"requestId":"native-epoch-1:1","outcome":"ok","data":data});
+            assert!(crate::runtime::serialization::json_bytes(&response).unwrap() <= allowance);
+            let (RequestAdmission::Execute(completion, waiter), Some(delivery)) = replay
+                .begin_for_delivery(
+                    RequestNumber {
+                        epoch: 1,
+                        sequence: 1,
+                    },
+                    &replay::fingerprint(&command).unwrap(),
+                    0,
+                    allowance,
+                    priority,
+                    Some(allowance),
+                )
+                .unwrap()
+            else {
+                panic!("first request");
+            };
+            let pressure = budget.reserve(budget.available()).unwrap();
+            let reply = completion.complete(&response).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(reply.bytes()).unwrap(),
+                response
+            );
+            let delivery = delivery
+                .prepare(&"a".repeat(64), &"b".repeat(32), reply.bytes())
+                .unwrap();
+            let mut callback: Option<Callback> = None;
+            let receipt = delivery
+                .submit(|_, cb| {
+                    callback = Some(cb);
+                    Ok(())
+                })
+                .unwrap();
+            drop(receipt);
+            drop((
+                replay,
+                waiter,
+                reply,
+                pressure,
+                general_pressure,
+                input_and_typed,
+            ));
+            assert!(
+                shared.used() > 0,
+                "abandoned callback still owns script charge"
+            );
+            drop(callback);
+            assert_eq!(shared.used(), 0);
+            assert!(shared.peak() <= shared.limit());
+        }
+    }
     #[test]
     fn bounded_control_hint_never_bypasses_strict_validation() {
         let budget = ByteBudget::with_headroom(128 * 1024, 64 * 1024);
