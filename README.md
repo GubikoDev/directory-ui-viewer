@@ -6,6 +6,11 @@ A local-first visual directory explorer for macOS and Linux. The project aims to
 
 The repository currently contains the project foundation only. Directory browsing is intentionally not implemented yet.
 
+The first implementation targets macOS. Rust CI checks both macOS and Linux;
+Linux release support remains a later milestone. The frontend uses a typed
+filesystem adapter, with native folder selection and root approval owned by
+Rust. The frontend has no direct dialog permission.
+
 ## Technology
 
 - React, TypeScript, Vite, Tailwind CSS, and shadcn/ui conventions

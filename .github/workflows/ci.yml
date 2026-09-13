@@ -25,13 +25,19 @@ jobs:
       - run: npm run build
 
   rust:
-    runs-on: ubuntu-latest
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - name: Install Tauri system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
@@ -42,3 +48,4 @@ jobs:
             librsvg2-dev
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
