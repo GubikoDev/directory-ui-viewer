@@ -25,6 +25,125 @@ beforeEach(() => {
   });
 });
 describe('native wire boundary', () => {
+  it.each(['cancelTask', 'startListing', 'startUsageScan'] as const)(
+    'retains worst-case bounded issue samples for %s under pressure',
+    async (operation) => {
+      const adapter = new NativeAdapter();
+      // Issues::record caps samples at32, operations at64 bytes and entry IDs
+      // at256. Control characters maximize JSON escaping within those bounds.
+      const work = {
+        ...wire.work,
+        issues: {
+          counts: Object.fromEntries(
+            Array.from({ length: 32 }, (_, n) => [
+              `CODE_${n}`,
+              '18446744073709551615',
+            ]),
+          ),
+          samples: Array.from({ length: 32 }, () => ({
+            code: 'LINK_TRAVERSAL_BLOCKED',
+            operation: '\u0001'.repeat(64),
+            scope: 'entry',
+            entryId: '\u0001'.repeat(256),
+            nativeCode: -2147483648,
+          })),
+        },
+      };
+      const response = {
+        requestId: request.requestId,
+        outcome: 'ok',
+        data: operation === 'cancelTask' ? { status: 'accepted', work } : work,
+      };
+      const json = JSON.stringify(response);
+      expect(
+        512 + json.length * 2 + frontendBudget.parseBytes(json),
+      ).toBeLessThanOrEqual(640 * 1024);
+      let pressure!: ReturnType<FrontendBudget['reserve']>;
+      vi.mocked(invoke).mockImplementationOnce(async (_command, bytes) => {
+        const envelope = JSON.parse(
+          new TextDecoder().decode(bytes as Uint8Array),
+        );
+        // Fill the absolute limit, including control headroom. Parsing must
+        // consume the existing credit, never silently grow into spare headroom.
+        pressure = frontendBudget.reserve(
+          frontendBudget.limit - frontendBudget.used,
+          true,
+        );
+        expect(
+          nativeInbox().receive(envelope.responseKey, JSON.stringify(response)),
+        ).toBe(true);
+        return undefined as never;
+      });
+      try {
+        const reply =
+          operation === 'cancelTask'
+            ? await adapter.cancelTask({
+                ...request,
+                sessionId: 'fixture-session',
+                generation: 1,
+                taskId: 'scan-1',
+              })
+            : operation === 'startListing'
+              ? await adapter.startListing({
+                  ...request,
+                  sessionId: 'fixture-session',
+                  generation: 1,
+                  directoryId: 'A',
+                  category: 'files',
+                })
+              : await adapter.startUsageScan({
+                  ...request,
+                  sessionId: 'fixture-session',
+                  generation: 1,
+                });
+        expect(reply).toEqual(response);
+        expect(frontendBudget.peak).toBeLessThanOrEqual(frontendBudget.limit);
+      } finally {
+        pressure?.close();
+      }
+    },
+  );
+  it('uses preadmitted reply credit when data pressure arrives after native selection', async () => {
+    const adapter = new NativeAdapter();
+    let pressure!: ReturnType<FrontendBudget['reserve']>;
+    const response = {
+      requestId: request.requestId,
+      outcome: 'ok',
+      data: {
+        session: {
+          ...wire.root.session,
+          sessionId: 's'.repeat(256),
+          rootEntryId: 'e'.repeat(256),
+        },
+        root: {
+          ...wire.root.root,
+          entryId: 'e'.repeat(256),
+          // macOS candidate components are capped at1023 raw bytes. ASCII
+          // controls maximize serialized escaping; lossy UTF8 is shorter here.
+          displayName: '\u0001'.repeat(1023),
+        },
+      },
+    };
+    vi.mocked(invoke).mockImplementationOnce(async (_command, bytes) => {
+      const envelope = JSON.parse(
+        new TextDecoder().decode(bytes as Uint8Array),
+      );
+      // Model native effects completing before the response reaches JavaScript.
+      pressure = frontendBudget.reserve(frontendBudget.available);
+      expect(
+        nativeInbox().receive(envelope.responseKey, JSON.stringify(response)),
+      ).toBe(true);
+      return undefined as never;
+    });
+    try {
+      expect(await adapter.chooseRoot(request)).toEqual(response);
+      expect(invoke).toHaveBeenCalledOnce();
+      expect(nativeInbox().pending).toBe(0);
+      expect(frontendBudget.peak).toBeLessThanOrEqual(frontendBudget.limit);
+    } finally {
+      pressure?.close();
+    }
+  });
   it('dispatches cancel and close and parses replies while ordinary admission is full', async () => {
     const adapter = new NativeAdapter();
     const blocker = frontendBudget.reserve(frontendBudget.available);

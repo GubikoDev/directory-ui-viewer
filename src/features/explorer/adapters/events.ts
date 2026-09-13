@@ -33,11 +33,13 @@ export class WorkInbox {
   subscribe(listener: (event: WorkEvent) => void): () => void {
     if (this.listener || !Number.isSafeInteger(this.subscription + 1))
       throw new Error('RESOURCE_LIMIT');
-    const subscription = ++this.subscription;
-    this.listener = listener;
-    return () => {
+    const subscription = this.subscription + 1;
+    const unsubscribe = this.budget.allocateLifetime(1024, () => () => {
       if (this.subscription === subscription) this.listener = undefined;
-    };
+    });
+    this.subscription = subscription;
+    this.listener = listener;
+    return unsubscribe;
   }
   receive = (json: string): boolean => {
     if (!this.listener || typeof json !== 'string' || json.length > 4096)

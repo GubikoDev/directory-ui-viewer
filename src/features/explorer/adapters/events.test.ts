@@ -61,9 +61,11 @@ describe('bounded native event delivery', () => {
     });
     expect(inbox.receive(JSON.stringify(wire.event))).toBe(true);
     stop();
-    expect(budget.used).toBe(baseline + ownBytes(event));
+    expect(budget.used).toBe(baseline + 1024 + ownBytes(event));
     expect(Object.isFrozen(event)).toBe(true);
     collect(records.get(event)!);
+    expect(budget.used).toBe(baseline + 1024);
+    collect(records.get(stop)!);
     expect(budget.used).toBe(baseline);
   });
 });

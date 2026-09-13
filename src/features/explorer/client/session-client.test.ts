@@ -70,7 +70,7 @@ describe('SessionClient with deterministic adapter', () => {
     await client.close();
   });
   it('accepts cancellation under data pressure and reports recovery failure separately', async () => {
-    const budget = new FrontendBudget();
+    const budget = new FrontendBudget(undefined, undefined, 1024 * 1024);
     const { client, adapter, store } = setup(new FixtureAdapter(), budget);
     adapter.deferTasks = true;
     adapter.dropEvents = true;
@@ -205,31 +205,62 @@ describe('SessionClient with deterministic adapter', () => {
     expect(adapter.calls.readUsage).toBe(calls);
     blocker.close();
   });
-  it('keeps native control ownership when a chosen root cannot fit the view', async () => {
-    const budget = new FrontendBudget();
+  it('keeps native control ownership when an admitted root cannot fit the view', async () => {
+    const budget = new FrontendBudget(undefined, undefined, 1024 * 1024);
     const { client, adapter, store } = setup(new FixtureAdapter(), budget);
-    const blocker = budget.reserve(budget.limit - budget.used);
-    await expect(client.chooseRoot()).rejects.toThrow('RESOURCE_LIMIT');
-    expect(client.hasSession).toBe(true);
-    expect(store.getSnapshot().session).toBeNull();
-    expect(adapter.calls.startUsageScan ?? 0).toBe(0);
-    expect(adapter.calls.startListing ?? 0).toBe(0);
-    await client.close();
-    expect(adapter.calls.closeSession).toBe(1);
-    expect(client.hasSession).toBe(false);
-    blocker.close();
+    let blocker!: ReturnType<FrontendBudget['reserve']>;
+    const choose = adapter.chooseRoot.bind(adapter);
+    vi.spyOn(adapter, 'chooseRoot').mockImplementation(async (request) => {
+      const result = await choose(request);
+      blocker = budget.reserve(budget.available);
+      return result;
+    });
+    try {
+      await expect(client.chooseRoot()).rejects.toThrow('RESOURCE_LIMIT');
+      expect(client.hasSession).toBe(true);
+      expect(store.getSnapshot().session).toBeNull();
+      expect(adapter.calls.startUsageScan ?? 0).toBe(0);
+      expect(adapter.calls.startListing ?? 0).toBe(0);
+      await client.close();
+      expect(adapter.calls.closeSession).toBe(1);
+      expect(client.hasSession).toBe(false);
+    } finally {
+      blocker?.close();
+    }
+  });
+  it('does not invoke root selection when dispatch admission fails', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter } = setup(new FixtureAdapter(), budget);
+    await client.connect();
+    const blocker = budget.reserve(budget.available);
+    try {
+      await expect(client.chooseRoot()).rejects.toThrow('RESOURCE_LIMIT');
+      expect(adapter.calls.chooseRoot ?? 0).toBe(0);
+      expect(client.hasSession).toBe(false);
+    } finally {
+      blocker.close();
+    }
   });
   it('retries the native advanced generation even when its failure view was rejected', async () => {
     const budget = new FrontendBudget();
     const { client, adapter, store } = setup(new FixtureAdapter(), budget);
     await client.chooseRoot();
-    const blocker = budget.reserve(budget.limit - budget.used);
+    let blocker!: ReturnType<FrontendBudget['reserve']>;
+    const refresh = adapter.refreshRoot.bind(adapter);
+    vi.spyOn(adapter, 'refreshRoot').mockImplementationOnce(async (request) => {
+      const result = await refresh(request);
+      blocker = budget.reserve(budget.available);
+      return result;
+    });
     adapter.failNextRefresh = true;
-    await expect(client.refresh()).rejects.toThrow('IO_ERROR');
-    expect(store.getSnapshot().session).toBeNull();
-    expect(store.getSnapshot().failedRoot).toBeNull();
-    expect(client.hasSession).toBe(true);
-    blocker.close();
+    try {
+      await expect(client.refresh()).rejects.toThrow('IO_ERROR');
+      expect(store.getSnapshot().session).toBeNull();
+      expect(store.getSnapshot().failedRoot).toBeNull();
+      expect(client.hasSession).toBe(true);
+    } finally {
+      blocker?.close();
+    }
     await client.refresh();
     expect(store.getSnapshot().session?.generation).toBe(3);
     expect(adapter.calls.startUsageScan).toBe(2);

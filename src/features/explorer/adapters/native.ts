@@ -36,9 +36,28 @@ function documentProof(): string {
     throw new Error('CLIENT_EXPIRED');
   return proof;
 }
+function replyCredit(operation: string): number {
+  switch (operation) {
+    case 'chooseRoot':
+    case 'refreshRoot':
+      return 256 * 1024;
+    case 'startListing':
+    case 'startUsageScan':
+    case 'cancelTask':
+      // Encoded UTF16 plus structural parse cost for32 bounded issue samples.
+      // The maximum-escape fixture requires570184bytes before decoding.
+      return 640 * 1024;
+    case 'closeSession':
+      return 32 * 1024;
+    default:
+      return 0;
+  }
+}
 /** Native wire translation only. Paths and native contexts never enter this API. */
 export class NativeAdapter implements FilesystemAdapter {
-  constructor(private readonly budget: FrontendBudget = frontendBudget) {}
+  constructor(private readonly budget: FrontendBudget = frontendBudget) {
+    budget.retainLifetime(this, 4096);
+  }
   private call<T>(
     command: string,
     make: () => unknown,
@@ -97,9 +116,9 @@ export class NativeAdapter implements FilesystemAdapter {
     let release: (() => void) | undefined;
     try {
       const document = documentProof();
-      const inbox = nativeInbox(this.budget);
+      const inbox = nativeInbox(this.budget, priority);
       const key = responseKey();
-      inbox.open(key, priority);
+      inbox.open(key, priority, replyCredit(operation));
       release = () => inbox.close(key);
       await this.call(
         'filesystem_request',

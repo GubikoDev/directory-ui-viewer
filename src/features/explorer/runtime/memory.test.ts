@@ -21,6 +21,25 @@ function harness(limit = 32 * 1024 * 1024) {
   };
 }
 describe('document-wide managed observation budget', () => {
+  it('transfers preadmitted parse credit without freeing it or crossing pools', () => {
+    const { budget, collect } = harness();
+    const json = '{"sessionId":"owned"}';
+    const size = budget.parseBytes(json);
+    const parent = budget.reserve(size + 100);
+    const child = parent.take(size);
+    expect(budget.used).toBe(size + 100);
+    expect(parent.bytes).toBe(100);
+    expect(() => parent.take(101)).toThrow('RESOURCE_LIMIT');
+    expect(() => new FrontendBudget().parse(json, false, child)).toThrow(
+      'INVALID_RESERVATION',
+    );
+    const result = budget.parse(json, false, child) as object;
+    parent.close();
+    child.close();
+    expect(budget.used).toBe(ownBytes(result));
+    collect(result);
+    expect(budget.used).toBe(0);
+  });
   it('keeps control reservations in the same counter and absolute ceiling', () => {
     const budget = new FrontendBudget(100, undefined, 20);
     const data = budget.reserve(80);

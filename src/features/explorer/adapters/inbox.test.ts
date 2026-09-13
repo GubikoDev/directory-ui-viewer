@@ -3,6 +3,18 @@ import { ReplyInbox } from './inbox';
 import { FrontendBudget, ownBytes } from '../runtime/memory';
 
 describe('native response inbox', () => {
+  it('protects admitted mutation bytes from later inbox saturation', () => {
+    const inbox = new ReplyInbox(32 * 1024, 3, new FrontendBudget());
+    inbox.open('mutation', false, 16 * 1024);
+    inbox.open('later', false, 16 * 1024);
+    expect(inbox.bytes).toBe(32 * 1024);
+    expect(() => inbox.open('extra')).toThrow('RESOURCE_LIMIT');
+    expect(inbox.receive('mutation', '{"sessionId":"owned"}')).toBe(true);
+    expect(inbox.parse('mutation')).toEqual({ sessionId: 'owned' });
+    inbox.close('mutation');
+    inbox.close('later');
+    expect(inbox.bytes).toBe(0);
+  });
   it('keeps control slot and byte headroom without evicting ordinary waiters', () => {
     const inbox = new ReplyInbox(2048, 3, new FrontendBudget(), 1, 1024);
     inbox.open('one');
@@ -19,7 +31,7 @@ describe('native response inbox', () => {
   it('shares admission across inboxes and retains parsed results after closing a slot', () => {
     let collect!: (bytes: number) => void;
     const records = new Map<object, number>();
-    const budget = new FrontendBudget(8192, (callback) => {
+    const budget = new FrontendBudget(64 * 1024, (callback) => {
       collect = callback;
       return {
         register(target, bytes) {
@@ -27,25 +39,26 @@ describe('native response inbox', () => {
         },
       };
     });
-    const first = new ReplyInbox(8192, 256, budget);
-    const second = new ReplyInbox(8192, 256, budget);
+    const first = new ReplyInbox(8192, 2, budget);
+    const second = new ReplyInbox(8192, 2, budget);
+    const baseline = budget.used;
     first.open('one');
     second.open('two');
     first.receive('one', '{"ok":true}');
     const result = first.parse('one') as object;
     first.close('one');
-    expect(budget.used).toBe(512 + ownBytes(result));
+    expect(budget.used).toBe(baseline + 512 + ownBytes(result));
     second.close('two');
-    expect(budget.used).toBe(ownBytes(result));
+    expect(budget.used).toBe(baseline + ownBytes(result));
     collect(records.get(result)!);
-    expect(budget.used).toBe(0);
-    const reservation = budget.reserve(8192 - 512);
+    expect(budget.used).toBe(baseline);
+    const reservation = budget.reserve(budget.available - 512);
     first.open('three');
     expect(() => second.open('four')).toThrow('RESOURCE_LIMIT');
     expect(second.pending).toBe(0);
     first.close('three');
     reservation.close();
-    expect(budget.used).toBe(0);
+    expect(budget.used).toBe(baseline);
   });
   it('retains encoded replies until the IPC completion ack is handled', () => {
     const inbox = new ReplyInbox();

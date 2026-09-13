@@ -87,6 +87,10 @@ export class FrontendReservation {
     if (bytes > this.remaining) throw new Error('RESOURCE_LIMIT');
     this.remaining -= bytes;
   }
+  take(bytes: number): FrontendReservation {
+    this.transfer(bytes);
+    return new FrontendReservation(this.budget, bytes, this.priority);
+  }
   close() {
     this.resize(0);
   }
@@ -244,7 +248,7 @@ export class FrontendBudget {
       memory.close();
     }
   }
-  parse(json: string, priority = false): unknown {
+  parseBytes(json: string): number {
     // Count structural tokens outside strings before JSON.parse. String UTF-16
     // storage plus per-node/property/slot headroom bounds native wire objects.
     if (json.length > 1_048_576) throw new Error('RESOURCE_LIMIT');
@@ -267,16 +271,25 @@ export class FrontendBudget {
       } else if (char === '}' || char === ']') depth--;
       else if (char === ':' || char === ',') bytes += 512;
     }
-    return this.allocate(
-      bytes,
-      () => {
-        const value: unknown = JSON.parse(json);
-        if (value === null || typeof value !== 'object')
-          throw new Error('INVALID_RESPONSE');
-        return value;
-      },
-      priority,
-    );
+    return bytes;
+  }
+  parse(
+    json: string,
+    priority = false,
+    reserved?: FrontendReservation,
+  ): unknown {
+    const bytes = this.parseBytes(json);
+    const memory = reserved ?? this.reserve(bytes, priority);
+    try {
+      if (!memory.belongsTo(this)) throw new Error('INVALID_RESERVATION');
+      if (memory.bytes < bytes) throw new Error('RESOURCE_LIMIT');
+      const value: unknown = JSON.parse(json);
+      if (value === null || typeof value !== 'object')
+        throw new Error('INVALID_RESPONSE');
+      return this.retain(value, memory);
+    } finally {
+      if (!reserved) memory.close();
+    }
   }
 }
 

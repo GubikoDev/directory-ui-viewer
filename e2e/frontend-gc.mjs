@@ -14,10 +14,13 @@ try {
   for (const file of [
     'runtime/memory',
     'runtime/task-map',
+    'runtime/issue-log',
     'model/types',
     'model/store',
     'adapters/fixture',
     'adapters/encoding',
+    'adapters/inbox',
+    'adapters/events',
   ]) {
     const source = fs.readFileSync(
       new URL(`../src/features/explorer/${file}.ts`, import.meta.url),
@@ -42,6 +45,9 @@ try {
   const { FrontendBudget } = await load('runtime/memory');
   const { ExplorerStore } = await load('model/store');
   const { TaskMap } = await load('runtime/task-map');
+  const { IssueLog } = await load('runtime/issue-log');
+  const { ReplyInbox } = await load('adapters/inbox');
+  const { WorkInbox } = await load('adapters/events');
   const { encodeWire } = await load('adapters/encoding');
   const { fixtureEntry } = await load('adapters/fixture');
   const budget = new FrontendBudget();
@@ -151,6 +157,77 @@ try {
       whileBufferRetained,
       afterBufferRelease: wireBudget.used,
       peak: wireBudget.peak,
+    }),
+  );
+  const replyBudget = new FrontendBudget();
+  let inbox = new ReplyInbox(undefined, 2, replyBudget);
+  const inboxBaseline = replyBudget.used;
+  inbox.open('owned', false, 256 * 1024);
+  const pressure = replyBudget.reserve(replyBudget.available);
+  assert(inbox.receive('owned', '{"session":{"sessionId":"owned"}}'));
+  let received = inbox.parse('owned');
+  inbox.close('owned');
+  pressure.close();
+  await settle();
+  const whileReplyRetained = replyBudget.used;
+  assert(whileReplyRetained > inboxBaseline);
+  assert.equal(received.session.sessionId, 'owned');
+  received = undefined;
+  await settle();
+  assert.equal(replyBudget.used, inboxBaseline);
+  inbox = undefined;
+  await settle();
+  assert.equal(replyBudget.used, 0);
+  console.log(
+    JSON.stringify({
+      engine: 'Node V8; not WKWebView',
+      inboxBaseline,
+      whileReplyRetained,
+      afterInboxRelease: replyBudget.used,
+    }),
+  );
+
+  const issueBudget = new FrontendBudget();
+  let issues = new IssueLog(issueBudget);
+  const issueBaseline = issueBudget.used;
+  issues.append(new Error('IO_ERROR'));
+  let issueSnapshot = issues.snapshot;
+  issues.clear();
+  await settle();
+  const whileIssueRetained = issueBudget.used;
+  assert(whileIssueRetained > issueBaseline);
+  assert.equal(issueSnapshot[0].message, 'IO_ERROR');
+  issueSnapshot = undefined;
+  await settle();
+  assert.equal(issueBudget.used, issueBaseline);
+  issues = undefined;
+  await settle();
+  assert.equal(issueBudget.used, 0);
+  console.log(
+    JSON.stringify({
+      engine: 'Node V8; not WKWebView',
+      issueBaseline,
+      whileIssueRetained,
+      afterIssueLogRelease: issueBudget.used,
+    }),
+  );
+
+  const eventBudget = new FrontendBudget();
+  let events = new WorkInbox(eventBudget);
+  let unsubscribe = events.subscribe(() => {});
+  unsubscribe();
+  events = undefined;
+  await settle();
+  const whileStopRetained = eventBudget.used;
+  assert.equal(whileStopRetained, 3072);
+  unsubscribe = undefined;
+  await settle();
+  assert.equal(eventBudget.used, 0);
+  console.log(
+    JSON.stringify({
+      engine: 'Node V8; not WKWebView',
+      whileStopRetained,
+      afterStopRelease: eventBudget.used,
     }),
   );
 } finally {

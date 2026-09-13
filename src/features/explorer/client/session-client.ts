@@ -1,5 +1,6 @@
 import { ExplorerStore } from '../model/store';
 import { TaskMap } from '../runtime/task-map';
+import { IssueLog, type ClientIssue } from '../runtime/issue-log';
 import {
   sameScope,
   terminal,
@@ -49,30 +50,29 @@ export class SessionClient {
   private lastPage: TaskMap<number>;
   private pageDemand: TaskMap<boolean>;
   private lastEvent: TaskMap<number>;
-  private deferredErrors: Error[] = [];
+  private readonly errorLog: IssueLog;
   constructor(
     readonly adapter: FilesystemAdapter,
     readonly store = new ExplorerStore(),
     private readonly nonce: string = crypto.randomUUID(),
     private readonly now = () => Date.now(),
   ) {
+    store.budget.retainLifetime(this, 8192 + nonce.length * 2);
+    this.errorLog = new IssueLog(store.budget);
     this.recovery = new TaskMap(store.budget);
     this.pageReads = new TaskMap(store.budget);
     this.lastPage = new TaskMap(store.budget);
     this.pageDemand = new TaskMap(store.budget);
     this.lastEvent = new TaskMap(store.budget);
   }
-  get errors(): readonly Error[] {
-    return this.deferredErrors;
+  get errors(): readonly ClientIssue[] {
+    return this.errorLog.snapshot;
   }
   get hasSession(): boolean {
     return this.rootScope() !== null;
   }
   private report(error: unknown) {
-    this.deferredErrors = [
-      ...this.deferredErrors.slice(-31),
-      error instanceof Error ? error : new Error('INTERNAL'),
-    ];
+    this.errorLog.append(error);
   }
   connect(): Promise<void> {
     if (this.connection) return this.connection;
@@ -146,6 +146,9 @@ export class SessionClient {
     // Bound dispatch closures even if callers enqueue before the next microtask.
     if (this.queuedControls >= (priority ? 64 : 62))
       return Promise.reject(new AdapterError('RESOURCE_LIMIT'));
+    // Admit both Promise owners before enqueueing an effect. Their request
+    // wrapper/callback metadata remains charged until the actual owners' GC.
+    const memory = this.store.budget.reserve(12 * 1024, priority);
     this.queuedControls++;
     const lifecycle = this.lifecycle;
     const dispatch = () => {
@@ -154,13 +157,20 @@ export class SessionClient {
         throw new AdapterError('CLIENT_EXPIRED');
       return fn();
     };
-    const next = this.controlTail.then(dispatch);
-    // The tail must not retain the previous result or its pending response.
-    this.controlTail = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+    try {
+      const next = this.controlTail.then(dispatch);
+      this.store.budget.retainLifetimeFrom(next, memory, 8 * 1024);
+      // The tail must not retain the previous result or its pending response.
+      const tail = next.then(
+        () => undefined,
+        () => undefined,
+      );
+      this.store.budget.retainLifetimeFrom(tail, memory, 4 * 1024);
+      this.controlTail = tail;
+      return next;
+    } finally {
+      memory.close();
+    }
   }
   private register(task: WorkRecord) {
     this.store.applyTask(task);
