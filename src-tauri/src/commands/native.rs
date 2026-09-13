@@ -30,7 +30,6 @@ use tauri::{
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{mpsc, oneshot};
 
-const PROOF_KEY: &str = "__DIRECTORY_DOCUMENT_PROOF__";
 const INIT: &str = r#"(() => {
   if (window !== window.top) return;
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -202,23 +201,24 @@ impl Bridge {
         if context.document == 0 {
             return Err(issue("CLIENT_EXPIRED"));
         }
-        let (tx, rx) = oneshot::channel();
-        let sender = Mutex::new(Some(tx));
-        window
-            .eval_with_callback(format!("window.{PROOF_KEY}"), move |value| {
-                if let Some(tx) = sender.lock().unwrap().take() {
-                    let _ = tx.send(value);
-                }
+        let probe =
+            super::delivery::Delivery::proof_check(proof, &self.budgets.work).map_err(|error| {
+                issue(match error {
+                    super::delivery::DeliveryError::ResourceLimit => "RESOURCE_LIMIT",
+                    _ => "CLIENT_EXPIRED",
+                })
+            })?;
+        let receipt = probe
+            .submit(|script, callback| {
+                window
+                    .eval_with_callback(script, callback)
+                    .map_err(|_| super::delivery::DeliveryError::Disconnected)
             })
             .map_err(|_| issue("CLIENT_EXPIRED"))?;
-        let value = tokio::time::timeout(Duration::from_secs(10), rx)
+        tokio::time::timeout(Duration::from_secs(10), receipt.wait())
             .await
             .map_err(|_| issue("CLIENT_EXPIRED"))?
             .map_err(|_| issue("CLIENT_EXPIRED"))?;
-        let actual: String = serde_json::from_str(&value).map_err(|_| issue("CLIENT_EXPIRED"))?;
-        if actual != proof {
-            return Err(issue("CLIENT_EXPIRED"));
-        }
         self.current(&context)?;
         Ok(context)
     }

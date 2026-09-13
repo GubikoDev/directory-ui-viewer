@@ -26,6 +26,22 @@ pub fn valid_key(key: &str) -> bool {
     key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit())
 }
 impl Delivery {
+    /// Main-frame authentication returns only a boolean. The page's property
+    /// value is never serialized into an unbounded native callback response.
+    pub fn proof_check(proof: &str, budget: &ByteBudget) -> Result<Self, DeliveryError> {
+        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(DeliveryError::InvalidArgument);
+        }
+        // Fixed script, boolean result, oneshot/callback and native copies.
+        // Keep this charge in both callback and waiter, as with payload delivery.
+        let memory = budget
+            .reserve(4096)
+            .map_err(|_| DeliveryError::ResourceLimit)?;
+        Ok(Self {
+            script: format!("window.__DIRECTORY_DOCUMENT_PROOF__===\"{proof}\""),
+            memory: Arc::new(memory),
+        })
+    }
     pub fn prepare(
         proof: &str,
         key: &str,
@@ -92,7 +108,8 @@ impl Delivery {
     }
 }
 impl Receipt {
-    /// Confirms the client slot settled. The slot can contain a client-local
+    /// Requires the evaluated expression to return the boolean true.
+    /// For payload delivery this confirms the client slot settled; it can contain a client-local
     /// resource error; this acknowledgement never denotes operation success.
     pub async fn wait(self) -> Result<(), DeliveryError> {
         if self
@@ -110,6 +127,57 @@ impl Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn proof_timeout_keeps_native_callback_charged_and_returns_only_boolean() {
+        let budget = ByteBudget::new(4096);
+        let proof = "a".repeat(64);
+        let mut queued = None;
+        let receipt = Delivery::proof_check(&proof, &budget)
+            .unwrap()
+            .submit(|script, callback| {
+                assert_eq!(
+                    script,
+                    format!("window.__DIRECTORY_DOCUMENT_PROOF__===\"{proof}\"")
+                );
+                queued = Some((script, callback));
+                Ok(())
+            })
+            .unwrap();
+        tauri::async_runtime::block_on(async {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(1), receipt.wait())
+                    .await
+                    .is_err()
+            );
+        });
+        assert_eq!(budget.used(), 4096);
+        assert!(matches!(
+            Delivery::proof_check(&proof, &budget),
+            Err(DeliveryError::ResourceLimit)
+        ));
+        let (script, callback) = queued.take().unwrap();
+        callback("true".into());
+        assert_eq!(budget.used(), 4096);
+        drop(script);
+        drop(callback);
+        assert_eq!(budget.used(), 0);
+        for value in ["false", "null", "\"true\"", ""] {
+            let receipt = Delivery::proof_check(&proof, &budget)
+                .unwrap()
+                .submit(|_, callback| {
+                    callback(value.into());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                tauri::async_runtime::block_on(receipt.wait()),
+                Err(DeliveryError::Disconnected)
+            );
+            assert_eq!(budget.used(), 0);
+        }
+        assert!(Delivery::proof_check("\";injected", &budget).is_err());
+        assert_eq!(budget.used(), 0);
+    }
     fn make(budget: &ByteBudget) -> Delivery {
         Delivery::prepare(
             &"a".repeat(64),
