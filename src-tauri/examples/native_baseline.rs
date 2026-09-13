@@ -182,9 +182,15 @@ mod macos {
         resident_max_sampled: u64,
         os_fd_max_sampled: usize,
         managed_fd_max_sampled: usize,
+        work_reserved_high_water: usize,
+        hardlink_reserved_high_water: usize,
+        managed_fd_high_water: usize,
     }
     impl Samples {
         fn observe(&mut self, resources: &RuntimeResources) {
+            self.work_reserved_high_water = resources.budgets.work.peak();
+            self.hardlink_reserved_high_water = resources.budgets.hardlinks.peak();
+            self.managed_fd_high_water = resources.scheduler.handles().peak();
             self.managed_peak = self.managed_peak.max(resources.budgets.used());
             self.work_peak = self.work_peak.max(resources.budgets.work.used());
             self.hardlink_peak = self.hardlink_peak.max(resources.budgets.hardlinks.used());
@@ -306,7 +312,7 @@ mod macos {
                 first_page_ms = Some(started.elapsed().as_secs_f64() * 1000.);
             }
             first_entries += page.entries.len();
-            cursor = page.next_cursor;
+            cursor = page.next_cursor.clone();
             if page.work.phase.terminal() && fixture.eligible && first_entries < 200 {
                 panic!(
                     "insufficient eligible entries: {first_entries}, {:?}",
@@ -329,8 +335,8 @@ mod macos {
             .unwrap();
         let result = runtime
             .read_usage(&context(), epoch, &current, &[root.root.entry_id])
-            .unwrap()
-            .remove(0);
+            .unwrap()[0]
+            .clone();
         if fixture.partial {
             assert!(
                 matches!(&result.logical, Measure::Partial { reasons, .. } if reasons.contains(&Reason::ResourceLimit))

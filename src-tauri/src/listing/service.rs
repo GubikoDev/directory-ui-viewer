@@ -1,6 +1,7 @@
 //! Demand-driven listing integration over an internal, typed source.
 //! No Tauri commands or production filesystem implementation are registered here.
 use super::cache::{CacheError, ListingCache, ListingHandle};
+use crate::runtime::memory::{ByteBudget, Charged};
 use crate::{
     domain::{
         controller::{Cancellation, Scope},
@@ -317,10 +318,29 @@ impl ListingService {
         limit: usize,
         now: u64,
     ) -> Result<ListingPage, CacheError> {
+        self.page_operation(id, |cache| cache.page(id, cursor, limit, now))
+    }
+    pub fn charged_page(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        now: u64,
+        budget: &ByteBudget,
+    ) -> Result<Charged<ListingPage>, CacheError> {
+        self.page_operation(id, |cache| {
+            cache.charged_page(id, cursor, limit, now, budget)
+        })
+    }
+    fn page_operation<T>(
+        &self,
+        id: &str,
+        read: impl FnOnce(&mut ListingCache) -> Result<T, CacheError>,
+    ) -> Result<T, CacheError> {
         self.synchronize(id);
         let (result, retired, demand) = {
             let mut state = self.state.lock().unwrap();
-            let result = state.cache.page(id, cursor, limit, now);
+            let result = read(&mut state.cache);
             let demand = result.is_ok() && state.cache.needs_collection(id) == Ok(true);
             (result, state.retired(), demand)
         };

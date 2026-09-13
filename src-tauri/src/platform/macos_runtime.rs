@@ -23,7 +23,7 @@ use crate::{
     runtime::{
         clock::Clock,
         events::EventSink,
-        memory::{ManagedBudgets, Reservation},
+        memory::{Charged, ManagedBudgets, Reservation},
     },
     scan::{
         service::{CancelStatus, UsageError, UsageService},
@@ -674,14 +674,15 @@ impl NativeRuntime {
         task: &str,
         cursor: Option<&str>,
         limit: usize,
-    ) -> Result<ListingPage, FsIssue> {
+    ) -> Result<Charged<ListingPage>, FsIssue> {
         self.with_generation(context, epoch, scope, |g| {
             g.listing
-                .page(
+                .charged_page(
                     task,
                     cursor,
                     limit,
                     self.resources.clock.sample().monotonic_ms,
+                    &self.resources.budgets.work,
                 )
                 .map_err(cache_error)
         })
@@ -710,9 +711,9 @@ impl NativeRuntime {
         epoch: u64,
         scope: &Scope,
         ids: &[String],
-    ) -> Result<Vec<DirectoryUsage>, FsIssue> {
+    ) -> Result<Charged<Vec<DirectoryUsage>>, FsIssue> {
         self.with_generation(context, epoch, scope, |g| {
-            g.usage.read_usage(ids).map_err(usage_error)
+            g.usage.charged_usage(ids).map_err(usage_error)
         })
     }
     pub fn read_task(

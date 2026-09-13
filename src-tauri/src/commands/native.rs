@@ -370,6 +370,15 @@ fn execute(
     memory: Reservation,
 ) {
     let id = request.request_id;
+    // Retain bounded control/root/WorkRecord temporaries through serialization.
+    // Variable listing/usage clones carry an additional Charged owner themselves.
+    let response_memory = match bridge.budgets.work.reserve(64 * 1024) {
+        Ok(memory) => memory,
+        Err(_) => {
+            let _ = completion.complete(result::<()>(id, Err(issue("RESOURCE_LIMIT"))));
+            return;
+        }
+    };
     let scope = request.body.scope();
     let runtime = bridge.runtime.clone();
     // Each branch serializes its typed response directly into the charged cache.
@@ -378,6 +387,7 @@ fn execute(
             let ticket = runtime.begin_selection(&context, epoch);
             tauri::async_runtime::spawn(async move {
                 let _memory = memory;
+                let _response_memory = response_memory;
                 let selected = async {
                     let ticket = ticket?;
                     let (tx, rx) = oneshot::channel();
@@ -418,6 +428,7 @@ fn execute(
             let ticket = runtime.begin_refresh(&context, epoch, &scope.unwrap());
             tauri::async_runtime::spawn(async move {
                 let _memory = memory;
+                let _response_memory = response_memory;
                 let response = match ticket {
                     Ok(ticket) => match runtime.refresh_prepared(ticket).await {
                         Ok(data) => Response::Ok {

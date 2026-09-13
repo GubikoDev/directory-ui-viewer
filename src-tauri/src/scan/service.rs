@@ -17,7 +17,7 @@ use crate::{
     runtime::{
         clock::Clock,
         events::{EventSink, TaskEvents},
-        memory::{ManagedBudgets, Reservation},
+        memory::{Charged, ManagedBudgets, Reservation},
     },
     scheduler::{HandleBudget, Job, JobStep, Lane, Scheduler, Status, Ticket, Wait},
 };
@@ -373,6 +373,24 @@ impl UsageService {
             }
         }
         Ok(work.clone())
+    }
+    pub fn charged_usage(
+        &self,
+        ids: &[String],
+    ) -> Result<Charged<Vec<DirectoryUsage>>, UsageError> {
+        if ids.len() > 1000 {
+            return Err(UsageError::InvalidArgument);
+        }
+        // Index summaries serialize to at most 1024 bytes. Charge twice that
+        // storage plus the value/vector layout before cloning any summary.
+        let bytes = 4096 + ids.len() * (2048 + 2 * std::mem::size_of::<DirectoryUsage>() + 128);
+        let memory = self
+            .budgets
+            .work
+            .reserve(bytes)
+            .map_err(|_| UsageError::ResourceLimit)?;
+        self.read_usage(ids)
+            .map(|values| Charged::new(values, memory))
     }
     pub fn read_usage(&self, ids: &[String]) -> Result<Vec<DirectoryUsage>, UsageError> {
         if ids.len() > 1000 {

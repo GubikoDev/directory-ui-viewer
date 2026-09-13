@@ -3,7 +3,7 @@
 use crate::domain::model::{
     Category, Coverage, Entry, FsIssue, IssueScope, ListingPage, Phase, WorkRecord,
 };
-use crate::runtime::memory::{ByteBudget, Reservation};
+use crate::runtime::memory::{ByteBudget, Charged, Reservation};
 use crate::runtime::serialization::json_bytes;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -270,6 +270,49 @@ impl ListingCache {
         snapshot.last_used = now;
         Ok(snapshot.work.clone())
     }
+    pub fn charged_page(
+        &mut self,
+        task_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        now: u64,
+        budget: &ByteBudget,
+    ) -> Result<Charged<ListingPage>, CacheError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(CacheError::InvalidArgument);
+        }
+        self.expire(now);
+        let snapshot = self.snapshots.get(task_id).ok_or(if cursor.is_some() {
+            CacheError::CursorExpired
+        } else {
+            CacheError::TaskExpired
+        })?;
+        if snapshot
+            .page_limit
+            .is_some_and(|original| original != limit)
+        {
+            return Err(CacheError::InvalidArgument);
+        }
+        let offset = match cursor {
+            None => 0,
+            Some(cursor) => match snapshot.cursors.get(cursor) {
+                Some((offset, original_limit)) if *original_limit == limit => *offset,
+                _ => return Err(CacheError::CursorExpired),
+            },
+        };
+        // Two bounded Issues copies, work/cursor metadata and the page vector.
+        // Estimate only potentially returned entries while the same cache lock
+        // protects both admission and cloning. Published short pages overcount.
+        let mut bytes = 64_usize * 1024;
+        for entry in &snapshot.entries[offset..(offset + limit).min(snapshot.entries.len())] {
+            bytes = bytes.saturating_add(estimate(entry));
+        }
+        let memory = budget
+            .reserve(bytes)
+            .map_err(|_| CacheError::ResourceLimit)?;
+        self.page(task_id, cursor, limit, now)
+            .map(|page| Charged::new(page, memory))
+    }
     pub fn page(
         &mut self,
         task_id: &str,
@@ -461,6 +504,37 @@ impl ListingCache {
 mod tests {
     use super::*;
     use crate::domain::model::{Field, FollowPolicy, Issues, Kind, Operation};
+    #[test]
+    fn outgoing_page_reserves_before_publication_and_outlives_its_cache() {
+        let mut cache = ListingCache::new(100_000, 100, 1_048_576);
+        cache.start(work("t"), Category::Directories, 0).unwrap();
+        cache.append("t", entry("one")).unwrap();
+        let empty = ByteBudget::new(0);
+        assert!(matches!(
+            cache.charged_page("t", None, 2, 0, &empty),
+            Err(CacheError::ResourceLimit)
+        ));
+        assert_eq!(cache.snapshots["t"].page_limit, None);
+        assert!(cache.snapshots["t"].pages.is_empty());
+        cache.append("t", entry("two")).unwrap();
+        let amount = 64 * 1024 + estimate(&entry("one")) + estimate(&entry("two"));
+        let work = ByteBudget::new(amount);
+        let page = cache.charged_page("t", None, 3, 0, &work).unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(work.used(), amount);
+        assert!(matches!(
+            cache.charged_page("t", None, 3, 0, &work),
+            Err(CacheError::ResourceLimit)
+        ));
+        cache.clear();
+        assert_eq!(cache.managed_bytes(), 0);
+        assert_eq!(work.used(), amount);
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["entries"][0]["displayName"], "one");
+        assert!(json.get("value").is_none());
+        drop(page);
+        assert_eq!(work.used(), 0);
+    }
     fn work(id: &str) -> WorkRecord {
         WorkRecord {
             session_id: "s".into(),

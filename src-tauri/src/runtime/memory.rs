@@ -16,6 +16,36 @@ pub struct Reservation {
     budget: ByteBudget,
     bytes: usize,
 }
+/// A read result keeps its precharged allocation alive through serialization.
+/// No mutable dereference or consuming extraction can detach the value from it.
+pub struct Charged<T> {
+    value: T,
+    _memory: Reservation,
+}
+impl<T> Charged<T> {
+    pub fn new(value: T, memory: Reservation) -> Self {
+        Self {
+            value,
+            _memory: memory,
+        }
+    }
+}
+impl<T> std::ops::Deref for Charged<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+impl<T: std::fmt::Debug> std::fmt::Debug for Charged<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+impl<T: serde::Serialize> serde::Serialize for Charged<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
 impl ByteBudget {
     pub fn same_pool(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -113,6 +143,28 @@ impl ManagedBudgets {
 mod tests {
     use super::*;
     use std::{sync::Barrier, thread};
+    #[test]
+    fn charged_result_keeps_its_cost_through_serialization_and_value_destruction() {
+        struct Value(ByteBudget);
+        impl serde::Serialize for Value {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                assert_eq!(self.0.used(), 1024);
+                serializer.serialize_str("live")
+            }
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                assert_eq!(self.0.used(), 1024);
+            }
+        }
+        let budget = ByteBudget::new(1024);
+        let memory = budget.reserve(1024).unwrap();
+        let reply = Charged::new(Value(budget.clone()), memory);
+        assert_eq!(serde_json::to_string(&reply).unwrap(), "\"live\"");
+        assert!(budget.reserve(1).is_err());
+        drop(reply);
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn reservations_keep_their_old_size_on_failure_and_release_exactly_once() {
         let budget = ByteBudget::new(10);

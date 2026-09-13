@@ -87,8 +87,8 @@ fn collect(runtime: &NativeRuntime, epoch: u64, scope: &Scope, task: &str) -> Ve
         let page = runtime
             .read_listing(&context(1), epoch, scope, task, cursor.as_deref(), 200)
             .unwrap();
-        rows.extend(page.entries);
-        cursor = page.next_cursor;
+        rows.extend(page.entries.iter().cloned());
+        cursor = page.next_cursor.clone();
         if cursor.is_none() {
             assert_eq!(page.coverage, Coverage::Complete);
             return rows;
@@ -136,6 +136,7 @@ fn real_session_flow_refreshes_same_object_expires_ids_and_closes_all_resources(
         .read_usage(&context(1), epoch, &old, &[rows[0].entry_id.clone()])
         .unwrap();
     assert!(matches!(summary[0].logical, Measure::Complete { .. }));
+    drop(summary);
     fs::rename(f.p("root"), f.p("original")).unwrap();
     fs::create_dir(f.p("root")).unwrap();
     fs::write(f.p("root/replacement-secret"), b"wrong").unwrap();
@@ -429,6 +430,8 @@ fn parked_listing_cancellation_and_document_close_release_resources() {
         "CLIENT_EXPIRED"
     );
     until(|| resources.scheduler.handles().open() == 0);
+    assert!(resources.budgets.work.used() > 32 * 1024);
+    drop(page);
     assert_eq!(resources.budgets.work.used(), 32 * 1024);
     drop(runtime);
     until(|| resources.budgets.used() == 0);
@@ -842,8 +845,8 @@ fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
         });
         let usage = runtime
             .read_usage(&context(1), epoch, &current, &[root.root.entry_id])
-            .unwrap()
-            .remove(0);
+            .unwrap()[0]
+            .clone();
         if limit == 0 {
             assert!(
                 matches!(usage.logical, Measure::Partial { observed_bytes, reasons } if observed_bytes == own.into() && reasons.contains(&Reason::ResourceLimit))
