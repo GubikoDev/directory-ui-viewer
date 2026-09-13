@@ -549,3 +549,256 @@ fn repeated_close_of_an_older_session_never_closes_a_new_active_root() {
     );
     assert_eq!(resources.scheduler.handles().open(), 0);
 }
+
+#[test]
+fn async_selection_and_refresh_execute_metadata_on_the_same_fixed_foreground_worker() {
+    use directory_ui_viewer_lib::runtime::clock::{Clock, TimeSample};
+    use std::sync::Mutex;
+    struct ThreadClock {
+        inner: SystemClock,
+        calls: Mutex<Vec<String>>,
+    }
+    impl Clock for ThreadClock {
+        fn sample(&self) -> TimeSample {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().unwrap_or("unnamed").into());
+            self.inner.sample()
+        }
+    }
+    let f = Fixture::new();
+    let (_, mut resources) = setup();
+    let clock = Arc::new(ThreadClock {
+        inner: SystemClock::default(),
+        calls: Mutex::new(vec![]),
+    });
+    resources.clock = clock.clone();
+    let runtime = Arc::new(NativeRuntime::new(context(1), resources.clone()).unwrap());
+    let epoch = runtime.connect(&context(1), "one").unwrap();
+    let ticket = runtime.begin_selection(&context(1), epoch).unwrap();
+    let root =
+        tauri::async_runtime::block_on(runtime.clone().select_path(ticket, Some(f.p("root"))))
+            .unwrap()
+            .unwrap();
+    fs::rename(f.p("root"), f.p("original")).unwrap();
+    fs::create_dir(f.p("root")).unwrap();
+    fs::write(f.p("root/replacement"), b"not selected").unwrap();
+    let refreshed =
+        tauri::async_runtime::block_on(runtime.clone().refresh(context(1), epoch, scope(&root)))
+            .unwrap();
+    assert_eq!(refreshed.session.generation, 2);
+    let calls = clock.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|name| name == "directory-foreground"));
+    assert_eq!(resources.scheduler.handles().peak(), 1);
+    runtime
+        .close_session(&context(1), epoch, &root.session.session_id)
+        .unwrap();
+    drop(runtime);
+    until(|| resources.budgets.used() == 0);
+}
+
+struct BlockForeground {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+impl directory_ui_viewer_lib::scheduler::Job for BlockForeground {
+    fn step(
+        &mut self,
+        _: &directory_ui_viewer_lib::domain::controller::Cancellation,
+        _: &directory_ui_viewer_lib::scheduler::HandleBudget,
+    ) -> directory_ui_viewer_lib::scheduler::JobStep {
+        self.entered.send(()).unwrap();
+        self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        directory_ui_viewer_lib::scheduler::JobStep::Completed
+    }
+}
+fn block_foreground(resources: &RuntimeResources) -> std::sync::mpsc::SyncSender<()> {
+    use directory_ui_viewer_lib::scheduler::Lane;
+    let (entered, ready) = std::sync::mpsc::sync_channel(1);
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    resources
+        .scheduler
+        .submit(
+            "fixture-blocker".into(),
+            Scope {
+                session_id: "fixture-blocker".into(),
+                generation: 1,
+            },
+            Lane::Foreground,
+            BlockForeground {
+                entered,
+                release: wait,
+            },
+        )
+        .unwrap();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    release
+}
+#[test]
+fn closing_queued_preparation_returns_without_waiting_and_does_not_cancel_new_work() {
+    let f = Fixture::new();
+    let (runtime, resources) = setup();
+    let runtime = Arc::new(runtime);
+    let epoch = runtime.connect(&context(1), "one").unwrap();
+    let root = choose(&runtime, epoch, &f.p("root"));
+    let release = block_foreground(&resources);
+    let ticket = runtime.begin_selection(&context(1), epoch).unwrap();
+    // The missing path must never be touched by this queued, invalidated request.
+    let queued =
+        tauri::async_runtime::spawn(runtime.clone().select_path(ticket, Some(f.p("missing"))));
+    until(|| resources.scheduler.counts().1 == 1);
+    let start = Instant::now();
+    runtime
+        .close_session(&context(1), epoch, &root.session.session_id)
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_millis(100));
+    assert_eq!(
+        tauri::async_runtime::block_on(queued)
+            .unwrap()
+            .unwrap_err()
+            .code,
+        "CLIENT_EXPIRED"
+    );
+    assert_eq!(resources.scheduler.handles().open(), 0);
+    let next = runtime.begin_selection(&context(1), epoch).unwrap();
+    let new_work =
+        tauri::async_runtime::spawn(runtime.clone().select_path(next, Some(f.p("root"))));
+    until(|| resources.scheduler.counts().1 == 1);
+    assert_eq!(
+        resources.scheduler.handles().open(),
+        0,
+        "no replacement worker bypasses the blocked foreground lane"
+    );
+    release.send(()).unwrap();
+    assert!(
+        tauri::async_runtime::block_on(new_work)
+            .unwrap()
+            .unwrap()
+            .is_some()
+    );
+    drop(runtime);
+    until(|| resources.budgets.used() == 0);
+}
+#[test]
+fn dropping_async_receiver_cancels_queued_preparation_and_releases_picker_slot() {
+    let f = Fixture::new();
+    let (runtime, resources) = setup();
+    let runtime = Arc::new(runtime);
+    let epoch = runtime.connect(&context(1), "one").unwrap();
+    let release = block_foreground(&resources);
+    let ticket = runtime.begin_selection(&context(1), epoch).unwrap();
+    let queued =
+        tauri::async_runtime::spawn(runtime.clone().select_path(ticket, Some(f.p("root"))));
+    until(|| resources.scheduler.counts().1 == 1);
+    queued.abort();
+    assert!(tauri::async_runtime::block_on(queued).is_err());
+    until(|| resources.scheduler.counts().1 == 0);
+    let next = runtime.begin_selection(&context(1), epoch).unwrap();
+    runtime.finish_selection(next, Ok(None)).unwrap();
+    assert_eq!(resources.scheduler.handles().open(), 0);
+    assert_eq!(resources.budgets.work.used(), 32 * 1024);
+    release.send(()).unwrap();
+}
+#[test]
+fn queue_admission_failure_preserves_choice_and_returns_advanced_refresh_scope() {
+    let f = Fixture::new();
+    let (_, mut resources) = setup();
+    resources.scheduler = Arc::new(Scheduler::new(0, 64, 320));
+    let runtime = Arc::new(NativeRuntime::new(context(1), resources.clone()).unwrap());
+    let epoch = runtime.connect(&context(1), "one").unwrap();
+    let root = choose(&runtime, epoch, &f.p("root"));
+    let ticket = runtime.begin_selection(&context(1), epoch).unwrap();
+    assert_eq!(
+        tauri::async_runtime::block_on(runtime.clone().select_path(ticket, Some(f.p("missing"))))
+            .unwrap_err()
+            .code,
+        "RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        runtime
+            .root_data(&context(1), epoch, &scope(&root))
+            .unwrap(),
+        root
+    );
+    let failure =
+        tauri::async_runtime::block_on(runtime.clone().refresh(context(1), epoch, scope(&root)))
+            .unwrap_err();
+    assert_eq!(failure.error.code, "RESOURCE_LIMIT");
+    assert_eq!(failure.current_scope.unwrap().generation, 2);
+    assert_eq!(resources.scheduler.handles().peak(), 1);
+    let next = runtime.begin_selection(&context(1), epoch).unwrap();
+    runtime.finish_selection(next, Ok(None)).unwrap();
+}
+
+#[test]
+fn abandoning_active_preparation_keeps_old_root_and_discards_late_candidate() {
+    use directory_ui_viewer_lib::runtime::clock::{Clock, TimeSample};
+    use std::sync::{Mutex, atomic::AtomicBool};
+    struct PausedClock {
+        inner: SystemClock,
+        paused: AtomicBool,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Clock for PausedClock {
+        fn sample(&self) -> TimeSample {
+            if self.paused.load(Ordering::Acquire) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            self.inner.sample()
+        }
+    }
+    let f = Fixture::new();
+    fs::create_dir(f.p("candidate")).unwrap();
+    let (_, mut resources) = setup();
+    let (entered, ready) = std::sync::mpsc::sync_channel(1);
+    let (release, waiting) = std::sync::mpsc::sync_channel(1);
+    let clock = Arc::new(PausedClock {
+        inner: SystemClock::default(),
+        paused: AtomicBool::new(false),
+        entered,
+        release: Mutex::new(waiting),
+    });
+    resources.clock = clock.clone();
+    let runtime = Arc::new(NativeRuntime::new(context(1), resources.clone()).unwrap());
+    let epoch = runtime.connect(&context(1), "one").unwrap();
+    let root = choose(&runtime, epoch, &f.p("root"));
+    clock.paused.store(true, Ordering::Release);
+    let ticket = runtime.begin_selection(&context(1), epoch).unwrap();
+    let pending =
+        tauri::async_runtime::spawn(runtime.clone().select_path(ticket, Some(f.p("candidate"))));
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        resources.scheduler.handles().open(),
+        2,
+        "candidate owns a native handle while metadata observation drains"
+    );
+    pending.abort();
+    assert!(tauri::async_runtime::block_on(pending).is_err());
+    assert_eq!(
+        runtime
+            .root_data(&context(1), epoch, &scope(&root))
+            .unwrap(),
+        root
+    );
+    clock.paused.store(false, Ordering::Release);
+    release.send(()).unwrap();
+    until(|| resources.scheduler.handles().open() == 1);
+    assert_eq!(
+        runtime
+            .root_data(&context(1), epoch, &scope(&root))
+            .unwrap(),
+        root
+    );
+    let next = runtime.begin_selection(&context(1), epoch).unwrap();
+    runtime.finish_selection(next, Ok(None)).unwrap();
+    drop(runtime);
+    until(|| resources.budgets.used() == 0);
+}

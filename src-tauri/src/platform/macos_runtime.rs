@@ -1,6 +1,7 @@
 //! Native session ownership. Paths enter only through a trusted picker callback;
 //! prepare_* run on a fixed worker, finish_* revalidate before publication.
 //! This module does not deserialize native document/window contexts from IPC.
+mod prepare;
 use super::{
     macos::{ApprovedRoot, fs_issue},
     macos_listing::{NativeListingSource, metadata_entry},
@@ -40,6 +41,7 @@ use std::{
 };
 const TTL_MS: u64 = 300_000;
 const MESSAGE_BYTES: usize = 1_048_576;
+static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 fn issue(code: &str) -> FsIssue {
     FsIssue {
@@ -223,6 +225,7 @@ impl Drop for Generation {
     }
 }
 struct State {
+    root_work_scope: Scope,
     controller: SessionController,
     grant: Option<Arc<RootGrant>>,
     current: Option<Arc<Generation>>,
@@ -273,6 +276,13 @@ impl NativeRuntime {
             .map_err(|_| issue("RESOURCE_LIMIT"))?;
         Ok(Self {
             state: Mutex::new(State {
+                root_work_scope: Scope {
+                    session_id: format!(
+                        "native-preparation-{}",
+                        NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+                    ),
+                    generation: 1,
+                },
                 controller: SessionController::new(context),
                 grant: None,
                 current: None,
@@ -301,9 +311,14 @@ impl NativeRuntime {
             }
             s.refresh_pending = false;
             s.failure = None;
-            (s.current.take(), s.grant.take())
+            (
+                s.current.take(),
+                s.grant.take(),
+                Self::supersede_root_work(&mut s),
+            )
         };
-        Self::retire(retired, true);
+        self.resources.scheduler.cancel_scope(&retired.2);
+        Self::retire((retired.0, retired.1), true);
     }
     pub fn begin_selection(
         &self,
@@ -429,11 +444,13 @@ impl NativeRuntime {
         let retired = (
             s.current.replace(next.clone()),
             s.grant.replace(next.grant.clone()),
+            Self::supersede_root_work(&mut s),
         );
         s.refresh_pending = false;
         s.failure = None;
         drop(s);
-        Self::retire(retired, true);
+        self.resources.scheduler.cancel_scope(&retired.2);
+        Self::retire((retired.0, retired.1), true);
         Ok(Some(data))
     }
     pub fn begin_refresh(
@@ -442,7 +459,7 @@ impl NativeRuntime {
         epoch: u64,
         expected: &Scope,
     ) -> Result<RefreshTicket, FsIssue> {
-        let (ticket, old) = {
+        let (ticket, old, work_scope) = {
             let mut s = self.state.lock().unwrap();
             s.controller
                 .validate(context, epoch, Some(expected))
@@ -459,8 +476,10 @@ impl NativeRuntime {
                     grant,
                 },
                 s.current.take(),
+                Self::supersede_root_work(&mut s),
             )
         };
+        self.resources.scheduler.cancel_scope(&work_scope);
         Self::retire((old, None), false);
         Ok(ticket)
     }
@@ -520,6 +539,15 @@ impl NativeRuntime {
             }
         }
     }
+    fn supersede_root_work(state: &mut State) -> Scope {
+        let previous = state.root_work_scope.clone();
+        state.root_work_scope.generation = state
+            .root_work_scope
+            .generation
+            .checked_add(1)
+            .expect("root work epoch exhausted");
+        previous
+    }
     fn retire(
         (generation, grant): (Option<Arc<Generation>>, Option<Arc<RootGrant>>),
         revoke: bool,
@@ -559,9 +587,14 @@ impl NativeRuntime {
             s.controller.close();
             s.failure = None;
             s.refresh_pending = false;
-            (s.current.take(), s.grant.take())
+            (
+                s.current.take(),
+                s.grant.take(),
+                Self::supersede_root_work(&mut s),
+            )
         };
-        Self::retire(retired, true);
+        self.resources.scheduler.cancel_scope(&retired.2);
+        Self::retire((retired.0, retired.1), true);
         Ok(true)
     }
     fn with_generation<T>(
@@ -723,6 +756,7 @@ impl Drop for NativeRuntime {
     fn drop(&mut self) {
         let s = self.state.get_mut().unwrap();
         s.controller.close();
+        self.resources.scheduler.cancel_scope(&s.root_work_scope);
         Self::retire((s.current.take(), s.grant.take()), true);
     }
 }
