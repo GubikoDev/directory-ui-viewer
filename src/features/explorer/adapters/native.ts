@@ -75,7 +75,7 @@ export class NativeAdapter implements FilesystemAdapter {
           },
         }),
       );
-      return JSON.parse(inbox.read(key)) as Response<T>;
+      return inbox.parse(key) as Response<T>;
     } catch (error) {
       const code = errorCode(error);
       return {

@@ -1,13 +1,24 @@
+import {
+  frontendBudget,
+  type FrontendBudget,
+  type FrontendReservation,
+} from '../runtime/memory';
 /** Private per-document response slots. Native IPC carries only the completion ack. */
 export class ReplyInbox {
   private slots = new Map<
     string,
-    { json?: string; error?: string; bytes: number }
+    {
+      json?: string;
+      error?: string;
+      bytes: number;
+      memory: FrontendReservation;
+    }
   >();
   private used = 0;
   constructor(
     private readonly maxBytes = 8 * 1024 * 1024,
     private readonly maxPending = 256,
+    private readonly budget: FrontendBudget = frontendBudget,
   ) {}
   get bytes() {
     return this.used;
@@ -19,7 +30,8 @@ export class ReplyInbox {
     if (this.slots.has(key)) throw new Error('INVALID_ARGUMENT');
     if (this.slots.size >= this.maxPending || this.used + 512 > this.maxBytes)
       throw new Error('RESOURCE_LIMIT');
-    this.slots.set(key, { bytes: 512 });
+    const memory = this.budget.reserve(512);
+    this.slots.set(key, { bytes: 512, memory });
     this.used += 512;
   }
   receive = (key: string, json: string): boolean => {
@@ -32,9 +44,14 @@ export class ReplyInbox {
       const bytes = json.length * 2;
       if (this.used + bytes > this.maxBytes) slot.error = 'RESOURCE_LIMIT';
       else {
-        slot.json = json;
-        slot.bytes += bytes;
-        this.used += bytes;
+        try {
+          slot.memory.resize(slot.bytes + bytes);
+          slot.json = json;
+          slot.bytes += bytes;
+          this.used += bytes;
+        } catch {
+          slot.error = 'RESOURCE_LIMIT';
+        }
       }
     }
     // Ack means this slot is settled, including a local resource/format error.
@@ -48,11 +65,17 @@ export class ReplyInbox {
       throw new Error(slot?.error ?? 'INVALID_RESPONSE');
     return slot.json;
   }
+  parse(key: string): unknown {
+    // Parsed descendants keep individual reservations after their response slot
+    // is closed; a store/snapshot may retain them longer than the outer reply.
+    return this.budget.parse(this.read(key));
+  }
   close(key: string) {
     const slot = this.slots.get(key);
     if (slot) {
       this.used -= slot.bytes;
       this.slots.delete(key);
+      slot.memory.close();
     }
   }
 }

@@ -1,7 +1,39 @@
 import { describe, expect, it } from 'vitest';
 import { ReplyInbox } from './inbox';
+import { FrontendBudget, ownBytes } from '../runtime/memory';
 
 describe('native response inbox', () => {
+  it('shares admission across inboxes and retains parsed results after closing a slot', () => {
+    let collect!: (bytes: number) => void;
+    const records = new Map<object, number>();
+    const budget = new FrontendBudget(8192, (callback) => {
+      collect = callback;
+      return {
+        register(target, bytes) {
+          records.set(target, bytes);
+        },
+      };
+    });
+    const first = new ReplyInbox(8192, 256, budget);
+    const second = new ReplyInbox(8192, 256, budget);
+    first.open('one');
+    second.open('two');
+    first.receive('one', '{"ok":true}');
+    const result = first.parse('one') as object;
+    first.close('one');
+    expect(budget.used).toBe(512 + ownBytes(result));
+    second.close('two');
+    expect(budget.used).toBe(ownBytes(result));
+    collect(records.get(result)!);
+    expect(budget.used).toBe(0);
+    const reservation = budget.reserve(8192 - 512);
+    first.open('three');
+    expect(() => second.open('four')).toThrow('RESOURCE_LIMIT');
+    expect(second.pending).toBe(0);
+    first.close('three');
+    reservation.close();
+    expect(budget.used).toBe(0);
+  });
   it('retains encoded replies until the IPC completion ack is handled', () => {
     const inbox = new ReplyInbox();
     inbox.open('one');
