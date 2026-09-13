@@ -27,7 +27,7 @@ Use Vitest and React Testing Library for components and logic, and Playwright fo
 
 ## Security & Filesystem Access
 
-Filesystem access is read-only and user-initiated. Never grant a static whole-disk scope. Canonicalize selected paths, restrict traversal to descendants of the selected root, preserve OS permission failures, and avoid following symlinks outside the approved tree. Do not log filenames or absolute paths without explicit diagnostic consent.
+Filesystem access is read-only and user-initiated. Never grant a static whole-disk scope. Canonicalize native picker candidates and approve the successfully opened directory object. Under the user-approved object policy (2026-09-13), safely acquired descendant directory handles remain approved after moves. Preserve the original root handle on refresh; never automatically approve a replacement at its old path or rebind an existing ID to a different object. Reject symlink target traversal and unapproved object acquisition, preserve mount boundaries and OS permission failures, and revoke new operations on close while existing calls drain. Do not log filenames or absolute paths without explicit diagnostic consent.
 
 ## Project Memory & Agent Collaboration
 
