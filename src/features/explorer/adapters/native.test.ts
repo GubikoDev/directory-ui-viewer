@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { NativeAdapter } from './native';
 import { nativeInbox } from './inbox';
+import { nativeEvents } from './events';
+import wire from '../model/wire-fixture.json';
 function deliverOnce(response: unknown) {
   vi.mocked(invoke).mockImplementationOnce(async (_command, args) => {
     const envelope = JSON.parse(new TextDecoder().decode(args as Uint8Array));
@@ -22,6 +24,15 @@ beforeEach(() => {
   });
 });
 describe('native wire boundary', () => {
+  it('subscribes through the document receiver without the framework event queue', async () => {
+    const listener = vi.fn();
+    const stop = await new NativeAdapter().subscribe(listener);
+    expect(nativeEvents().receive(JSON.stringify(wire.event))).toBe(true);
+    expect(listener).toHaveBeenCalledWith(wire.event);
+    stop();
+    expect(nativeEvents().receive(JSON.stringify(wire.event))).toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+  });
   it('reports a structured connection rejection without losing its code', async () => {
     vi.mocked(invoke).mockRejectedValueOnce({ code: 'CLIENT_EXPIRED' });
     await expect(

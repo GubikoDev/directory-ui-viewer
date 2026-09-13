@@ -26,6 +26,37 @@ pub fn valid_key(key: &str) -> bool {
     key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit())
 }
 impl Delivery {
+    /// Event delivery has one native receiver loop and no framework event queue.
+    /// A missing subscriber, stale document or resource pressure drops the hint.
+    pub fn work_event(
+        proof: &str,
+        event: &crate::domain::model::WorkEvent,
+        budget: &ByteBudget,
+    ) -> Result<Self, DeliveryError> {
+        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(DeliveryError::InvalidArgument);
+        }
+        if crate::runtime::serialization::json_bytes(event)
+            .map_err(|_| DeliveryError::InvalidArgument)?
+            > 4096
+        {
+            return Err(DeliveryError::ResourceLimit);
+        }
+        // Raw JSON <=4KiB, quoted JSON <=8KiB, script/native UTF-16 copies,
+        // boolean result and callback metadata. Reserve before serialization.
+        let memory = budget
+            .reserve(64 * 1024)
+            .map_err(|_| DeliveryError::ResourceLimit)?;
+        let json = serde_json::to_string(event).map_err(|_| DeliveryError::InvalidArgument)?;
+        let quoted = serde_json::to_string(&json).map_err(|_| DeliveryError::InvalidArgument)?;
+        let script = format!(
+            "(()=>{{if(window.__DIRECTORY_DOCUMENT_PROOF__!==\"{proof}\")return false;const receive=window.__DIRECTORY_WORK_EVENT__;return typeof receive===\"function\"&&receive({quoted})===true;}})()"
+        );
+        Ok(Self {
+            script,
+            memory: Arc::new(memory),
+        })
+    }
     /// Main-frame authentication returns only a boolean. The page's property
     /// value is never serialized into an unbounded native callback response.
     pub fn proof_check(proof: &str, budget: &ByteBudget) -> Result<Self, DeliveryError> {
@@ -127,6 +158,53 @@ impl Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_scripts_quote_untrusted_fields_and_keep_abandoned_costs_bounded() {
+        let budget = ByteBudget::new(64 * 1024);
+        let wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/features/explorer/model/wire-fixture.json"
+        ))
+        .unwrap();
+        let mut event: crate::domain::model::WorkEvent =
+            serde_json::from_value(wire["event"].clone()).unwrap();
+        event.task_id = "\");throw Error('injected')//한글".into();
+        let mut queued = None;
+        let receipt = Delivery::work_event(&"a".repeat(64), &event, &budget)
+            .unwrap()
+            .submit(|script, callback| {
+                queued = Some((script, callback));
+                Ok(())
+            })
+            .unwrap();
+        drop(receipt);
+        assert_eq!(budget.used(), 64 * 1024);
+        assert!(matches!(
+            Delivery::work_event(&"a".repeat(64), &event, &budget),
+            Err(DeliveryError::ResourceLimit)
+        ));
+        let (script, callback) = queued.take().unwrap();
+        let quoted = script
+            .split("&&receive(")
+            .nth(1)
+            .unwrap()
+            .strip_suffix(")===true;})()")
+            .unwrap();
+        let json: String = serde_json::from_str(quoted).unwrap();
+        let decoded: crate::domain::model::WorkEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.task_id, event.task_id);
+        assert!(script.contains("window.__DIRECTORY_DOCUMENT_PROOF__!=="));
+        drop(script);
+        callback("false".into());
+        assert_eq!(budget.used(), 64 * 1024);
+        drop(callback);
+        assert_eq!(budget.used(), 0);
+        event.task_id = "x".repeat(4097);
+        assert!(matches!(
+            Delivery::work_event(&"a".repeat(64), &event, &budget),
+            Err(DeliveryError::ResourceLimit)
+        ));
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn proof_timeout_keeps_native_callback_charged_and_returns_only_boolean() {
         let budget = ByteBudget::new(4096);

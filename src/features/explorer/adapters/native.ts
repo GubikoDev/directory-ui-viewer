@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { nativeInbox, responseKey } from './inbox';
+import { nativeEvents } from './events';
 import type {
   FilesystemAdapter,
   Request,
@@ -118,9 +118,8 @@ export class NativeAdapter implements FilesystemAdapter {
   closeSession(input: Input<'closeSession'>): Promise<Reply<'closeSession'>> {
     return this.send('closeSession', input);
   }
-  subscribe(listener: (event: WorkEvent) => void): Promise<() => void> {
-    return listen<WorkEvent>('filesystem-work', (event) =>
-      listener(event.payload),
-    );
+  async subscribe(listener: (event: WorkEvent) => void): Promise<() => void> {
+    documentProof();
+    return nativeEvents().subscribe(listener);
   }
 }

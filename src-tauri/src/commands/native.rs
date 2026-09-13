@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 use tauri::{
-    Emitter, Manager, WebviewWindow,
+    Manager, WebviewWindow,
     ipc::{InvokeBody, InvokeResponseBody},
     webview::{NewWindowResponse, PageLoadEvent},
 };
@@ -112,6 +112,7 @@ fn result<T>(id: String, value: Result<T, FsIssue>) -> Response<T> {
 struct Document {
     context: NativeContext,
     replay: Option<(u64, Arc<ReplayService>)>,
+    proof: Option<String>,
 }
 /// Events carry IDs only. A full queue drops hints; readTask remains authoritative.
 struct NativeEvents {
@@ -161,6 +162,7 @@ impl Bridge {
                 document: Mutex::new(Document {
                     context,
                     replay: None,
+                    proof: None,
                 }),
                 runtime,
                 budgets,
@@ -171,6 +173,7 @@ impl Bridge {
     }
     fn loaded(&self) {
         let mut document = self.document.lock().unwrap();
+        document.proof = None;
         // Exhaustion fails closed; there is no wrapped document identity.
         document.context.document = document
             .context
@@ -194,6 +197,13 @@ impl Bridge {
         window: &WebviewWindow,
         proof: &str,
     ) -> Result<NativeContext, FsIssue> {
+        // Tauri async IPC runs off the main thread. Enforce that precondition:
+        // after didCommitNavigation increments document, a proxy-queued eval
+        // cannot run until Wry has drained pending_scripts and set it to None.
+        // A main-thread immediate eval would not have that ordering guarantee.
+        if unsafe { libc::pthread_main_np() } != 0 {
+            return Err(issue("CLIENT_EXPIRED"));
+        }
         if window.label() != "main" || !valid_proof(proof) {
             return Err(issue("CLIENT_EXPIRED"));
         }
@@ -281,6 +291,7 @@ pub async fn connect_client(
             ReplayService::new(epoch, state.budgets.work.clone(), 256, 300_000).map_err(control)?;
         document.replay = Some((epoch, Arc::new(replay)));
     }
+    document.proof = Some(input.document_proof);
     Ok(InvokeResponseBody::Json(format!(
         "{{\"epoch\":\"native-epoch-{epoch}\"}}"
     )))
@@ -574,9 +585,14 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
-            let valid = {
+            // read_task validates current ownership but returns a WorkRecord
+            // clone; admit its bounded temporary before acquiring it.
+            let Ok(_validation_memory) = bridge.budgets.work.reserve(64 * 1024) else {
+                continue;
+            };
+            let proof = {
                 let document = bridge.document.lock().unwrap();
-                document.replay.as_ref().is_some_and(|(epoch, _)| {
+                let valid = document.replay.as_ref().is_some_and(|(epoch, _)| {
                     bridge
                         .runtime
                         .read_task(
@@ -589,11 +605,27 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             &event.task_id,
                         )
                         .is_ok()
-                })
+                });
+                if valid { document.proof.clone() } else { None }
             };
-            if valid {
-                let _ = window.emit("filesystem-work", &event);
-            }
+            let Some(proof) = proof else {
+                continue;
+            };
+            let Ok(delivery) =
+                super::delivery::Delivery::work_event(&proof, &event, &bridge.budgets.work)
+            else {
+                continue;
+            };
+            let Ok(receipt) = delivery.submit(|script, callback| {
+                window
+                    .eval_with_callback(script, callback)
+                    .map_err(|_| super::delivery::DeliveryError::Disconnected)
+            }) else {
+                continue;
+            };
+            // One event in flight per loop; timeout does not release a callback
+            // still owned by WebKit. The shared work budget bounds abandoned calls.
+            let _ = tokio::time::timeout(Duration::from_secs(10), receipt.wait()).await;
         }
     });
     Ok(())
@@ -643,6 +675,7 @@ mod tests {
         let service =
             Arc::new(ReplayService::new(epoch, bridge.budgets.work.clone(), 4, 100).unwrap());
         bridge.document.lock().unwrap().replay = Some((epoch, service.clone()));
+        bridge.document.lock().unwrap().proof = Some("a".repeat(64));
         let RequestAdmission::Execute(owner, waiter) = service
             .begin(
                 RequestNumber { epoch, sequence: 1 },
@@ -655,6 +688,7 @@ mod tests {
             panic!()
         };
         bridge.loaded();
+        assert!(bridge.document.lock().unwrap().proof.is_none());
         assert_eq!(bridge.current(&context).unwrap_err().code, "CLIENT_EXPIRED");
         assert!(bridge.replay(&context, epoch).is_err());
         assert!(tauri::async_runtime::block_on(waiter.wait()).is_err());
