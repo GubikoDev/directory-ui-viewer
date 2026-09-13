@@ -593,7 +593,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             };
             // read_task validates current ownership but returns a WorkRecord
             // clone; admit its bounded temporary before acquiring it.
-            let Ok(_validation_memory) = bridge.budgets.work.reserve(64 * 1024) else {
+            let Ok(memory) = bridge.budgets.work.reserve(64 * 1024) else {
                 continue;
             };
             let proof = {
@@ -617,11 +617,11 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let Some(proof) = proof else {
                 continue;
             };
-            let Ok(delivery) =
-                super::delivery::Delivery::work_event(&proof, &event, &bridge.budgets.work)
-            else {
+            let Ok(delivery) = super::delivery::Delivery::work_event(&proof, &event, memory) else {
                 continue;
             };
+            drop(proof);
+            drop(event);
             let Ok(receipt) = delivery.submit_guarded(permit, |script, callback| {
                 window
                     .eval_with_callback(script, callback)

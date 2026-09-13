@@ -31,7 +31,7 @@ impl Delivery {
     pub fn work_event(
         proof: &str,
         event: &crate::domain::model::WorkEvent,
-        budget: &ByteBudget,
+        memory: Reservation,
     ) -> Result<Self, DeliveryError> {
         if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(DeliveryError::InvalidArgument);
@@ -43,10 +43,11 @@ impl Delivery {
             return Err(DeliveryError::ResourceLimit);
         }
         // Raw JSON <=4KiB, quoted JSON <=8KiB, script/native UTF-16 copies,
-        // boolean result and callback metadata. Reserve before serialization.
-        let memory = budget
-            .reserve(64 * 1024)
-            .map_err(|_| DeliveryError::ResourceLimit)?;
+        // boolean result and callback metadata. Reuse the caller's validation
+        // reservation after its WorkRecord temporary has been destroyed.
+        if memory.bytes() < 64 * 1024 {
+            return Err(DeliveryError::ResourceLimit);
+        }
         let json = serde_json::to_string(event).map_err(|_| DeliveryError::InvalidArgument)?;
         let quoted = serde_json::to_string(&json).map_err(|_| DeliveryError::InvalidArgument)?;
         let script = format!(
@@ -188,20 +189,18 @@ mod tests {
         let mut queued = None;
         let lane = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = lane.clone().try_acquire_owned().unwrap();
-        let receipt = Delivery::work_event(&"a".repeat(64), &event, &budget)
-            .unwrap()
-            .submit_guarded(permit, |script, callback| {
-                queued = Some((script, callback));
-                Ok(())
-            })
-            .unwrap();
+        let receipt =
+            Delivery::work_event(&"a".repeat(64), &event, budget.reserve(64 * 1024).unwrap())
+                .unwrap()
+                .submit_guarded(permit, |script, callback| {
+                    queued = Some((script, callback));
+                    Ok(())
+                })
+                .unwrap();
         drop(receipt);
         assert!(lane.clone().try_acquire_owned().is_err());
         assert_eq!(budget.used(), 64 * 1024);
-        assert!(matches!(
-            Delivery::work_event(&"a".repeat(64), &event, &budget),
-            Err(DeliveryError::ResourceLimit)
-        ));
+        assert!(budget.reserve(64 * 1024).is_err());
         let (script, callback) = queued.take().unwrap();
         let quoted = script
             .split("&&receive(")
@@ -222,7 +221,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
         event.task_id = "x".repeat(4097);
         assert!(matches!(
-            Delivery::work_event(&"a".repeat(64), &event, &budget),
+            Delivery::work_event(&"a".repeat(64), &event, budget.reserve(64 * 1024).unwrap()),
             Err(DeliveryError::ResourceLimit)
         ));
         assert_eq!(budget.used(), 0);
