@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-filesystem-request"
+description = "Enables the filesystem_request command without any pre-configured scope."
+commands.allow = ["filesystem_request"]
+
+[[permission]]
+identifier = "deny-filesystem-request"
+description = "Denies the filesystem_request command without any pre-configured scope."
+commands.deny = ["filesystem_request"]

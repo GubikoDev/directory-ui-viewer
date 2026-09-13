@@ -17,11 +17,12 @@
         "width": 1200,
         "height": 760,
         "minWidth": 800,
-        "minHeight": 560
+        "minHeight": 560,
+        "create": false
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'none'"
     }
   },
   "bundle": {

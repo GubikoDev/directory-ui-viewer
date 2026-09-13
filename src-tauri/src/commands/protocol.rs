@@ -3,17 +3,17 @@ use crate::domain::{
     controller::Scope,
     model::{Category, FsIssue, IssueScope},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 const MAX_SAFE: u64 = 9_007_199_254_740_991;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Request {
     pub protocol_version: u8,
     pub request_id: String,
     pub body: Command,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(
     tag = "operation",
     rename_all = "camelCase",
@@ -112,8 +112,8 @@ impl Request {
             .and_then(number)
             .ok_or_else(|| issue("CLIENT_EXPIRED"))?;
         let sequence = number(sequence).ok_or_else(|| issue("INVALID_ARGUMENT"))?;
-        if let Some(scope) = self.body.scope() {
-            if !identifier(&scope.session_id, 128) || !(1..=MAX_SAFE).contains(&scope.generation) {
+        if let Some((session_id, generation)) = self.body.scope_ref() {
+            if !identifier(session_id, 128) || !(1..=MAX_SAFE).contains(&generation) {
                 return Err(issue("INVALID_ARGUMENT"));
             }
         }

@@ -1,6 +1,7 @@
 //! Pure control plane. Native window/document contexts must be provided by the
 //! trusted command boundary, never deserialized from frontend arguments.
 use super::model::Phase;
+use crate::runtime::memory::{ByteBudget, Reservation};
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -45,12 +46,12 @@ pub enum Admission<T> {
     Pending,
     Replay(T),
 }
-#[derive(Debug)]
 struct RequestRecord<T> {
     number: u64,
     fingerprint: String,
     result: Option<T>,
     accepted_ms: u64,
+    _memory: Reservation,
 }
 /// Bounded completed results + a high-water mark prevent expired requests from
 /// executing again. Pending requests are never evicted to make room for new work.
@@ -59,22 +60,45 @@ pub struct RequestLedger<T> {
     high_water: u64,
     max_records: usize,
     ttl_ms: u64,
+    budget: ByteBudget,
+    _memory: Reservation,
 }
 impl<T: Clone> RequestLedger<T> {
     pub fn new(max_records: usize, ttl_ms: u64) -> Self {
-        Self {
-            records: VecDeque::new(),
+        Self::with_budget(max_records, ttl_ms, ByteBudget::new(usize::MAX))
+            .expect("ledger allocation")
+    }
+    pub fn with_budget(
+        max_records: usize,
+        ttl_ms: u64,
+        budget: ByteBudget,
+    ) -> Result<Self, ControlError> {
+        let bytes = max_records
+            .checked_mul(std::mem::size_of::<RequestRecord<T>>() * 2)
+            .and_then(|n| n.checked_add(1024))
+            .ok_or(ControlError::ResourceLimit)?;
+        let memory = budget
+            .reserve(bytes)
+            .map_err(|_| ControlError::ResourceLimit)?;
+        let mut records = VecDeque::new();
+        records
+            .try_reserve_exact(max_records)
+            .map_err(|_| ControlError::ResourceLimit)?;
+        Ok(Self {
+            records,
             high_water: 0,
             max_records,
             ttl_ms,
-        }
+            budget,
+            _memory: memory,
+        })
     }
-    pub fn admit(
+    pub fn lookup(
         &mut self,
         number: u64,
         fingerprint: &str,
         now: u64,
-    ) -> Result<Admission<T>, ControlError> {
+    ) -> Result<Option<Admission<T>>, ControlError> {
         if number == 0 || number > MAX_SAFE_INTEGER || fingerprint.len() > 1024 {
             return Err(ControlError::InvalidArgument);
         }
@@ -84,26 +108,55 @@ impl<T: Clone> RequestLedger<T> {
             if record.fingerprint != fingerprint {
                 return Err(ControlError::InvalidArgument);
             }
-            return Ok(match &record.result {
+            return Ok(Some(match &record.result {
                 Some(result) => Admission::Replay(result.clone()),
                 None => Admission::Pending,
-            });
+            }));
         }
         if number <= self.high_water {
             return Err(ControlError::RequestExpired);
         }
-        while self.records.len() >= self.max_records {
-            let Some(index) = self.records.iter().position(|r| r.result.is_some()) else {
-                return Err(ControlError::ResourceLimit);
-            };
+        Ok(None)
+    }
+    pub fn evict_completed(&mut self) -> bool {
+        if let Some(index) = self.records.iter().position(|r| r.result.is_some()) {
             self.records.remove(index);
+            true
+        } else {
+            false
         }
+    }
+    pub fn clear(&mut self) {
+        self.records.clear();
+    }
+    pub fn admit(
+        &mut self,
+        number: u64,
+        fingerprint: &str,
+        now: u64,
+    ) -> Result<Admission<T>, ControlError> {
+        if let Some(existing) = self.lookup(number, fingerprint, now)? {
+            return Ok(existing);
+        }
+        while self.records.len() >= self.max_records {
+            if !self.evict_completed() {
+                return Err(ControlError::ResourceLimit);
+            }
+        }
+        let memory = loop {
+            match self.budget.reserve(256 + fingerprint.len()) {
+                Ok(memory) => break memory,
+                Err(_) if self.evict_completed() => (),
+                Err(_) => return Err(ControlError::ResourceLimit),
+            }
+        };
         self.high_water = number;
         self.records.push_back(RequestRecord {
             number,
             fingerprint: fingerprint.into(),
             result: None,
             accepted_ms: now,
+            _memory: memory,
         });
         Ok(Admission::New)
     }

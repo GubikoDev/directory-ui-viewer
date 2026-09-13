@@ -209,6 +209,13 @@ impl NativeRuntime {
         let ticket = self
             .begin_refresh(&context, epoch, &expected)
             .map_err(RefreshFailure::uncommitted)?;
+        self.refresh_prepared(ticket).await
+    }
+    /// Ticket is admitted synchronously at the IPC boundary before yielding.
+    pub async fn refresh_prepared(
+        self: Arc<Self>,
+        ticket: RefreshTicket,
+    ) -> Result<RootData, RefreshFailure> {
         let mut pending = self.enqueue_root(Action::Refresh(ticket));
         match pending.receiver.recv().await {
             Some(Outcome::Refresh(result)) => result,
