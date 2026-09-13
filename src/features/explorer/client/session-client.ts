@@ -12,7 +12,16 @@ import {
   type Scope,
   type ScopedRequest,
   type WorkRecord,
+  type ListingStart,
 } from '../model/types';
+
+type PendingStart =
+  | {
+      kind: 'listing';
+      request: ScopedRequest & { directoryId: string; category: Category };
+      order: number;
+    }
+  | { kind: 'usage'; request: ScopedRequest };
 
 export class AdapterError extends Error {
   constructor(
@@ -43,6 +52,7 @@ export class SessionClient {
   private queuedControls = 0;
   private polling?: Promise<void>;
   private subscription?: () => void;
+  private stateSubscription?: () => void;
   private timer?: ReturnType<typeof setInterval>;
   private connection?: Promise<void>;
   private recovery: TaskMap<Promise<void>>;
@@ -50,6 +60,7 @@ export class SessionClient {
   private lastPage: TaskMap<number>;
   private pageDemand: TaskMap<boolean>;
   private lastEvent: TaskMap<number>;
+  private pendingStarts: TaskMap<PendingStart>;
   private readonly errorLog: IssueLog;
   constructor(
     readonly adapter: FilesystemAdapter,
@@ -64,6 +75,26 @@ export class SessionClient {
     this.lastPage = new TaskMap(store.budget);
     this.pageDemand = new TaskMap(store.budget);
     this.lastEvent = new TaskMap(store.budget);
+    this.pendingStarts = new TaskMap(store.budget);
+    this.stateSubscription = store.subscribe(() => {
+      const tasks = store.getSnapshot().tasks;
+      const keep = (id: string) => tasks.has(id);
+      this.lastPage.prune(keep);
+      this.pageDemand.prune(keep);
+      this.lastEvent.prune(keep);
+      this.pendingStarts.prune((id) => {
+        const start = this.pendingStarts.get(id)!;
+        return (
+          sameScope(store.getSnapshot().session, start.request) &&
+          (start.kind === 'usage' ||
+            store.isListingRequestCurrent(
+              start.request.directoryId,
+              start.request.category,
+              start.order,
+            ))
+        );
+      });
+    });
   }
   get errors(): readonly ClientIssue[] {
     return this.errorLog.snapshot;
@@ -121,7 +152,10 @@ export class SessionClient {
     this.currentScope = null;
     this.recovery.clear();
     this.pageReads.clear();
+    this.pendingStarts.clear();
     this.store.reset(null);
+    this.stateSubscription?.();
+    this.stateSubscription = undefined;
     this.lastPage.clear();
     this.pageDemand.clear();
     this.lastEvent.clear();
@@ -172,10 +206,6 @@ export class SessionClient {
       memory.close();
     }
   }
-  private register(task: WorkRecord) {
-    this.store.applyTask(task);
-    this.lastEvent.set(task.taskId, this.now());
-  }
   chooseRoot(): Promise<boolean> {
     if (this.picker) return this.picker;
     this.picker = this.choose().finally(() => {
@@ -217,38 +247,107 @@ export class SessionClient {
   async list(directoryId: string, category: Category) {
     const scope = this.store.getSnapshot().session;
     if (!scope) throw new AdapterError('SESSION_CLOSED');
-    const { request, pending, order } = await this.control(async () => {
+    const { start, pending } = await this.control(async () => {
       const request = { ...this.scoped(scope), directoryId, category };
       const order = this.number;
-      return { request, pending: this.adapter.startListing(request), order };
+      if (!this.store.beginListing(directoryId, category, order))
+        throw new AdapterError('RESOURCE_LIMIT');
+      return this.prepareStart({ kind: 'listing', request, order });
     });
-    const response = await pending;
-    if (!sameScope(this.store.getSnapshot().session, scope)) return;
-    const start = unwrap(response, request.requestId);
-    if (!start) return;
-    if (!this.store.registerListing(start, order)) return;
-    this.lastEvent.set(start.work.taskId, this.now());
-    await this.nextPage(start.work.taskId);
+    await this.consumeStart(start, pending);
   }
   async scan() {
     const scope = this.store.getSnapshot().session;
     if (!scope) return;
-    const { request, pending } = await this.control(async () => {
+    const { start, pending } = await this.control(async () => {
       const request = this.scoped(scope);
-      return { request, pending: this.adapter.startUsageScan(request) };
+      return this.prepareStart({ kind: 'usage', request });
     });
-    const response = await pending;
-    if (!sameScope(this.store.getSnapshot().session, scope)) return;
-    const work = unwrap(response, request.requestId);
-    if (work) {
-      this.register(work);
-      await this.synchronize(work.taskId);
+    await this.consumeStart(start, pending);
+  }
+  private invokeStart(
+    start: PendingStart,
+  ): Promise<Response<ListingStart | WorkRecord>> {
+    return start.kind === 'listing'
+      ? this.adapter.startListing(start.request)
+      : this.adapter.startUsageScan(start.request);
+  }
+  private prepareStart(input: PendingStart) {
+    if (this.pendingStarts.size >= 64) throw new AdapterError('RESOURCE_LIMIT');
+    // Preserve only the small original request before effects. A transient
+    // registration failure is recovered with the SAME requestId, so native
+    // replay can never silently execute a fresh scan after cache expiry.
+    const start = this.store.budget.adopt(input);
+    this.pendingStarts.set(start.request.requestId, start);
+    try {
+      return { start, pending: this.invokeStart(start) };
+    } catch (error) {
+      this.pendingStarts.delete(start.request.requestId);
+      throw error;
+    }
+  }
+  private async consumeStart(
+    start: PendingStart,
+    pending: Promise<Response<ListingStart | WorkRecord>>,
+  ) {
+    const id = start.request.requestId;
+    try {
+      const response = await pending;
+      if (
+        this.pendingStarts.get(id) !== start ||
+        !sameScope(this.store.getSnapshot().session, start.request)
+      )
+        return;
+      // A definitive native error is itself replayable. Keeping its request
+      // would retry the same cached failure forever; only an unobserved result
+      // or a rejected local registration needs pending-start recovery.
+      if (response.requestId === id && response.outcome === 'error')
+        this.pendingStarts.delete(id);
+      const data = unwrap(response, id);
+      if (!data) {
+        this.pendingStarts.delete(id);
+        return;
+      }
+      let task: WorkRecord;
+      let admitted: boolean;
+      if (start.kind === 'listing') {
+        if (!('work' in data)) throw new AdapterError('INVALID_RESPONSE');
+        task = data.work;
+        admitted = this.store.registerListing(data, start.order);
+      } else {
+        if ('work' in data) throw new AdapterError('INVALID_RESPONSE');
+        task = data;
+        admitted = this.store.applyTask(task);
+      }
+      if (
+        !admitted &&
+        this.store.getSnapshot().resourceLimited &&
+        !this.store.getSnapshot().tasks.has(task.taskId)
+      )
+        return;
+      this.pendingStarts.delete(id);
+      if (!admitted) return;
+      this.lastEvent.set(task.taskId, this.now());
+      if (start.kind === 'listing') await this.nextPage(task.taskId);
+      else await this.synchronize(task.taskId);
+    } catch (error) {
+      if (
+        this.pendingStarts.get(id) === start &&
+        error instanceof Error &&
+        error.message === 'RESOURCE_LIMIT'
+      )
+        this.store.suspendObservations();
+      else this.pendingStarts.delete(id);
+      throw error;
     }
   }
   nextPage(taskId: string): Promise<boolean> {
     const state = this.store.getSnapshot();
     const task = state.tasks.get(taskId);
-    if (!task || task.operation === 'scanUsage') return Promise.resolve(false);
+    if (!task || task.operation === 'scanUsage') {
+      this.pageDemand.delete(taskId);
+      return Promise.resolve(false);
+    }
     let available = false;
     for (const listing of state.listings.values()) {
       if (
@@ -305,12 +404,47 @@ export class SessionClient {
   private synchronize(taskId: string): Promise<void> {
     return this.recovery.run(taskId, () => this.sync(taskId));
   }
+  closeListing(directoryId: string, category: Category) {
+    this.store.setExpanded(directoryId, false, category);
+    this.store.evictClosedListings();
+    return this.store.resumeObservations();
+  }
+  async retryObservations(): Promise<boolean> {
+    if (!this.store.resumeObservations()) return false;
+    const scope = this.store.getSnapshot().session;
+    if (!scope) return true;
+    const ids = this.observationIds('loadingListings');
+    const pending = this.observationIds('pendingStarts');
+    for (const id of pending) {
+      const start = this.pendingStarts.get(id);
+      if (!start || !sameScope(this.store.getSnapshot().session, scope))
+        continue;
+      const dispatched = await this.control(async () => ({
+        pending:
+          this.pendingStarts.get(id) === start ? this.invokeStart(start) : null,
+      }));
+      if (!dispatched.pending) continue;
+      await this.consumeStart(start, dispatched.pending);
+      if (this.store.getSnapshot().resourceLimited) return false;
+    }
+    for (const id of ids) {
+      if (
+        !sameScope(this.store.getSnapshot().session, scope) ||
+        this.store.getSnapshot().resourceLimited
+      )
+        return false;
+      await this.nextPage(id);
+    }
+    if (!this.store.getSnapshot().resourceLimited) await this.readUsage(scope);
+    return !this.store.getSnapshot().resourceLimited;
+  }
   private async sync(taskId: string) {
     const scope = this.store.getSnapshot().session;
     if (!scope) return;
     const request = { ...this.scoped(scope), taskId };
     const response = await this.adapter.readTask(request);
     if (!sameScope(this.store.getSnapshot().session, scope)) return;
+    if (!this.store.getSnapshot().tasks.has(taskId)) return;
     const work = unwrap(response, request.requestId);
     if (!work) return;
     this.store.applyTask(work);
@@ -342,7 +476,7 @@ export class SessionClient {
     return bytes;
   }
   private observationIds(
-    kind: 'directories' | 'pendingTasks',
+    kind: 'directories' | 'pendingTasks' | 'loadingListings' | 'pendingStarts',
   ): readonly string[] {
     // Both passes are synchronous. Only the charged IDs survive an async wait.
     const state = this.store.getSnapshot();
@@ -351,6 +485,12 @@ export class SessionClient {
       if (kind === 'directories') {
         for (const entry of state.entries.values())
           if (entry.kind === 'directory') accept(entry.entryId);
+      } else if (kind === 'pendingStarts') {
+        this.pendingStarts.forEach((_value, id) => accept(id));
+      } else if (kind === 'loadingListings') {
+        for (const listing of state.listings.values())
+          if (listing.loadState === 'loading' && listing.taskId)
+            accept(listing.taskId);
       } else {
         for (const task of state.tasks.values())
           if (
@@ -401,7 +541,8 @@ export class SessionClient {
       return { request, pending: this.adapter.cancelTask(request) };
     }, true);
     const result = unwrap(await pending, request.requestId);
-    if (result) this.store.applyTask(result.work);
+    if (result && this.store.getSnapshot().tasks.has(taskId))
+      this.store.applyTask(result.work);
     try {
       void this.synchronize(taskId).catch((error) => this.report(error));
     } catch (error) {

@@ -23,6 +23,29 @@ function accounting(limit = 64 * 1024) {
   };
 }
 describe('client task metadata ownership', () => {
+  it('deletes under full pressure and later compacts capacity without releasing the old owner early', () => {
+    const { budget, records, collect } = accounting();
+    const tasks = new TaskMap<number>(budget);
+    tasks.set('keep', 1);
+    tasks.set('closed', 2);
+    const old = [...records.keys()].find((value) => value instanceof Map)!;
+    const pressure = budget.reserve(budget.available);
+    tasks.prune((key) => key === 'keep');
+    expect(tasks.size).toBe(1);
+    expect(budget.used).toBe(budget.limit);
+    pressure.close();
+    tasks.prune((key) => key === 'keep');
+    expect(records.has(old)).toBe(true);
+    const current = [...records.keys()].find(
+      (value) => value instanceof Map && value !== old,
+    )!;
+    expect(current).toBeDefined();
+    collect(old);
+    expect(tasks.get('keep')).toBe(1);
+    tasks.clear();
+    collect(current);
+    expect(budget.used).toBe(512);
+  });
   it('precharges growth and keeps deleted map capacity until that container is collected', () => {
     const { budget, records, collect } = accounting();
     const tasks = new TaskMap<number>(budget);

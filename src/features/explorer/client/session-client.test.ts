@@ -20,6 +20,281 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('SessionClient with deterministic adapter', () => {
+  it('recovers two pending usage requests through replay of the same native task', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter, store } = setup(undefined, budget);
+    await client.chooseRoot();
+    const state = store.getSnapshot();
+    store.reset({ session: state.session!, root: state.entries.get('A')! });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached = 0;
+    const original = adapter.startUsageScan.bind(adapter);
+    const delay = async (input: Parameters<typeof original>[0]) => {
+      const response = await original(input);
+      reached++;
+      await gate;
+      return response;
+    };
+    const start = vi
+      .spyOn(adapter, 'startUsageScan')
+      .mockImplementationOnce(delay)
+      .mockImplementationOnce(delay);
+    const first = client.scan();
+    const second = client.scan();
+    await vi.waitFor(() => expect(reached).toBe(2));
+    const pressure = budget.reserve(budget.available);
+    release();
+    await Promise.all([first, second]);
+    expect(store.getSnapshot().resourceLimited).toBe(true);
+    expect(store.getSnapshot().tasks.size).toBe(0);
+    pressure.close();
+    expect(await client.retryObservations()).toBe(true);
+    expect(start).toHaveBeenCalledTimes(4);
+    expect(start.mock.calls[2][0]).toBe(start.mock.calls[0][0]);
+    expect(start.mock.calls[3][0]).toBe(start.mock.calls[1][0]);
+    const responses = await Promise.all(
+      start.mock.results.map((call) => call.value),
+    );
+    expect(responses[2]).toBe(responses[0]);
+    expect(responses[3]).toBe(responses[1]);
+    const ids = responses.map(
+      (response) => response.outcome === 'ok' && response.data.taskId,
+    );
+    expect(new Set(ids).size).toBe(1);
+    expect([...store.getSnapshot().tasks.keys()]).toEqual([ids[0]]);
+  });
+  it.each(['listing', 'usage'] as const)(
+    'replays the original %s request after registration pressure without a new effect',
+    async (kind) => {
+      const budget = new FrontendBudget();
+      const { client, adapter, store } = setup(undefined, budget);
+      await client.chooseRoot();
+      if (kind === 'usage') {
+        const state = store.getSnapshot();
+        store.reset({
+          session: state.session!,
+          root: state.entries.get(state.session!.rootEntryId)!,
+        });
+      }
+      const listing = adapter.startListing.bind(adapter);
+      const usage = adapter.startUsageScan.bind(adapter);
+      let pressure!: ReturnType<FrontendBudget['reserve']>;
+      const exhaustAfter = async <T>(pending: Promise<T>): Promise<T> => {
+        const response = await pending;
+        pressure = budget.reserve(budget.available);
+        return response;
+      };
+      const calls =
+        kind === 'listing'
+          ? vi
+              .spyOn(adapter, 'startListing')
+              .mockImplementationOnce((input) => exhaustAfter(listing(input)))
+          : vi
+              .spyOn(adapter, 'startUsageScan')
+              .mockImplementationOnce((input) => exhaustAfter(usage(input)));
+      await (kind === 'listing' ? client.list('B', 'files') : client.scan());
+      expect(store.getSnapshot().resourceLimited).toBe(true);
+      expect(
+        [...store.getSnapshot().tasks.values()].some(
+          (task) =>
+            task.operation === (kind === 'listing' ? 'listFiles' : 'scanUsage'),
+        ),
+      ).toBe(false);
+      const first = calls.mock.calls[0][0];
+      const response = await calls.mock.results[0].value;
+      expect(response.outcome).toBe('ok');
+      pressure.close();
+      expect(await client.retryObservations()).toBe(true);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(calls.mock.calls[1][0]).toBe(first);
+      const replay = await calls.mock.results[1].value;
+      expect(replay).toBe(response);
+      if (response.outcome === 'ok') {
+        const task =
+          'work' in response.data ? response.data.work : response.data;
+        expect(store.getSnapshot().tasks.get(task.taskId)).toEqual(task);
+      }
+      await client.retryObservations();
+      expect(calls).toHaveBeenCalledTimes(2);
+    },
+  );
+  it.each([
+    'expired',
+    'nativeResourceError',
+    'closed',
+    'closedBeforeDispatch',
+    'superseded',
+  ] as const)(
+    'does not resurrect or restart a rejected registration when %s',
+    async (ending) => {
+      const budget = new FrontendBudget();
+      const { client, adapter, store } = setup(undefined, budget);
+      await client.chooseRoot();
+      const original = adapter.startListing.bind(adapter);
+      let pressure!: ReturnType<FrontendBudget['reserve']>;
+      const start = vi
+        .spyOn(adapter, 'startListing')
+        .mockImplementationOnce(async (input) => {
+          const response = await original(input);
+          pressure = budget.reserve(budget.available);
+          return response;
+        });
+      await client.list('B', 'files');
+      expect(store.getSnapshot().resourceLimited).toBe(true);
+      pressure.close();
+      if (ending === 'expired' || ending === 'nativeResourceError') {
+        const code =
+          ending === 'expired' ? 'REQUEST_EXPIRED' : 'RESOURCE_LIMIT';
+        start.mockImplementationOnce(async (input) => ({
+          requestId: input.requestId,
+          outcome: 'error',
+          error: {
+            code,
+            operation: 'startListing',
+            scope: 'root',
+          },
+        }));
+        await expect(client.retryObservations()).rejects.toThrow(code);
+        expect(start.mock.calls[1][0]).toBe(start.mock.calls[0][0]);
+      } else if (ending === 'closed') {
+        client.closeListing('B', 'files');
+      } else if (ending === 'closedBeforeDispatch') {
+        const retry = client.retryObservations();
+        client.closeListing('B', 'files');
+        await retry;
+        expect(start).toHaveBeenCalledOnce();
+      } else {
+        await client.list('B', 'files');
+        expect(start.mock.calls[1][0].requestId).not.toBe(
+          start.mock.calls[0][0].requestId,
+        );
+      }
+      const count = start.mock.calls.length;
+      await client.retryObservations();
+      expect(start).toHaveBeenCalledTimes(count);
+      expect(store.getListing('B', 'files').loadState).toBe(
+        ending === 'superseded' ? 'settled' : 'notRequested',
+      );
+    },
+  );
+  it.each(['start', 'page'] as const)(
+    'drops a late %s response after closing a file listing',
+    async (stage) => {
+      const { client, adapter, store } = setup();
+      await client.chooseRoot();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let reached = false;
+      if (stage === 'start') {
+        const original = adapter.startListing.bind(adapter);
+        vi.spyOn(adapter, 'startListing').mockImplementation(async (input) => {
+          const response = await original(input);
+          reached = true;
+          await gate;
+          return response;
+        });
+      } else {
+        const original = adapter.readListingPage.bind(adapter);
+        vi.spyOn(adapter, 'readListingPage').mockImplementation(
+          async (input) => {
+            const response = await original(input);
+            reached = true;
+            await gate;
+            return response;
+          },
+        );
+      }
+      const pending = client.list('B', 'files');
+      await vi.waitFor(() => expect(reached).toBe(true));
+      client.closeListing('B', 'files');
+      release();
+      await pending;
+      expect(store.getListing('B', 'files').loadState).toBe('notRequested');
+      expect(
+        [...store.getSnapshot().entries.values()].some(
+          (entry) => entry.kind === 'regularFile',
+        ),
+      ).toBe(false);
+      expect(
+        [...store.getSnapshot().tasks.values()].some(
+          (work) => work.operation === 'listFiles',
+        ),
+      ).toBe(false);
+    },
+  );
+  it('drops a late task recovery after reclaiming its listing', async () => {
+    vi.useFakeTimers();
+    const { client, adapter, store } = setup();
+    await client.chooseRoot();
+    adapter.deferTasks = true;
+    await client.list('B', 'files');
+    const task = store.getListing('B', 'files').taskId!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original = adapter.readTask.bind(adapter);
+    const read = vi
+      .spyOn(adapter, 'readTask')
+      .mockImplementation(async (input) => {
+        const response = await original(input);
+        await gate;
+        return response;
+      });
+    vi.setSystemTime(Date.now() + 2000);
+    const pending = client.poll();
+    expect(read).toHaveBeenCalledOnce();
+    client.closeListing('B', 'files');
+    release();
+    await pending;
+    expect(store.getSnapshot().tasks.has(task)).toBe(false);
+    expect(store.getListing('B', 'files').loadState).toBe('notRequested');
+  });
+  it('retries a pressure-rejected page with the same task and cursor without restarting scans', async () => {
+    vi.useFakeTimers();
+    const adapter = new FixtureAdapter({
+      entries: [
+        fixtureEntry('A', null),
+        ...Array.from({ length: 450 }, (_, i) =>
+          fixtureEntry('child-' + i, 'A'),
+        ),
+      ],
+    });
+    const budget = new FrontendBudget();
+    const { client, store } = setup(adapter, budget);
+    await client.chooseRoot();
+    const task = store.getListing('A', 'directories').taskId!;
+    const starts = {
+      listing: adapter.calls.startListing,
+      scan: adapter.calls.startUsageScan,
+    };
+    const original = adapter.readListingPage.bind(adapter);
+    let pressure!: ReturnType<FrontendBudget['reserve']>;
+    vi.spyOn(adapter, 'readListingPage').mockImplementationOnce(
+      async (input) => {
+        const response = await original(input);
+        pressure = budget.reserve(budget.available);
+        return response;
+      },
+    );
+    vi.setSystemTime(Date.now() + 250);
+    expect(await client.nextPage(task)).toBe(false);
+    expect(store.getSnapshot().resourceLimited).toBe(true);
+    pressure.close();
+    vi.setSystemTime(Date.now() + 250);
+    expect(await client.retryObservations()).toBe(true);
+    expect(
+      store.getListing('A', 'directories').snapshot?.entryIds,
+    ).toHaveLength(400);
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    expect(adapter.calls.startListing).toBe(starts.listing);
+    expect(adapter.calls.startUsageScan).toBe(starts.scan);
+  });
   it('keeps two dispatch slots for cancel and close behind a full ordinary queue', async () => {
     const { client, adapter, store } = setup();
     await client.chooseRoot();

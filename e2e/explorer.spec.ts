@@ -17,6 +17,14 @@ test('fixture flow exercises lazy folders, files, presentation, refresh and clos
     page.getByText('file (regularFile)', { exact: true }),
   ).toBeVisible();
   const work = page.getByRole('region', { name: '작업 상태' });
+  await page.getByRole('button', { name: '파일 목록 닫기' }).click();
+  await expect(
+    page.getByText('file (regularFile)', { exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole('button', { name: '파일 목록 보기' }).click();
+  await expect(
+    page.getByText('file (regularFile)', { exact: true }),
+  ).toBeVisible();
   const before = await work.innerText();
   await page
     .getByRole('button', { name: '표현 전환 (organization)', exact: true })

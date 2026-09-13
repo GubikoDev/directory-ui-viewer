@@ -21,6 +21,7 @@ import {
   type WorkEvent,
   type WorkRecord,
 } from './types';
+import { compactClosed } from './retention';
 
 export interface ExplorerState {
   session: RootSession | null;
@@ -53,6 +54,11 @@ const emptyState = (): ExplorerState => ({
 export class ExplorerStore {
   private state!: ExplorerState;
   private pressureState!: ExplorerState;
+  private pressureMetadata?: {
+    sequences: Map<string, number>;
+    orders: Map<string, number>;
+    cancelled: Set<string>;
+  };
   private listeners!: Set<() => void>;
   private sequences!: Map<string, number>;
   private listingOrders!: Map<string, number>;
@@ -140,6 +146,7 @@ export class ExplorerStore {
     if (this.transaction) return update();
     const previous = this.state;
     const pressure = this.pressureState;
+    const pressureMetadata = this.pressureMetadata;
     const sequences = this.sequences;
     const orders = this.listingOrders;
     const cancelled = this.cancelPending;
@@ -154,6 +161,10 @@ export class ExplorerStore {
       this.transaction = memory;
       this.budget.retain(input, memory);
       const result = update();
+      // Event/cancellation bookkeeping can change without publishing a new
+      // view. Keep the prebuilt pressure metadata in step with those changes.
+      if (this.pressureMetadata && this.state === previous)
+        this.publish(this.state);
       this.budget.retain(this.sequences, memory);
       this.budget.retain(this.listingOrders, memory);
       this.budget.retain(this.cancelPending, memory);
@@ -161,6 +172,7 @@ export class ExplorerStore {
     } catch (error) {
       this.state = previous;
       this.pressureState = pressure;
+      this.pressureMetadata = pressureMetadata;
       this.sequences = sequences;
       this.listingOrders = orders;
       this.cancelPending = cancelled;
@@ -168,6 +180,7 @@ export class ExplorerStore {
         // Already built with the current snapshot: signaling pressure allocates
         // no new observation when another owner has exhausted the shared pool.
         this.state = pressure;
+        this.usePressureMetadata();
         return fallback;
       }
       throw error;
@@ -181,12 +194,67 @@ export class ExplorerStore {
   private publish(next: ExplorerState) {
     if (!this.transaction) throw new Error('INVALID_RESERVATION');
     this.budget.retain(next, this.transaction);
-    const pressure = next.resourceLimited
-      ? next
-      : { ...next, resourceLimited: true };
+    const compact = compactClosed(next, this.budget, this.transaction);
+    this.budget.retain(compact, this.transaction);
+    let metadata: typeof this.pressureMetadata;
+    if (compact !== next) {
+      const sequences = new Map<string, number>();
+      const orders = new Map<string, number>();
+      const cancelled = new Set<string>();
+      for (const [id, sequence] of this.sequences)
+        if (compact.tasks.has(id)) sequences.set(id, sequence);
+      for (const id of this.cancelPending)
+        if (compact.tasks.has(id)) cancelled.add(id);
+      const keepOrder = (id: string, category: Category) => {
+        const key = listingKey(id, category);
+        const order = this.listingOrders.get(key);
+        if (order !== undefined) orders.set(key, order);
+      };
+      for (const listing of compact.listings.values())
+        keepOrder(listing.directoryId, listing.category);
+      for (const id of compact.expandedIds) keepOrder(id, 'directories');
+      for (const id of compact.openFileListIds) keepOrder(id, 'files');
+      const selected = compact.selectedId ?? compact.session?.rootEntryId;
+      if (selected) keepOrder(selected, 'directories');
+      metadata = { sequences, orders, cancelled };
+      this.budget.retain(metadata, this.transaction);
+    }
+    const pressure = compact.resourceLimited
+      ? compact
+      : { ...compact, resourceLimited: true };
     this.budget.retain(pressure, this.transaction);
     this.state = next;
     this.pressureState = pressure;
+    this.pressureMetadata = metadata;
+  }
+  private usePressureMetadata() {
+    if (!this.pressureMetadata) return;
+    this.sequences = this.pressureMetadata.sequences;
+    this.listingOrders = this.pressureMetadata.orders;
+    this.cancelPending = this.pressureMetadata.cancelled;
+  }
+  evictClosedListings(): boolean {
+    if (this.state.listings === this.pressureState.listings) return false;
+    this.state = this.pressureState;
+    this.usePressureMetadata();
+    this.listeners.forEach((listener) => listener());
+    return true;
+  }
+  suspendObservations() {
+    const before = this.state;
+    this.state = this.pressureState;
+    this.usePressureMetadata();
+    if (before !== this.state) this.listeners.forEach((listener) => listener());
+  }
+  isListingRequestCurrent(id: string, category: Category, order: number) {
+    return this.listingOrders.get(listingKey(id, category)) === order;
+  }
+  resumeObservations(): boolean {
+    this.evictClosedListings();
+    return this.change(null, false, () => {
+      this.publish({ ...this.state, resourceLimited: false });
+      return true;
+    });
   }
   reset(root: RootData | null) {
     if (root === null) {
@@ -194,6 +262,7 @@ export class ExplorerStore {
       const closed = this.closed[before.mode];
       this.state = closed.state;
       this.pressureState = closed.pressure;
+      this.pressureMetadata = undefined;
       this.sequences = this.emptySequences;
       this.listingOrders = this.emptyOrders;
       this.cancelPending = this.emptyCancelled;
@@ -247,7 +316,11 @@ export class ExplorerStore {
     return this.change(id, undefined, () => {
       const ids = new Set(this.state[key]);
       if (expanded) ids.add(id);
-      else ids.delete(id);
+      else {
+        ids.delete(id);
+        this.listingOrders = new Map(this.listingOrders);
+        this.listingOrders.delete(listingKey(id, category));
+      }
       this.publish({ ...this.state, [key]: ids });
     });
   }
@@ -292,14 +365,13 @@ export class ExplorerStore {
   registerListing(start: ListingStart, requestOrder: number): boolean {
     if (!sameScope(this.state.session, start.work)) return false;
     const key = listingKey(start.directoryId, start.category);
-    if (requestOrder < (this.listingOrders.get(key) ?? -1)) return false;
+    if (requestOrder !== this.listingOrders.get(key)) return false;
     if (!this.acceptsTask(start.work)) return false;
     return this.change(start, false, () => {
       const tasks = new Map(this.state.tasks).set(
         start.work.taskId,
         start.work,
       );
-      this.listingOrders = new Map(this.listingOrders).set(key, requestOrder);
       const prior = this.state.listings.get(key);
       if (prior?.snapshot?.listingRevision === start.listingRevision) {
         this.publish({ ...this.state, tasks });
@@ -320,6 +392,23 @@ export class ExplorerStore {
         },
       });
       this.publish({ ...this.state, tasks, listings });
+      return true;
+    });
+  }
+  beginListing(
+    directoryId: string,
+    category: Category,
+    requestOrder: number,
+  ): boolean {
+    if (this.state.entries.get(directoryId)?.kind !== 'directory') return false;
+    const key = listingKey(directoryId, category);
+    if (requestOrder <= (this.listingOrders.get(key) ?? -1)) return false;
+    return this.change(directoryId, false, () => {
+      this.listingOrders = new Map(this.listingOrders).set(key, requestOrder);
+      const field =
+        category === 'directories' ? 'expandedIds' : 'openFileListIds';
+      const ids = new Set(this.state[field]).add(directoryId);
+      this.publish({ ...this.state, [field]: ids });
       return true;
     });
   }
@@ -430,12 +519,17 @@ export class ExplorerStore {
             return false;
           entries.set(entry.entryId, entry);
         }
-        const entryIds = [
-          ...new Set([
-            ...snapshot.entryIds,
-            ...page.entries.map((entry) => entry.entryId),
-          ]),
-        ];
+        const seen = new Set(snapshot.entryIds);
+        const entryIds = [...snapshot.entryIds];
+        for (const entry of page.entries) {
+          if (!seen.has(entry.entryId)) {
+            seen.add(entry.entryId);
+            entryIds.push(entry.entryId);
+          }
+        }
+        // The dedup scratch also lives until GC. Avoid unowned concatenation
+        // and mapped arrays; keep this one temporary Set on the transaction.
+        this.budget.retain(seen, this.transaction!);
         const nextListing: DirectoryListing = {
           ...listing,
           loadState:

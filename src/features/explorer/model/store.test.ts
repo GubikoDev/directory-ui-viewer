@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { fixtureEntry } from '../adapters/fixture';
 import { ExplorerStore } from './store';
 import { FrontendBudget } from '../runtime/memory';
@@ -47,14 +47,180 @@ const page = (changes: Partial<ListingPage> = {}): ListingPage => ({
 function setup() {
   const store = new ExplorerStore();
   store.reset(root);
+  store.beginListing('A', 'directories', 1);
   store.registerListing(page(), 1);
   return store;
 }
 describe('ExplorerStore observations', () => {
+  it('fits fully visible retention scratch inside the admitted usage transaction', () => {
+    const store = setup();
+    expect(
+      store.applyPage(
+        page({
+          entries: Array.from({ length: 1000 }, (_, i) =>
+            fixtureEntry(`visible-${i}`, 'A'),
+          ),
+          nextCursor: null,
+        }),
+      ),
+    ).toBe(true);
+    const usage: DirectoryUsage = {
+      directoryId: 'A',
+      usageRevision: 1,
+      scanState: 'settled',
+      logical: { state: 'complete', bytes: '123' },
+      allocated: { state: 'complete', bytes: '4096' },
+      observedAt: work.observedAt,
+    };
+    const reserve = store.budget.reserve.bind(store.budget);
+    let pressure!: ReturnType<typeof reserve>;
+    const admitted = vi
+      .spyOn(store.budget, 'reserve')
+      .mockImplementationOnce((bytes, priority) => {
+        const memory = reserve(bytes, priority);
+        // No unreserved pool remains after admission: all publish scratch must
+        // fit the existing transaction allowance, without raising any limit.
+        pressure = reserve(store.budget.available);
+        return memory;
+      });
+    store.applyUsage(root.session, [usage]);
+    expect(admitted).toHaveBeenCalledOnce();
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    expect(store.getSnapshot().entries.size).toBe(1001);
+    expect(store.getSnapshot().usages.get('A')).toEqual(usage);
+    pressure.close();
+    admitted.mockRestore();
+  });
+  it('reclaims obsolete revision entries and tasks while keeping the current open listing', () => {
+    const store = setup();
+    store.applyPage(
+      page({ entries: [fixtureEntry('old', 'A')], nextCursor: null }),
+    );
+    const previous = store.getSnapshot();
+    const replacement = page({
+      work: { ...work, taskId: 'replacement' },
+      listingRevision: 'replacement-revision',
+      entries: [fixtureEntry('new', 'A')],
+      nextCursor: null,
+    });
+    expect(store.beginListing('A', 'directories', 2)).toBe(true);
+    expect(store.registerListing(replacement, 2)).toBe(true);
+    expect(store.applyPage(replacement)).toBe(true);
+    const pressure = store.budget.reserve(store.budget.available);
+    store.setMode('mindmap');
+    expect(store.getSnapshot().resourceLimited).toBe(true);
+    expect([...store.getSnapshot().entries.keys()].sort()).toEqual([
+      'A',
+      'new',
+    ]);
+    expect([...store.getSnapshot().tasks.keys()]).toEqual(['replacement']);
+    expect(store.getListing('A', 'directories').snapshot?.entryIds).toEqual([
+      'new',
+    ]);
+    expect(previous.entries.has('old')).toBe(true);
+    expect(previous.tasks.has('t')).toBe(true);
+    pressure.close();
+  });
+  it('evicts closed payloads without allocation under pressure and explicitly resumes after release', () => {
+    const budget = new FrontendBudget();
+    const store = new ExplorerStore(budget);
+    store.reset(root);
+    store.beginListing('A', 'directories', 1);
+    store.registerListing(page(), 1);
+    store.applyPage(
+      page({
+        entries: [fixtureEntry('B', 'A')],
+        nextCursor: null,
+        coverage: 'complete',
+        work: { ...work, phase: 'completed', sequence: 2 },
+      }),
+    );
+    const files = page({
+      directoryId: 'B',
+      category: 'files',
+      listingRevision: 'files',
+      entries: [fixtureEntry('closed-file', 'B', 'regularFile')],
+      nextCursor: null,
+      coverage: 'complete',
+      work: {
+        ...work,
+        taskId: 'files',
+        operation: 'listFiles',
+        targetId: 'B',
+        phase: 'completed',
+      },
+    });
+    store.beginListing('B', 'files', 2);
+    store.registerListing(files, 2);
+    expect(store.applyPage(files)).toBe(true);
+    store.setExpanded('B', false, 'files');
+    store.select('A');
+    const held = store.getSnapshot();
+    const blocker = budget.reserve(budget.available);
+    store.applyTask({ ...work, phase: 'completed', sequence: 3 });
+    expect(store.getSnapshot().resourceLimited).toBe(true);
+    expect(store.getSnapshot().entries.has('closed-file')).toBe(false);
+    expect(store.getListing('B', 'files').loadState).toBe('notRequested');
+    expect(store.getSnapshot().selectedId).toBe('A');
+    expect(store.getSnapshot().entries.has('B')).toBe(true);
+    expect(held.entries.has('closed-file')).toBe(true);
+    expect(budget.used).toBe(budget.limit);
+    expect(store.resumeObservations()).toBe(false);
+    expect(store.registerListing(files, 2)).toBe(false);
+    expect(store.applyPage(files)).toBe(false);
+    blocker.close();
+    expect(store.resumeObservations()).toBe(true);
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    expect(store.beginListing('B', 'files', 3)).toBe(true);
+    expect(store.registerListing(files, 2)).toBe(false);
+    expect(store.registerListing(files, 3)).toBe(true);
+    expect(store.applyPage(files)).toBe(true);
+  });
+  it('preserves selected descendants and ancestors when their closed sibling payloads are reclaimed', () => {
+    const store = setup();
+    store.applyPage(
+      page({
+        entries: [fixtureEntry('B', 'A')],
+        nextCursor: null,
+        work: { ...work, phase: 'completed', sequence: 2 },
+      }),
+    );
+    const files = page({
+      directoryId: 'B',
+      category: 'files',
+      listingRevision: 'files',
+      entries: [
+        fixtureEntry('selected-file', 'B', 'regularFile'),
+        fixtureEntry('other-file', 'B', 'regularFile'),
+      ],
+      nextCursor: null,
+      work: {
+        ...work,
+        taskId: 'files',
+        operation: 'listFiles',
+        targetId: 'B',
+        phase: 'completed',
+      },
+    });
+    store.beginListing('B', 'files', 2);
+    store.registerListing(files, 2);
+    store.applyPage(files);
+    store.select('selected-file');
+    store.setExpanded('B', false, 'files');
+    expect(store.evictClosedListings()).toBe(true);
+    expect([...store.getSnapshot().entries.keys()].sort()).toEqual([
+      'A',
+      'B',
+      'selected-file',
+    ]);
+    expect(store.getSnapshot().selectedId).toBe('selected-file');
+    expect(store.getSnapshot().tasks.has('files')).toBe(false);
+  });
   it('distinguishes unrequested, pending empty, true empty, and permission failure', () => {
     const store = new ExplorerStore();
     store.reset(root);
     expect(store.getListing('A', 'directories').loadState).toBe('notRequested');
+    store.beginListing('A', 'directories', 1);
     store.registerListing(page(), 1);
     store.applyPage(page());
     expect(store.getListing('A', 'directories').loadState).toBe('loading');
@@ -134,6 +300,7 @@ describe('ExplorerStore observations', () => {
 
   it('rejects same-scope late listing starts by local request order', () => {
     const store = setup();
+    store.beginListing('A', 'directories', 3);
     store.registerListing(
       page({ listingRevision: 'r2', work: { ...work, taskId: 't2' } }),
       3,
@@ -214,6 +381,7 @@ describe('ExplorerStore observations', () => {
     const budget = new FrontendBudget();
     const store = new ExplorerStore(budget);
     store.reset(root);
+    store.beginListing('A', 'directories', 1);
     store.registerListing(page(), 1);
     const before = store.getSnapshot();
     const blocker = budget.reserve(budget.limit - budget.used);
@@ -258,14 +426,15 @@ describe('ExplorerStore observations', () => {
     blocker.close();
   });
   it('charges task and usage maps, preserves older snapshots and rejects both under shared pressure', () => {
+    const scan: WorkRecord = { ...work, operation: 'scanUsage' };
     const budget = new FrontendBudget();
     const store = new ExplorerStore(budget);
     store.reset(root);
     const baseline = budget.used;
-    expect(store.applyTask(work)).toBe(true);
+    expect(store.applyTask(scan)).toBe(true);
     expect(budget.used).toBeGreaterThan(baseline);
     const old = store.getSnapshot();
-    expect(store.applyTask({ ...work, sequence: 2 })).toBe(true);
+    expect(store.applyTask({ ...scan, sequence: 2 })).toBe(true);
     expect(old.tasks.get('t')?.sequence).toBe(1);
     expect(store.getSnapshot().tasks.get('t')?.sequence).toBe(2);
     const beforeUsage = budget.used;
@@ -275,7 +444,7 @@ describe('ExplorerStore observations', () => {
       scanState: 'settled',
       logical: { state: 'complete', bytes: '123' },
       allocated: { state: 'complete', bytes: '4096' },
-      observedAt: work.observedAt,
+      observedAt: scan.observedAt,
     };
     store.applyUsage(root.session, [usage]);
     expect(budget.used).toBeGreaterThan(beforeUsage);
@@ -283,14 +452,14 @@ describe('ExplorerStore observations', () => {
     const blocker = budget.reserve(budget.limit - budget.used);
     store.applyUsage(root.session, [{ ...usage, usageRevision: 2 }]);
     expect(store.getSnapshot().usages).toBe(before.usages);
-    expect(store.applyTask({ ...work, taskId: 'new', sequence: 3 })).toBe(
+    expect(store.applyTask({ ...scan, taskId: 'new', sequence: 3 })).toBe(
       false,
     );
     expect(store.getSnapshot().tasks).toBe(before.tasks);
     expect(store.getSnapshot().resourceLimited).toBe(true);
     expect(budget.peak).toBe(budget.limit);
     blocker.close();
-    expect(store.applyTask({ ...work, sequence: 3 })).toBe(true);
+    expect(store.applyTask({ ...scan, sequence: 3 })).toBe(true);
     expect(old.tasks.get('t')?.sequence).toBe(1);
   });
 });

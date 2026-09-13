@@ -113,7 +113,12 @@ export function App({ client: provided }: { client?: SessionClient }) {
         <p role="alert">{error || state.failedRoot?.issue.code}</p>
       )}
       {state.resourceLimited && (
-        <p role="status">메모리 한도에 도달했습니다.</p>
+        <div>
+          <p role="status">메모리 한도에 도달했습니다.</p>
+          <button onClick={() => run(() => client.retryObservations())}>
+            관측 다시 읽기
+          </button>
+        </div>
       )}
       {entry && (
         <section aria-label="현재 폴더">
@@ -131,6 +136,13 @@ export function App({ client: provided }: { client?: SessionClient }) {
             >
               파일 목록 보기
             </button>
+            {state.openFileListIds.has(entry.entryId) && (
+              <button
+                onClick={() => client.closeListing(entry.entryId, 'files')}
+              >
+                파일 목록 닫기
+              </button>
+            )}
             <button onClick={() => run(() => client.scan())}>용량 집계</button>
           </div>
           <ul

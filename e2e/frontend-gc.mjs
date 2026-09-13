@@ -17,6 +17,7 @@ try {
     'runtime/issue-log',
     'model/types',
     'model/store',
+    'model/retention',
     'adapters/fixture',
     'adapters/encoding',
     'adapters/inbox',
@@ -228,6 +229,90 @@ try {
       engine: 'Node V8; not WKWebView',
       whileStopRetained,
       afterStopRelease: eventBudget.used,
+    }),
+  );
+  const retainedBudget = new FrontendBudget();
+  const compactStore = new ExplorerStore(retainedBudget);
+  await settle();
+  const compactBaseline = retainedBudget.used;
+  let closedSnapshot = (() => {
+    const scope = { sessionId: 'owned', generation: 1 };
+    compactStore.reset({
+      root: fixtureEntry('A', null),
+      session: {
+        ...scope,
+        rootEntryId: 'A',
+        platform: 'fixture',
+        capacity: { foreground: 'available', background: 'available' },
+      },
+    });
+    const issues = { counts: {}, samples: [] };
+    function publish(id, category, entries, order) {
+      const work = {
+        ...scope,
+        taskId: 'task-' + order,
+        operation: category === 'files' ? 'listFiles' : 'listDirectories',
+        targetId: id,
+        phase: 'completed',
+        sequence: 1,
+        processedEntries: String(entries.length),
+        processedDirectories: '0',
+        observedAt: '2026-09-14T00:00:00Z',
+        issues,
+      };
+      const page = {
+        work,
+        directoryId: id,
+        category,
+        listingRevision: 'revision-' + order,
+        entries,
+        cursor: null,
+        nextCursor: null,
+        coverage: 'complete',
+        issues,
+      };
+      assert(compactStore.beginListing(id, category, order));
+      assert(compactStore.registerListing(page, order));
+      assert(compactStore.applyPage(page));
+    }
+    publish('A', 'directories', [fixtureEntry('B', 'A')], 1);
+    publish(
+      'B',
+      'files',
+      Array.from({ length: 300 }, (_, i) =>
+        fixtureEntry('file-' + i, 'B', 'regularFile'),
+      ),
+      2,
+    );
+    compactStore.setExpanded('B', false, 'files');
+    const held = compactStore.getSnapshot();
+    const pressure = retainedBudget.reserve(retainedBudget.available);
+    compactStore.setMode('mindmap');
+    assert.equal(compactStore.getSnapshot().entries.size, 2);
+    assert.equal(held.entries.size, 302);
+    assert.equal(retainedBudget.used, retainedBudget.limit);
+    pressure.close();
+    assert(compactStore.resumeObservations());
+    return held;
+  })();
+  await settle();
+  const whileClosedSnapshotRetained = retainedBudget.used;
+  assert.equal(closedSnapshot.entries.size, 302);
+  closedSnapshot = undefined;
+  await settle();
+  const afterClosedSnapshotRelease = retainedBudget.used;
+  assert(afterClosedSnapshotRelease < whileClosedSnapshotRetained);
+  assert.equal(compactStore.getSnapshot().entries.size, 2);
+  compactStore.reset(null);
+  await settle();
+  assert.equal(retainedBudget.used, compactBaseline);
+  console.log(
+    JSON.stringify({
+      engine: 'Node V8; not WKWebView',
+      compactBaseline,
+      whileClosedSnapshotRetained,
+      afterClosedSnapshotRelease,
+      afterCompactStoreReset: retainedBudget.used,
     }),
   );
 } finally {
