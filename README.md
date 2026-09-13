@@ -54,8 +54,9 @@ The application will ask the user to choose a root directory through the native 
 
 Open `project-notes/` as an Obsidian Vault. It is an independent local Git
 repository, excluded from this application repository. Commit documentation
-changes from inside that folder. Obsidian settings are untracked; no remote
-is configured. The Vault is not included when cloning the application.
+changes from inside that folder and push to its separately configured private
+remote. Obsidian settings are untracked. The Vault is not included when cloning
+the application.
 
 ## License
 
