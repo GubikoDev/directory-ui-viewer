@@ -20,6 +20,18 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('SessionClient with deterministic adapter', () => {
+  it('does not throw a synchronous recovery admission failure through an event producer', async () => {
+    const budget = new FrontendBudget();
+    const { client, adapter, store } = setup(new FixtureAdapter(), budget);
+    adapter.deferTasks = true;
+    await client.chooseRoot();
+    const task = [...store.getSnapshot().tasks.values()][0];
+    vi.spyOn(store, 'acceptEvent').mockReturnValue(true);
+    const blocker = budget.reserve(budget.limit - budget.used);
+    expect(() => adapter.finish(task.taskId)).not.toThrow();
+    expect(client.errors.at(-1)?.message).toBe('RESOURCE_LIMIT');
+    blocker.close();
+  });
   it('does not hold close behind an unresolved listing start response', async () => {
     const { client, adapter, store } = setup();
     await client.chooseRoot();

@@ -85,11 +85,17 @@ export class SessionClient {
       if (lifecycle !== this.lifecycle) return;
       this.epoch = epoch;
       const unsubscribe = await this.adapter.subscribe((event) => {
-        if (!this.store.acceptEvent(event)) return;
-        this.lastEvent.set(event.taskId, this.now());
-        void this.synchronize(event.taskId).catch((error) =>
-          this.report(error),
-        );
+        try {
+          if (!this.store.acceptEvent(event)) return;
+          this.lastEvent.set(event.taskId, this.now());
+          void this.synchronize(event.taskId).catch((error) =>
+            this.report(error),
+          );
+        } catch (error) {
+          // Admission can fail synchronously before a Promise exists. Hints
+          // must not throw through the adapter's event producer.
+          this.report(error);
+        }
       });
       if (lifecycle !== this.lifecycle) {
         unsubscribe();
