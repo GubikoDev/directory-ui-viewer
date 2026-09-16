@@ -3,6 +3,60 @@ import { ReplyInbox } from './inbox';
 import { FrontendBudget, ownBytes } from '../runtime/memory';
 
 describe('native response inbox', () => {
+  it('waits for admission and lets close pass an admitted, unfinished picker', async () => {
+    const inbox = new ReplyInbox(8192, 3, new FrontendBudget());
+    inbox.open('picker');
+    inbox.open('read');
+    inbox.open('close', true);
+    const sent: string[] = [];
+    let finishPicker!: () => void;
+    const picker = inbox.dispatch('picker', () => {
+      sent.push('picker');
+      return new Promise<void>((resolve) => {
+        finishPicker = resolve;
+      });
+    });
+    const read = inbox.dispatch('read', async () => {
+      sent.push('read');
+    });
+    const close = inbox.dispatch(
+      'close',
+      async () => {
+        sent.push('close');
+      },
+      true,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sent).toEqual(['picker']);
+    expect(inbox.admit('missing')).toBe(false);
+    expect(inbox.admit('picker')).toBe(true);
+    expect(inbox.admit('picker')).toBe(false);
+    await read;
+    await close;
+    expect(sent).toEqual(['picker', 'read', 'close']);
+    finishPicker();
+    await picker;
+    for (const key of ['picker', 'read', 'close']) inbox.close(key);
+    expect(inbox.pending).toBe(0);
+  });
+  it('releases admission after a pre-admission failure without poisoning later requests', async () => {
+    const inbox = new ReplyInbox(8192, 2, new FrontendBudget());
+    inbox.open('rejected');
+    inbox.open('next');
+    const rejected = inbox.dispatch('rejected', async () => {
+      throw new Error('CLIENT_EXPIRED');
+    });
+    let called = false;
+    const next = inbox.dispatch('next', async () => {
+      called = true;
+    });
+    await expect(rejected).rejects.toThrow('CLIENT_EXPIRED');
+    await next;
+    expect(called).toBe(true);
+    inbox.close('rejected');
+    inbox.close('next');
+  });
   it('protects admitted mutation bytes from later inbox saturation', () => {
     const inbox = new ReplyInbox(32 * 1024, 3, new FrontendBudget());
     inbox.open('mutation', false, 16 * 1024);

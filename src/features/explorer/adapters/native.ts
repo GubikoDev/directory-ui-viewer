@@ -120,17 +120,22 @@ export class NativeAdapter implements FilesystemAdapter {
       const key = responseKey();
       inbox.open(key, priority, replyCredit(operation));
       release = () => inbox.close(key);
-      await this.call(
-        'filesystem_request',
-        () => ({
-          documentProof: document,
-          responseKey: key,
-          request: {
-            protocolVersion,
-            requestId,
-            body: { ...fields, operation },
-          },
-        }),
+      await inbox.dispatch(
+        key,
+        () =>
+          this.call<void>(
+            'filesystem_request',
+            () => ({
+              documentProof: document,
+              responseKey: key,
+              request: {
+                protocolVersion,
+                requestId,
+                body: { ...fields, operation },
+              },
+            }),
+            priority,
+          ),
         priority,
       );
       return inbox.parse(key) as Response<T>;

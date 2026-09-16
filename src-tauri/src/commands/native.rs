@@ -387,6 +387,9 @@ pub async fn filesystem_request(
     let hash = replay::fingerprint(&input.request).map_err(control)?;
     let epoch = number.epoch;
     let mutation_bytes = mutation_reply_bytes(&input.request.body);
+    let admission_ack =
+        super::delivery::Delivery::admission(&input.document_proof, &input.response_key, &budget)
+            .map_err(|_| issue("RESOURCE_LIMIT"))?;
     let (waiter, delivery) = {
         // Admission and immediate control effects have one order. Only native
         // picker/worker waits outlive this lock; no filesystem call runs here.
@@ -420,6 +423,19 @@ pub async fn filesystem_request(
         };
         (waiter, delivery)
     };
+    // Immediate control effects have happened, while picker/disk waits remain
+    // independent. JS may now send its next monotonically numbered request.
+    let admitted = admission_ack
+        .submit(|script, callback| {
+            window
+                .eval_with_callback(script, callback)
+                .map_err(|_| super::delivery::DeliveryError::Disconnected)
+        })
+        .map_err(|_| issue("CLIENT_EXPIRED"))?;
+    tokio::time::timeout(Duration::from_secs(10), admitted.wait())
+        .await
+        .map_err(|_| issue("CLIENT_EXPIRED"))?
+        .map_err(|_| issue("CLIENT_EXPIRED"))?;
     let reply = waiter.wait().await.map_err(control)?;
     state.current(&context)?;
     let delivery = match delivery {

@@ -91,6 +91,22 @@ pub fn valid_key(key: &str) -> bool {
     key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit())
 }
 impl Delivery {
+    /// Acknowledge ordered admission separately from the eventual response.
+    /// Reserve before effects; the proof/key gate cannot grant filesystem access.
+    pub fn admission(proof: &str, key: &str, budget: &ByteBudget) -> Result<Self, DeliveryError> {
+        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) || !valid_key(key) {
+            return Err(DeliveryError::InvalidArgument);
+        }
+        let memory = budget
+            .reserve(4096)
+            .map_err(|_| DeliveryError::ResourceLimit)?;
+        Ok(Self {
+            script: format!(
+                "(()=>{{if(window.__DIRECTORY_DOCUMENT_PROOF__!==\"{proof}\")return false;const admit=window.__DIRECTORY_ADMIT__;return typeof admit===\"function\"&&admit(\"{key}\")===true;}})()"
+            ),
+            memory: Arc::new(memory),
+        })
+    }
     /// Event delivery has one native receiver loop and no framework event queue.
     /// A missing subscriber, stale document or resource pressure drops the hint.
     pub fn work_event(
@@ -211,6 +227,37 @@ impl Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admission_ack_is_proof_gated_and_keeps_abandoned_callback_charged() {
+        let budget = ByteBudget::new(4096);
+        let proof = "a".repeat(64);
+        let key = "b".repeat(32);
+        let mut queued = None;
+        let receipt = Delivery::admission(&proof, &key, &budget)
+            .unwrap()
+            .submit(|script, callback| {
+                assert!(script.contains(&format!(
+                    "window.__DIRECTORY_DOCUMENT_PROOF__!==\"{proof}\""
+                )));
+                assert!(script.contains(&format!("admit(\"{key}\")===true")));
+                assert!(script.len() < 512);
+                queued = Some((script, callback));
+                Ok(())
+            })
+            .unwrap();
+        drop(receipt);
+        assert_eq!(budget.used(), 4096);
+        assert!(Delivery::admission(&proof, &key, &budget).is_err());
+        let (script, callback) = queued.take().unwrap();
+        callback("true".into());
+        assert_eq!(budget.used(), 4096);
+        drop(script);
+        drop(callback);
+        assert_eq!(budget.used(), 0);
+        assert!(Delivery::admission("bad", &key, &budget).is_err());
+        assert!(Delivery::admission(&proof, "bad", &budget).is_err());
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn event_scripts_quote_untrusted_fields_and_keep_abandoned_costs_bounded() {
         let budget = ByteBudget::new(64 * 1024);

@@ -14,9 +14,11 @@ export class ReplyInbox {
       capacity: number;
       memory: FrontendReservation;
       priority: boolean;
+      admit?: () => void;
     }
   >;
   private used = 0;
+  private dispatchTail = Promise.resolve();
   constructor(
     private readonly maxBytes = 8 * 1024 * 1024,
     private readonly maxPending = 256,
@@ -46,6 +48,43 @@ export class ReplyInbox {
   get pending() {
     return this.slots.size;
   }
+  /** Serialize native admission, not picker/worker completion. */
+  dispatch(key: string, action: () => Promise<void>, priority = false) {
+    const slot = this.slots.get(key);
+    if (!slot || slot.admit) throw new Error('INVALID_ARGUMENT');
+    const memory = this.budget.reserve(24 * 1024, priority);
+    try {
+      let resolve!: () => void;
+      const admitted = new Promise<void>((done) => {
+        resolve = done;
+      });
+      this.budget.retainLifetimeFrom(admitted, memory, 8 * 1024);
+      const release = () => resolve();
+      // The receiver can outlive the awaited promise. Charge its closure until
+      // its own GC, including the deferred resolver it holds.
+      this.budget.retainLifetimeFrom(release, memory, 8 * 1024);
+      const result = this.dispatchTail.then(async () => {
+        try {
+          await action();
+        } finally {
+          release();
+        }
+      });
+      this.budget.retainLifetimeFrom(result, memory, 8 * 1024);
+      slot.admit = release;
+      this.dispatchTail = admitted;
+      return result;
+    } finally {
+      memory.close();
+    }
+  }
+  admit = (key: string): boolean => {
+    const slot = this.slots.get(key);
+    if (!slot?.admit) return false;
+    slot.admit();
+    slot.admit = undefined;
+    return true;
+  };
   open(key: string, priority = false, replyCredit = 0) {
     if (this.slots.has(key)) throw new Error('INVALID_ARGUMENT');
     const capacity = Math.max(512, replyCredit);
@@ -129,6 +168,7 @@ export function nativeInbox(
 ): ReplyInbox {
   const target = window as Window & {
     __DIRECTORY_RECEIVE__?: ReplyInbox['receive'];
+    __DIRECTORY_ADMIT__?: ReplyInbox['admit'];
   };
   inbox ??= new ReplyInbox(
     8 * 1024 * 1024,
@@ -145,6 +185,12 @@ export function nativeInbox(
       value: inbox.receive,
     });
   if (target.__DIRECTORY_RECEIVE__ !== inbox.receive)
+    throw new Error('CLIENT_EXPIRED');
+  if (!target.__DIRECTORY_ADMIT__)
+    Object.defineProperty(target, '__DIRECTORY_ADMIT__', {
+      value: inbox.admit,
+    });
+  if (target.__DIRECTORY_ADMIT__ !== inbox.admit)
     throw new Error('CLIENT_EXPIRED');
   return inbox;
 }
