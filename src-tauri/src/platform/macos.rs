@@ -1,6 +1,6 @@
-//! Object capabilities for trusted native code; none of these types deserialize.
-//! Paths are accepted only for the native picker's initial candidate. Directory
-//! reads and child acquisition subsequently use owned handles and raw components.
+//! Native approval and metadata checks around walkdir directory enumeration.
+//! Paths originate only from the native picker and validated child components.
+//! Moving a directory can expire access; it does not approve its replacement.
 use crate::{
     runtime::memory::{ByteBudget, Reservation},
     scheduler::{HandleBudget, HandlePermit},
@@ -13,7 +13,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,11 +21,8 @@ use std::{
 };
 
 const O_RESOLVE_BENEATH: i32 = 0x00001000; // Installed macOS SDK sys/fcntl.h.
-const ATTR_CMN_ERROR: u32 = 0x20000000; // Installed SDK sys/attr.h.
 const O_NOFOLLOW_ANY: i32 = 0x20000000;
 const FLAGS: i32 = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | O_NOFOLLOW_ANY;
-// Fixed syscall buffer avoids libc fdopendir union-stack read-all allocation.
-const BUFFER_BYTES: usize = 16 * 1024;
 const HANDLE_BYTES: usize = 2048;
 
 #[derive(Debug)]
@@ -106,6 +103,7 @@ impl Grant {
 // A tag identifies the exact parent capability, never just its display path.
 struct ParentTag;
 pub struct Directory {
+    path: PathBuf,
     fd: OwnedFd,
     _permit: HandlePermit,
     grant: Arc<Grant>,
@@ -195,6 +193,7 @@ impl ApprovedRoot {
         let mount = mount_fd(fd.as_raw_fd())?;
         Ok(Self {
             directory: Directory {
+                path: canonical,
                 fd,
                 _permit: permit,
                 _memory: reservation,
@@ -229,8 +228,20 @@ impl Directory {
     pub fn identity(&self) -> Identity {
         self.identity
     }
-    pub fn metadata(&self) -> Result<libc::stat> {
+    /// Check that the saved path still names this directory. Temporary handles
+    /// are scoped to this call; no path is sent over IPC or included in errors.
+    fn validate_path(&self) -> Result<()> {
         self.grant.check()?;
+        let path = CString::new(self.path.as_os_str().as_bytes())
+            .map_err(|_| BoundaryError::InvalidComponent)?;
+        let fd = owned(unsafe { libc::open(path.as_ptr(), FLAGS) })?;
+        if Identity::of(&stat_fd(fd.as_raw_fd())?) != self.identity {
+            return Err(BoundaryError::ChangedObject);
+        }
+        self.grant.check()
+    }
+    pub fn metadata(&self) -> Result<libc::stat> {
+        self.validate_path()?;
         let stat = stat_fd(self.fd.as_raw_fd())?;
         self.grant.check()?;
         Ok(stat)
@@ -269,6 +280,7 @@ impl Directory {
         self.open_component(&child.name, Some(Identity::of(&child.stat)))
     }
     fn open_component(&self, name: &CStr, expected: Option<Identity>) -> Result<Directory> {
+        self.validate_path()?;
         let (permit, reservation) = self.grant.reserve()?;
         // Operations admitted before revoke may drain. Neither errors nor
         // successful results from that interval are published after revocation.
@@ -291,6 +303,11 @@ impl Directory {
         }
         self.grant.check()?;
         Ok(Directory {
+            path: if name.to_bytes() == b"." {
+                self.path.clone()
+            } else {
+                self.path.join(std::ffi::OsStr::from_bytes(name.to_bytes()))
+            },
             fd,
             _permit: permit,
             _memory: reservation,
@@ -305,26 +322,28 @@ impl Directory {
         let directory = self.open_component(c".", Some(self.identity))?;
         directory.into_cursor()
     }
-    pub fn into_cursor(mut self) -> Result<DirectoryCursor> {
-        self.grant.check()?;
-        self._memory
-            .resize(HANDLE_BYTES + BUFFER_BYTES)
-            .map_err(|_| BoundaryError::ResourceLimit)?;
+    pub fn into_cursor(self) -> Result<DirectoryCursor> {
+        self.validate_path()?;
+        let entries = walkdir::WalkDir::new(&self.path)
+            .min_depth(1)
+            .max_depth(1)
+            .follow_links(false)
+            .follow_root_links(false)
+            .max_open(1)
+            .into_iter();
         Ok(DirectoryCursor {
+            entries,
             directory: Arc::new(self),
-            buffer: Box::new([0; BUFFER_BYTES / 8]),
-            offset: 0,
-            remaining: 0,
             ended: false,
         })
     }
 }
-/// Exclusively owned cursor with a fixed aligned buffer. No libc DIR caches.
+/// A streaming walkdir cursor. UsageScanner owns subtree scheduling/aggregation,
+/// so max_depth(1) avoids a second recursive walk and preserves lazy listings.
+/// Library allocations are not included in our application's reservation meter.
 pub struct DirectoryCursor {
-    buffer: Box<[u64; BUFFER_BYTES / 8]>,
+    entries: walkdir::IntoIter,
     directory: Arc<Directory>,
-    offset: usize,
-    remaining: usize,
     ended: bool,
 }
 impl DirectoryCursor {
@@ -335,157 +354,44 @@ impl DirectoryCursor {
         &self.directory
     }
     pub fn next_name(&mut self) -> Result<Option<Vec<u8>>> {
-        loop {
-            self.directory.grant.check()?;
-            if self.remaining == 0 {
-                if self.ended {
-                    return Ok(None);
-                }
-                let mut attrs = libc::attrlist {
-                    bitmapcount: libc::ATTR_BIT_MAP_COUNT as u16,
-                    reserved: 0,
-                    commonattr: libc::ATTR_CMN_NAME
-                        | libc::ATTR_CMN_RETURNED_ATTRS
-                        | ATTR_CMN_ERROR,
-                    volattr: 0,
-                    dirattr: 0,
-                    fileattr: 0,
-                    forkattr: 0,
-                };
-                self.buffer.fill(0);
-                let count = unsafe {
-                    libc::getattrlistbulk(
-                        self.directory.fd.as_raw_fd(),
-                        (&mut attrs as *mut libc::attrlist).cast(),
-                        self.buffer.as_mut_ptr().cast(),
-                        BUFFER_BYTES,
-                        libc::FSOPT_PACK_INVAL_ATTRS as u64,
-                    )
-                };
-                let error = io::Error::last_os_error();
-                self.directory.grant.check()?;
-                if count < 0 {
-                    // A failed bulk read has no trustworthy continuation.
+        self.directory.grant.check()?;
+        if self.ended {
+            return Ok(None);
+        }
+        // Reject ordinary move/replacement and permission changes. This is not
+        // an atomic snapshot across concurrent filesystem mutations.
+        if let Err(error) = self.directory.validate_path() {
+            self.ended = true;
+            return Err(error);
+        }
+        let next = self.entries.next();
+        self.directory.grant.check()?;
+        match next {
+            Some(Ok(entry)) => {
+                self.directory
+                    .validate_path()
+                    .inspect_err(|_| self.ended = true)?;
+                let name = entry.file_name().as_bytes();
+                component(name)?;
+                Ok(Some(name.to_vec()))
+            }
+            Some(Err(error)) => {
+                let entry_only = error.depth() > 0;
+                let error = error
+                    .into_io_error()
+                    .unwrap_or_else(|| io::Error::from_raw_os_error(libc::EIO));
+                if entry_only {
+                    Err(BoundaryError::EntryNative(error))
+                } else {
                     self.ended = true;
-                    return Err(error.into());
-                }
-                self.remaining = count as usize;
-                self.offset = 0;
-                if count == 0 {
-                    self.ended = true;
-                    return Ok(None);
+                    Err(BoundaryError::Native(error))
                 }
             }
-            let bytes = unsafe {
-                std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), BUFFER_BYTES)
-            };
-            let parsed = parse_name(bytes, self.offset);
-            match parsed {
-                Ok((length, name)) => {
-                    self.offset += length;
-                    self.remaining -= 1;
-                    let name = name.map_err(|e| match e {
-                        BoundaryError::Native(e) => BoundaryError::EntryNative(e),
-                        other => other,
-                    })?;
-                    if name == b"." || name == b".." {
-                        continue;
-                    }
-                    // The record boundary is intact: reject this component only
-                    // and allow later siblings. Malformed records end the cursor.
-                    component(name)?;
-                    return Ok(Some(name.to_vec()));
-                }
-                Err(error) => {
-                    self.remaining = 0;
-                    self.ended = true;
-                    return Err(error);
-                }
+            None => {
+                self.ended = true;
+                Ok(None)
             }
         }
-    }
-}
-// Packed output: uint32 length, attribute_set_t (5 uint32), error, name ref.
-// Parse integers from slices so malformed offsets cannot cause pointer UB.
-fn parse_name(bytes: &[u8], offset: usize) -> Result<(usize, Result<&[u8]>)> {
-    fn bad() -> BoundaryError {
-        BoundaryError::Native(io::Error::from_raw_os_error(libc::EIO))
-    }
-    fn word(bytes: &[u8], at: usize) -> Result<u32> {
-        let raw = bytes
-            .get(at..at.checked_add(4).ok_or_else(bad)?)
-            .ok_or_else(bad)?;
-        Ok(u32::from_ne_bytes(raw.try_into().map_err(|_| bad())?))
-    }
-    let record = bytes.get(offset..).ok_or_else(bad)?;
-    let len = word(record, 0)? as usize;
-    if len < 36 || len % 8 != 0 {
-        return Err(bad());
-    }
-    let record = record.get(..len).ok_or_else(bad)?;
-    let returned = word(record, 4)?;
-    let error = word(record, 24)?;
-    if returned & ATTR_CMN_ERROR != 0 && error != 0 {
-        return Ok((len, Err(io::Error::from_raw_os_error(error as i32).into())));
-    }
-    if returned & libc::ATTR_CMN_NAME == 0 {
-        return Err(bad());
-    }
-    let displacement = word(record, 28)? as i32;
-    let name_len = word(record, 32)? as usize;
-    let start = 28usize
-        .checked_add_signed(displacement as isize)
-        .ok_or_else(bad)?;
-    let end = start.checked_add(name_len).ok_or_else(bad)?;
-    if start < 36 || name_len < 1 {
-        return Err(bad());
-    }
-    let name = record.get(start..end).ok_or_else(bad)?;
-    if name.last() != Some(&0) {
-        return Err(bad());
-    }
-    Ok((len, Ok(&name[..name_len - 1])))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn parser_checks_record_name_offsets_and_error_rows() {
-        fn put(b: &mut [u8], i: usize, v: u32) {
-            b[i..i + 4].copy_from_slice(&v.to_ne_bytes())
-        }
-        let mut b = [0u8; 48];
-        put(&mut b, 0, 48);
-        put(&mut b, 4, libc::ATTR_CMN_NAME | ATTR_CMN_ERROR);
-        put(&mut b, 28, 8);
-        put(&mut b, 32, 5);
-        b[36..41].copy_from_slice(b"test\0");
-        assert_eq!(parse_name(&b, 0).unwrap().1.unwrap(), b"test");
-        for (i, v) in [
-            (0, 0),
-            (0, 49),
-            (0, 32),
-            (28, u32::MAX),
-            (28, 100),
-            (32, 0),
-            (32, 100),
-            (4, 0),
-        ] {
-            let mut invalid = b;
-            put(&mut invalid, i, v);
-            assert!(parse_name(&invalid, 0).is_err());
-        }
-        let mut invalid = b;
-        invalid[40] = 1;
-        assert!(parse_name(&invalid, 0).is_err());
-        for offset in [1, 47, 48, usize::MAX] {
-            assert!(parse_name(&b, offset).is_err())
-        }
-        put(&mut b, 24, libc::EACCES as u32);
-        assert!(
-            matches!(parse_name(&b,0).unwrap().1,Err(BoundaryError::Native(e)) if e.raw_os_error()==Some(libc::EACCES))
-        );
     }
 }
 

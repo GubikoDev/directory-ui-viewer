@@ -239,7 +239,7 @@ fn replacement_is_not_exposed_under_old_id_and_ancestor_replacement_blocks_reacq
     );
 }
 #[test]
-fn root_move_keeps_original_listing_and_pre_cancelled_resolution_opens_nothing() {
+fn root_move_requires_reselection_and_pre_cancelled_resolution_opens_nothing() {
     let f = Fixture::new();
     fs::write(f.p("root/original"), b"").unwrap();
     let setup = Setup::new(&f, 300_000, 2);
@@ -260,13 +260,17 @@ fn root_move_keeps_original_listing_and_pre_cancelled_resolution_opens_nothing()
     assert_eq!(setup.scheduler.handles().open(), 1);
     let handle = setup.start(&setup.id, Category::Files, 0);
     let (rows, coverage) = setup.collect(&handle, 0);
-    assert_eq!(coverage, Coverage::Complete);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].display_name, "original");
-    assert_eq!(
-        setup.scheduler.handles().peak(),
-        2,
-        "native cursor is not charged twice"
+    assert_eq!(coverage, Coverage::Partial);
+    assert!(rows.is_empty());
+    assert!(
+        setup
+            .service
+            .work(&handle.task_id, 0)
+            .unwrap()
+            .issues
+            .samples
+            .iter()
+            .any(|error| error.code == "ENTRY_CHANGED")
     );
 }
 #[test]

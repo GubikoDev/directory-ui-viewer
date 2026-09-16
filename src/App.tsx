@@ -1,3 +1,4 @@
+import engineLicenses from '../licenses/THIRD-PARTY-NOTICES.txt?raw';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createAdapter } from './features/explorer/adapters/create';
 import { SessionClient } from './features/explorer/client/session-client';
@@ -206,6 +207,12 @@ export function App({ client: provided }: { client?: SessionClient }) {
           })}
         />
       )}
+      <details className="mt-6 text-sm text-slate-400">
+        <summary className="cursor-pointer">
+          오픈소스 라이선스 · 탐색 엔진
+        </summary>
+        <pre className="mt-2 whitespace-pre-wrap">{engineLicenses}</pre>
+      </details>
     </main>
   );
 }

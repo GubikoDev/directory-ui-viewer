@@ -1,4 +1,5 @@
-//! Charge every source-owned directory cursor to the application's shared FD pool.
+//! Share native approval-handle permits, or charge non-native source cursors.
+//! walkdir-owned directory streams are bounded separately by cursor depth.
 use super::usage::{Observation, ObservationSource};
 use crate::{
     domain::model::{FsIssue, IssueScope},

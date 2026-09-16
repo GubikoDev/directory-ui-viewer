@@ -27,6 +27,9 @@
   },
   "bundle": {
     "active": false,
-    "targets": ["dmg", "appimage"]
+    "targets": ["dmg", "appimage"],
+    "resources": {
+      "../licenses/": "licenses/"
+    }
   }
 }

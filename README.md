@@ -5,9 +5,9 @@ A local-first visual directory explorer for macOS and Linux. The project aims to
 ## Status
 
 The internal directory listing, usage aggregation, cancellation, and typed
-adapters are implemented with a temporary verification screen. Native security,
-whole-application resource accounting, and macOS integration acceptance remain
-in progress; unit tests and engine benchmarks alone do not establish completion.
+adapters use a walkdir-backed macOS engine with a temporary verification screen.
+See [the internal engine scope and validation](docs/internal-engine.md). The
+previous native enumeration implementation is retained in `src-tauri/legacy/`.
 
 The first implementation targets macOS. Rust CI checks both macOS and Linux;
 Linux release support remains a later milestone. The frontend uses a typed
@@ -56,10 +56,10 @@ Validate the environment with `npm run build`, `npm test`, `npm run lint`,
 
 ## Filesystem Security Direction
 
-The native picker approves the successfully opened directory object. Safely
-opened descendant directory objects remain approved after moves; refresh keeps
-the original root handle. A replacement at the old path is never automatically
-approved. The read-only boundary preserves mount boundaries and OS permission
+The native picker approves the successfully opened directory object. Moving or
+replacing a directory may expire access and require selecting it again. Refresh
+checks the saved path against the original identity; a replacement at that path
+is never automatically approved. The read-only boundary preserves mount boundaries and OS permission
 failures, rejects symlink target traversal, and revokes new operations on close
 while existing calls drain. There is no static whole-disk scope.
 
@@ -79,4 +79,8 @@ the application.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The walkdir engine uses the MIT option for walkdir 2.5.0 and
+same-file 1.0.6. Their unmodified copyright and license texts are preserved in
+[licenses/](licenses/THIRD-PARTY-NOTICES.txt), displayed in the application, and
+included as desktop bundle resources. This notice inventory covers the engine
+addition, not the full pre-existing Tauri/React dependency tree.

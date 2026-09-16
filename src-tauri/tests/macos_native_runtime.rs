@@ -138,10 +138,7 @@ fn real_session_flow_refreshes_same_object_expires_ids_and_closes_all_resources(
         .unwrap();
     assert!(matches!(summary[0].logical, Measure::Complete { .. }));
     drop(summary);
-    fs::rename(f.p("root"), f.p("original")).unwrap();
-    fs::create_dir(f.p("root")).unwrap();
-    fs::write(f.p("root/replacement-secret"), b"wrong").unwrap();
-    fs::write(f.p("original/current"), b"yes").unwrap();
+    fs::write(f.p("root/current"), b"yes").unwrap();
     let ticket = runtime.begin_refresh(&context(1), epoch, &old).unwrap();
     assert_eq!(
         runtime
@@ -372,7 +369,7 @@ fn refresh_failure_keeps_new_generation_failed_and_retry_keeps_original_grant() 
     assert_eq!(
         resources.scheduler.handles().peak(),
         1,
-        "refresh never reopens root pathname"
+        "refresh preserves the original persistent grant"
     );
 }
 #[test]
@@ -593,9 +590,7 @@ fn async_selection_and_refresh_execute_metadata_on_the_same_fixed_foreground_wor
         tauri::async_runtime::block_on(runtime.clone().select_path(ticket, Some(f.p("root"))))
             .unwrap()
             .unwrap();
-    fs::rename(f.p("root"), f.p("original")).unwrap();
-    fs::create_dir(f.p("root")).unwrap();
-    fs::write(f.p("root/replacement"), b"not selected").unwrap();
+    fs::write(f.p("root/current"), b"fresh").unwrap();
     let refreshed =
         tauri::async_runtime::block_on(runtime.clone().refresh(context(1), epoch, scope(&root)))
             .unwrap();
@@ -940,4 +935,40 @@ fn parked_native_task_cancels_and_session_closes_with_general_work_budget_full()
     drop((pressure, additional, runtime));
     drop(resources.scheduler);
     until(|| resources.budgets.used() == 0);
+}
+
+#[test]
+fn moved_root_refresh_fails_and_explicit_reselection_recovers() {
+    let f = Fixture::new();
+    fs::write(f.p("root/original"), b"selected").unwrap();
+    let (runtime, resources) = setup();
+    let epoch = runtime.connect(&context(1), "one").unwrap();
+    let root = choose(&runtime, epoch, &f.p("root"));
+    fs::rename(f.p("root"), f.p("moved")).unwrap();
+    fs::create_dir(f.p("root")).unwrap();
+    fs::write(f.p("root/replacement"), b"not selected").unwrap();
+    let ticket = runtime
+        .begin_refresh(&context(1), epoch, &scope(&root))
+        .unwrap();
+    let prepared = runtime.prepare_refresh(&ticket);
+    let failure = runtime.finish_refresh(ticket, prepared).unwrap_err();
+    assert_eq!(failure.error.code, "ENTRY_CHANGED");
+    let recovered = choose(&runtime, epoch, &f.p("moved"));
+    let current = scope(&recovered);
+    let (task, _) = runtime
+        .start_listing(
+            &context(1),
+            epoch,
+            &current,
+            &recovered.root.entry_id,
+            Category::Files,
+        )
+        .unwrap();
+    let rows = collect(&runtime, epoch, &current, &task.task_id);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].display_name, "original");
+    runtime
+        .close_session(&context(1), epoch, &current.session_id)
+        .unwrap();
+    until(|| resources.scheduler.handles().open() == 0);
 }

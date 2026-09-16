@@ -41,8 +41,8 @@ fn source_error_reason(issue: &FsIssue) -> Reason {
 }
 pub trait ObservationSource {
     type Cursor;
-    /// Native capability sources account every handle themselves, including
-    /// retained parents and validation opens. Wrappers verify the same pool.
+    /// Native sources account retained approval handles. walkdir owns additional
+    /// short-lived/read-directory handles; this pool is not an OS FD counter.
     /// Pure registration hook: never performs filesystem I/O.
     fn bind_directory(
         &mut self,

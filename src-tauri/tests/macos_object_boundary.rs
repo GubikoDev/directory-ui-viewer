@@ -1,4 +1,4 @@
-//! Current object-approval policy tests, using only self-created temp fixtures.
+//! Path validity, native approval and walkdir tests using only owned fixtures.
 #![cfg(target_os = "macos")]
 use directory_ui_viewer_lib::{
     platform::macos::{ApprovedRoot, BoundaryError, Directory},
@@ -90,7 +90,7 @@ fn s01_components_and_symlink_targets_are_not_opened() {
     );
 }
 #[test]
-fn s01_acquired_object_survives_move_and_aba_but_stale_name_does_not_rebind() {
+fn moved_directory_requires_valid_original_path_and_never_rebinds() {
     let f = Fixture::new();
     fs::create_dir(f.p("root/child")).unwrap();
     let root = f.approve();
@@ -105,8 +105,11 @@ fn s01_acquired_object_survives_move_and_aba_but_stale_name_does_not_rebind() {
         .join()
         .unwrap();
     });
-    assert_eq!(names(&child), vec![b"marker".to_vec()]);
-    assert_eq!(child.observe(b"marker").unwrap().metadata().st_size, 6);
+    assert!(matches!(child.cursor(), Err(BoundaryError::ChangedObject)));
+    assert!(matches!(
+        child.metadata(),
+        Err(BoundaryError::ChangedObject)
+    ));
     assert!(matches!(
         root.directory().open_observed(&observed),
         Err(BoundaryError::ChangedObject)
@@ -123,7 +126,7 @@ fn s01_acquired_object_survives_move_and_aba_but_stale_name_does_not_rebind() {
     );
 }
 #[test]
-fn s02_root_refresh_preserves_original_object_and_cursor_offsets_are_independent() {
+fn replaced_root_requires_reselection_and_new_cursors_are_independent() {
     let f = Fixture::new();
     fs::write(f.p("root/original"), b"").unwrap();
     let root = f.approve();
@@ -132,7 +135,10 @@ fn s02_root_refresh_preserves_original_object_and_cursor_offsets_are_independent
     fs::create_dir(f.p("root")).unwrap();
     fs::write(f.p("root/replacement-secret"), b"").unwrap();
     for _ in 0..3 {
-        assert_eq!(names(root.directory()), vec![b"original".to_vec()]);
+        assert!(matches!(
+            root.directory().cursor(),
+            Err(BoundaryError::ChangedObject)
+        ));
         assert_eq!(root.directory().identity(), id)
     }
     let second = f.approve();
@@ -407,10 +413,14 @@ fn concurrent_symlink_swap_keeps_every_successful_handle_on_original_object() {
             match root.directory().open_observed(&observed) {
                 Ok(child) => {
                     assert_eq!(child.identity(), id);
-                    assert_eq!(names(&child), vec![b"safe".to_vec()]);
+                    if let Ok(mut cursor) = child.cursor() {
+                        while let Ok(Some(name)) = cursor.next_name() {
+                            assert_eq!(name, b"safe");
+                        }
+                    }
                     success += 1
                 }
-                Err(BoundaryError::Native(_)) => {}
+                Err(BoundaryError::Native(_) | BoundaryError::ChangedObject) => {}
                 Err(e) => panic!("unexpected boundary error: {e:?}"),
             }
         }
