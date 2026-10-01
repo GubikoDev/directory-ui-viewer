@@ -5,7 +5,7 @@ test('shows the application shell', async ({ page }) => {
 
   await expect(
     page.getByRole('heading', { name: 'Directory UI Viewer' }),
-  ).toBeVisible();
+  ).toBeAttached();
 });
 
 test('ships the walkdir and same-file copyright and permission notices', async ({

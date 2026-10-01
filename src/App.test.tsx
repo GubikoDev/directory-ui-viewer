@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from './App';
+import { InternalApp } from './InternalApp';
 import { SessionClient } from './features/explorer/client/session-client';
 import {
   FixtureAdapter,
@@ -20,7 +21,7 @@ describe('App', () => {
       }),
     );
     await client.chooseRoot();
-    const view = render(<App client={client} />);
+    const view = render(<InternalApp client={client} />);
     vi.spyOn(client, 'nextPage').mockImplementation(() => {
       throw new Error('RESOURCE_LIMIT');
     });

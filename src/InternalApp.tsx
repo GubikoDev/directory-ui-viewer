@@ -1,0 +1,218 @@
+import engineLicenses from '../licenses/THIRD-PARTY-NOTICES.txt?raw';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { createAdapter } from './features/explorer/adapters/create';
+import { SessionClient } from './features/explorer/client/session-client';
+import { terminal, type Measure } from './features/explorer/model/types';
+import { VerificationPanel } from './features/explorer/verification/VerificationPanel';
+
+function measure(value?: Measure) {
+  if (!value || value.state === 'unknown') return '미확인';
+  if (value.state === 'complete') return `${value.bytes} B`;
+  if (value.state === 'partial')
+    return `${value.observedBytes} B (부분: ${value.reasons.join(', ')})`;
+  return `집계 불가: ${value.reason}`;
+}
+/** Temporary verification surface; final navigation and visual design are deferred. */
+export function InternalApp({ client: provided }: { client?: SessionClient }) {
+  const [client] = useState(
+    () => provided ?? new SessionClient(createAdapter()),
+  );
+  const state = useSyncExternalStore(
+    client.store.subscribe,
+    client.store.getSnapshot,
+  );
+  const [error, setError] = useState('');
+  const [choosing, setChoosing] = useState(false);
+  const renderedList = useRef<HTMLUListElement | null>(null);
+  useEffect(() => () => client.dispose(), [client]);
+  const run = (action: () => Promise<unknown>) => {
+    setError('');
+    void Promise.resolve()
+      .then(action)
+      .catch((e) => setError(e instanceof Error ? e.message : 'INTERNAL'));
+  };
+  const selected = state.selectedId ?? state.session?.rootEntryId;
+  const entry = selected ? state.entries.get(selected) : undefined;
+  const folders = selected
+    ? client.store.getListing(selected, 'directories')
+    : undefined;
+  const files = selected
+    ? client.store.getListing(selected, 'files')
+    : undefined;
+  const count =
+    (folders?.snapshot?.entryIds.length ?? 0) +
+    (files?.snapshot?.entryIds.length ?? 0);
+  const choose = () =>
+    run(async () => {
+      setChoosing(true);
+      try {
+        await client.chooseRoot();
+      } finally {
+        setChoosing(false);
+      }
+    });
+  const open = (id: string) =>
+    run(async () => {
+      client.store.select(id);
+      client.store.setExpanded(id, true);
+      await client.list(id, 'directories');
+    });
+  const renderItem = (id: string) => {
+    const item = state.entries.get(id);
+    if (!item) return null;
+    return (
+      <li key={id} className="rounded border border-slate-700 p-2">
+        {item.kind === 'directory' ? (
+          <button onClick={() => open(id)}>{item.displayName}</button>
+        ) : (
+          <span>
+            {item.displayName} ({item.kind})
+          </span>
+        )}
+        {item.kind === 'directory' && (
+          <span className="ml-4 text-slate-400">
+            {measure(state.usages.get(id)?.logical)}
+          </span>
+        )}
+      </li>
+    );
+  };
+  return (
+    <main className="min-h-screen bg-slate-950 p-6 text-slate-100">
+      <h1 className="text-2xl font-semibold">Directory UI Viewer</h1>
+      <p className="my-3 text-slate-400">
+        내부 기능 검증 화면 ·{' '}
+        {state.session?.platform === 'macos'
+          ? 'macOS 읽기 전용'
+          : '폴더 선택 전 / 브라우저에서는 샘플 데이터'}
+      </p>
+      <div className="my-4 flex flex-wrap gap-3">
+        <button disabled={choosing} onClick={choose}>
+          폴더 선택
+        </button>
+        <button
+          disabled={!client.hasSession}
+          onClick={() => run(() => client.refresh())}
+        >
+          새로고침
+        </button>
+        <button
+          disabled={!client.hasSession}
+          onClick={() => run(() => client.close())}
+        >
+          연결 닫기
+        </button>
+        <button
+          onClick={() =>
+            client.store.setMode(
+              state.mode === 'organization' ? 'mindmap' : 'organization',
+            )
+          }
+        >
+          표현 전환 ({state.mode})
+        </button>
+      </div>
+      {(error || state.failedRoot) && (
+        <p role="alert">{error || state.failedRoot?.issue.code}</p>
+      )}
+      {state.resourceLimited && (
+        <div>
+          <p role="status">메모리 한도에 도달했습니다.</p>
+          <button onClick={() => run(() => client.retryObservations())}>
+            관측 다시 읽기
+          </button>
+        </div>
+      )}
+      {entry && (
+        <section aria-label="현재 폴더">
+          <h2 className="my-3 text-xl">{entry.displayName}</h2>
+          <p>논리 용량: {measure(state.usages.get(entry.entryId)?.logical)}</p>
+          <p>
+            할당 용량: {measure(state.usages.get(entry.entryId)?.allocated)}
+          </p>
+          <div className="my-3 flex gap-3">
+            {entry.parentId && (
+              <button onClick={() => open(entry.parentId!)}>상위 폴더</button>
+            )}
+            <button
+              onClick={() => run(() => client.list(entry.entryId, 'files'))}
+            >
+              파일 목록 보기
+            </button>
+            {state.openFileListIds.has(entry.entryId) && (
+              <button
+                onClick={() => client.closeListing(entry.entryId, 'files')}
+              >
+                파일 목록 닫기
+              </button>
+            )}
+            <button onClick={() => run(() => client.scan())}>용량 집계</button>
+          </div>
+          <ul
+            ref={renderedList}
+            data-generation={state.session?.generation}
+            aria-label="항목 목록"
+            className={
+              state.mode === 'mindmap'
+                ? 'my-4 flex flex-wrap gap-4'
+                : 'my-4 space-y-2'
+            }
+          >
+            {folders?.snapshot?.entryIds.map(renderItem)}
+            {files?.snapshot?.entryIds.map(renderItem)}
+          </ul>
+          {folders?.snapshot?.coverage === 'complete' && count === 0 && (
+            <p>하위 폴더가 없습니다.</p>
+          )}
+          {[folders, files].map((listing, i) =>
+            listing?.snapshot?.nextCursor && listing.taskId ? (
+              <button
+                key={i}
+                onClick={() => run(() => client.nextPage(listing.taskId!))}
+              >
+                {listing.category === 'files' ? '파일' : '폴더'} 다음 페이지
+              </button>
+            ) : null,
+          )}
+        </section>
+      )}
+      <section aria-label="작업 상태">
+        <h2 className="my-3 text-xl">작업 상태</h2>
+        <ul>
+          {Array.from(state.tasks.values(), (task) => (
+            <li key={task.taskId}>
+              {task.operation}: {task.phase} {task.waitReason ?? ''} ·{' '}
+              {task.processedEntries}개
+              {!terminal(task.phase) && (
+                <button
+                  className="ml-3"
+                  onClick={() => run(() => client.cancel(task.taskId))}
+                >
+                  취소
+                </button>
+              )}
+              {Object.keys(task.issues.counts).length > 0 && (
+                <span> · {Object.keys(task.issues.counts).join(', ')}</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      </section>
+      {import.meta.env.VITE_INTERNAL_BENCHMARK === '1' && (
+        <VerificationPanel
+          client={client}
+          rendered={() => ({
+            generation: Number(renderedList.current?.dataset.generation),
+            count: renderedList.current?.childElementCount ?? 0,
+          })}
+        />
+      )}
+      <details className="mt-6 text-sm text-slate-400">
+        <summary className="cursor-pointer">
+          오픈소스 라이선스 · 탐색 엔진
+        </summary>
+        <pre className="mt-2 whitespace-pre-wrap">{engineLicenses}</pre>
+      </details>
+    </main>
+  );
+}
