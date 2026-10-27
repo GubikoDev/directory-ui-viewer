@@ -87,11 +87,6 @@ button:focus-visible {
   padding: 0 16px 0 14px;
   border-bottom: 1px solid var(--line);
 }
-.window-lights {
-  display: flex;
-  gap: 7px;
-  margin-right: 14px;
-}
 .root-name {
   display: flex;
   align-items: center;
@@ -522,8 +517,5 @@ button:focus-visible {
   }
   .detail-panel {
     width: 280px;
-  }
-  .window-lights {
-    display: none;
   }
 }

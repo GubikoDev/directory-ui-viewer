@@ -113,11 +113,6 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
     <main className={light ? 'explorer light' : 'explorer'}>
       <h1 className="sr-only">Directory UI Viewer</h1>
       <header className="topbar">
-        <div className="window-lights" aria-hidden="true">
-          {['imgLight', 'imgLight1', 'imgLight2'].map((name) => (
-            <Icon key={name} name={name} size={11} />
-          ))}
-        </div>
         <div className="root-name">
           {root && icon('imgRootIcon', 15)}
           <span>{root?.displayName ?? ''}</span>
