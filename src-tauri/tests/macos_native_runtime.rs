@@ -816,7 +816,7 @@ fn abandoning_active_preparation_keeps_old_root_and_discards_late_candidate() {
 }
 
 #[test]
-fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
+fn native_scanner_uses_the_runtime_hardlink_and_scan_workspace_pools() {
     use directory_ui_viewer_lib::{
         domain::model::Reason,
         runtime::{events::DiscardEvents, memory::ByteBudget},
@@ -844,7 +844,7 @@ fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
         let epoch = runtime.connect(&context(1), "budget").unwrap();
         let root = choose(&runtime, epoch, &fixture.p("root"));
         let current = scope(&root);
-        let baseline = resources.budgets.work.used();
+        let baseline = resources.budgets.scan_workspace.used();
         let task = runtime.start_usage(&context(1), epoch, &current).unwrap();
         until(|| {
             runtime
@@ -867,7 +867,7 @@ fn native_scanner_uses_the_runtime_hardlink_and_work_pools() {
             );
             assert_eq!(resources.budgets.hardlinks.peak(), 160);
         }
-        assert!(resources.budgets.work.peak() >= baseline + 64 * 1024);
+        assert!(resources.budgets.scan_workspace.peak() >= baseline + 64 * 1024);
         assert!(resources.budgets.hardlinks.peak() <= limit);
         runtime
             .close_session(&context(1), epoch, &current.session_id)
@@ -971,4 +971,38 @@ fn moved_root_refresh_fails_and_explicit_reselection_recovers() {
         .close_session(&context(1), epoch, &current.session_id)
         .unwrap();
     until(|| resources.scheduler.handles().open() == 0);
+}
+
+#[test]
+fn listing_and_usage_reads_keep_work_space_when_scan_and_replay_reservations_are_full() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.p("root/child")).unwrap();
+    let (runtime, resources) = setup();
+    let epoch = runtime.connect(&context(1), "foreground").unwrap();
+    let root = choose(&runtime, epoch, &fixture.p("root"));
+    let scope = scope(&root);
+    let budgets = &resources.budgets;
+    let _scan = budgets
+        .scan_workspace
+        .reserve(budgets.scan_workspace.available())
+        .unwrap();
+    let _replay = budgets.replay.reserve(budgets.replay.available()).unwrap();
+    let (handle, _) = runtime
+        .start_listing(
+            &context(1),
+            epoch,
+            &scope,
+            &root.root.entry_id,
+            Category::Directories,
+        )
+        .unwrap();
+    let rows = collect(&runtime, epoch, &scope, &handle.task_id);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        runtime
+            .read_usage(&context(1), epoch, &scope, &[rows[0].entry_id.clone()])
+            .unwrap()
+            .len(),
+        1
+    );
 }

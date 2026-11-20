@@ -7,12 +7,14 @@ import type { ExplorerState } from '../model/store';
 export function useGraphViewport(
   session: RootSession | null,
   mode: ExplorerState['mode'],
-  anchor?: GraphNode,
+  anchor: GraphNode | undefined,
+  positions: ReadonlyMap<string, GraphNode>,
 ) {
   const previous = useRef<{
     session: RootSession | null;
     mode: ExplorerState['mode'];
     anchor?: GraphNode;
+    positions: ReadonlyMap<string, GraphNode>;
   } | null>(null);
   const ref = useRef<HTMLElement>(null);
   const [bounds, setBounds] = useState({
@@ -52,12 +54,33 @@ export function useGraphViewport(
   }, [session]);
   useLayoutEffect(() => {
     const old = previous.current;
-    previous.current = { session, mode, anchor };
+    previous.current = { session, mode, anchor, positions };
     const element = ref.current;
     if (!element || !anchor || !element.clientWidth) return;
     if ((old?.mode !== mode || old.session !== session) && mode === 'mindmap') {
       element.scrollLeft = anchor.x + (anchor.width - element.clientWidth) / 2;
       element.scrollTop = anchor.y + (anchor.height - element.clientHeight) / 2;
+    } else if (
+      old?.session === session &&
+      old.mode === mode &&
+      old.positions.size > positions.size
+    ) {
+      // Collapsing offscreen branches can move the row the user is reading.
+      for (const node of old.positions.values()) {
+        if (
+          node.x + node.width <= element.scrollLeft ||
+          node.x >= element.scrollLeft + element.clientWidth ||
+          node.y + node.height <= element.scrollTop ||
+          node.y >= element.scrollTop + element.clientHeight
+        )
+          continue;
+        const next = positions.get(node.id);
+        if (next) {
+          element.scrollLeft += next.x - node.x;
+          element.scrollTop += next.y - node.y;
+          break;
+        }
+      }
     } else if (old?.session === session && old.anchor?.id === anchor.id) {
       // Keep a visible selection in place as new branches change the layout.
       const x = old.anchor.x - element.scrollLeft,
@@ -72,6 +95,6 @@ export function useGraphViewport(
         element.scrollTop += anchor.y - old.anchor.y;
       }
     }
-  }, [session, mode, anchor]);
+  }, [session, mode, anchor, positions]);
   return { ref, bounds };
 }

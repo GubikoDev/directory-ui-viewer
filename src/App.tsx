@@ -71,7 +71,9 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
   const [details, setDetails] = useState(false);
   const [finishedTree, setFinishedTree] = useState<RootSession | null>(null);
   const discovering = !!state.session && state.session !== finishedTree;
-  const discovery = useRef<(() => void) | undefined>(undefined);
+  const discovery = useRef<ReturnType<typeof discoverDirectories> | undefined>(
+    undefined,
+  );
   useEffect(() => {
     if (!state.session) return;
     const session = state.session;
@@ -80,6 +82,7 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
       session,
       (e) => setError(e instanceof Error ? e.message : 'INTERNAL'),
       () => setFinishedTree(session),
+      () => setFinishedTree(null),
     );
     discovery.current = stop;
     return stop;
@@ -160,6 +163,7 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
     session,
     mode,
     selected ? positions.get(selected) : undefined,
+    positions,
   );
   const windowed =
     graph.nodes.length > 200 && bounds.width > 0 && bounds.height > 0;
@@ -177,6 +181,31 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
   const visibleNodes = graph.nodes.filter((n) =>
     intersects(n.x, n.y, n.x + n.width, n.y + n.height),
   );
+  // Layout and progress can change without changing the visible directories.
+  // Only restart viewport work when its IDs (or the session) actually change.
+  const viewportKey = JSON.stringify(
+    Array.from(
+      new Set([
+        ...(session ? [session.rootEntryId] : []),
+        ...(selected ? [selected] : []),
+        ...visibleNodes.map((node) => node.id),
+      ]),
+    ),
+  );
+  useEffect(() => {
+    if (!session) return;
+    const ids: string[] = JSON.parse(viewportKey);
+    client.setUsageViewport(session, ids);
+    discovery.current?.setViewport(ids);
+    // Coalesce scrolling and successive incoming graph pages.
+    const timer = setTimeout(() => {
+      void client.readUsage(session).catch((e) => {
+        if (client.store.getSnapshot().session === session)
+          setError(e instanceof Error ? e.message : 'INTERNAL');
+      });
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [client, session, viewportKey]);
   const open = (id: string) =>
     run(async () => {
       client.store.select(id);

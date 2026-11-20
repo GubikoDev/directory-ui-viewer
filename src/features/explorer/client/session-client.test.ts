@@ -804,3 +804,26 @@ it('rejects a refresh failure that claims a different session scope', async () =
   expect(store.getSnapshot().session).toBe(session);
   expect(store.getSnapshot().failedRoot).toBeNull();
 });
+
+it('queries only viewport directories in bounded batches during a scan', async () => {
+  const dirs = Array.from({ length: 180 }, (_, i) =>
+    fixtureEntry('d' + i, 'root'),
+  );
+  const { client, adapter, store } = setup(
+    new FixtureAdapter({ entries: [fixtureEntry('root', null), ...dirs] }),
+  );
+  await client.chooseRoot();
+  const scope = store.getSnapshot().session!;
+  const ids = ['root', ...dirs.slice(25, 65).map((d) => d.entryId)];
+  client.setUsageViewport(scope, ids);
+  const reads = vi.spyOn(adapter, 'readUsage');
+  await client.readUsage();
+  expect(reads.mock.calls.flatMap(([r]) => r.directoryIds)).toEqual(ids);
+  expect(reads.mock.calls.map(([r]) => r.directoryIds.length)).toEqual([32, 9]);
+  client.setUsageViewport(scope, ['root', 'd0']);
+  await client.readUsage(scope);
+  expect(Array.from(store.getSnapshot().usages.keys()).sort()).toEqual([
+    'd0',
+    'root',
+  ]);
+});

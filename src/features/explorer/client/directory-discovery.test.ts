@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { FixtureAdapter, fixtureEntry } from '../adapters/fixture';
+import { ExplorerStore } from '../model/store';
 import { SessionClient } from './session-client';
 import { discoverDirectories } from './directory-discovery';
 import { layoutGraph } from '../ui/presentation';
@@ -138,6 +139,100 @@ it('automatically consumes every page of a nested directory', async () => {
       203,
     );
     expect(error).not.toHaveBeenCalled();
+  } finally {
+    stop();
+    client.dispose();
+  }
+});
+
+it('resumes on scroll and retains completed observations without rereading offscreen branches', async () => {
+  const adapter = new FixtureAdapter({
+    entries: [
+      fixtureEntry('root', null),
+      fixtureEntry('left', 'root'),
+      fixtureEntry('right', 'root'),
+      fixtureEntry('one', 'left'),
+      fixtureEntry('two', 'right'),
+    ],
+  });
+  const client = new SessionClient(adapter);
+  await client.chooseRoot();
+  const session = client.store.getSnapshot().session!;
+  const listing = vi.spyOn(client, 'startTreeListing');
+  const idle = vi.fn();
+  const stop = discoverDirectories(
+    client,
+    session,
+    (e) => {
+      throw e;
+    },
+    idle,
+  );
+  try {
+    stop.setViewport(['root', 'left']);
+    await vi.waitFor(() => expect(idle).toHaveBeenCalledTimes(1));
+    expect(client.store.getSnapshot().entries.has('one')).toBe(true);
+    expect(listing.mock.calls.map(([, id]) => id)).toEqual(['left']);
+    stop.setViewport(['root', 'right']);
+    await vi.waitFor(() => expect(idle).toHaveBeenCalledTimes(2));
+    expect(client.store.getSnapshot().entries.has('two')).toBe(true);
+    stop.setViewport(['root', 'left']);
+    expect(listing.mock.calls.map(([, id]) => id)).toEqual(['left', 'right']);
+  } finally {
+    stop();
+    client.dispose();
+  }
+});
+
+it('reopens a pruned branch and keeps the visible path and its siblings reachable', async () => {
+  const branches = Array.from({ length: 64 }, (_, i) => 'branch-' + i);
+  const adapter = new FixtureAdapter({
+    entries: [
+      fixtureEntry('root', null),
+      ...branches.flatMap((id) => [
+        fixtureEntry(id, 'root'),
+        ...Array.from({ length: 8 }, (_, j) =>
+          fixtureEntry(id + '-child-' + j, id),
+        ),
+      ]),
+    ],
+  });
+  const client = new SessionClient(
+    adapter,
+    new ExplorerStore(256 * 1024 * 1024),
+  );
+  await client.chooseRoot();
+  const session = client.store.getSnapshot().session!;
+  const idle = vi.fn();
+  const stop = discoverDirectories(
+    client,
+    session,
+    (e) => {
+      throw e;
+    },
+    idle,
+  );
+  try {
+    stop.setViewport(branches);
+    await vi.waitFor(() => expect(idle).toHaveBeenCalledTimes(1), {
+      timeout: 5000,
+    });
+    stop.setViewport(['branch-63-child-0']);
+    await vi.waitFor(() =>
+      expect(client.store.getListing('branch-0', 'directories').loadState).toBe(
+        'notRequested',
+      ),
+    );
+    expect(
+      client.store.getListing('branch-63', 'directories').snapshot?.entryIds,
+    ).toContain('branch-63-child-0');
+    expect(client.store.getSnapshot().entries.has('branch-0')).toBe(true);
+    stop.setViewport(['branch-0']);
+    await vi.waitFor(() =>
+      expect(
+        client.store.getListing('branch-0', 'directories').snapshot?.entryIds,
+      ).toHaveLength(8),
+    );
   } finally {
     stop();
     client.dispose();

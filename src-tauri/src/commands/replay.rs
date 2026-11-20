@@ -331,6 +331,7 @@ struct ChargedWriter {
     bytes: Vec<u8>,
     memory: Reservation,
     max_bytes: usize,
+    replay: Weak<Inner>,
 }
 impl Write for ChargedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -351,9 +352,21 @@ impl Write for ChargedWriter {
             } else {
                 length
             };
-            self.memory
+            while self
+                .memory
                 .resize(self.memory.bytes().max(capacity))
-                .map_err(|_| io::Error::other("RESOURCE_LIMIT"))?;
+                .is_err()
+            {
+                // Read-only pages may outgrow their initial allowance. Apply
+                // the same completed-reply eviction as admission before failing.
+                if !self
+                    .replay
+                    .upgrade()
+                    .is_some_and(|inner| inner.state.lock().unwrap().ledger.evict_completed())
+                {
+                    return Err(io::Error::other("RESOURCE_LIMIT"));
+                }
+            }
             self.bytes
                 .try_reserve_exact(capacity - self.bytes.len())
                 .map_err(|_| io::Error::other("RESOURCE_LIMIT"))?;
@@ -375,6 +388,7 @@ impl Completion {
             bytes: std::mem::take(&mut self.bytes),
             memory: self.allocation.take().expect("one completion"),
             max_bytes: self.max_bytes.unwrap_or(MAX_MESSAGE_BYTES),
+            replay: self.inner.clone(),
         };
         let serialized = serde_json::to_writer(&mut writer, &value);
         drop(value);
@@ -597,12 +611,31 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
     #[test]
+    fn a_read_reply_can_reclaim_completed_records_as_it_is_serialized() {
+        let budget = ByteBudget::new(128 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 8, 1000).unwrap();
+        let payload = "x".repeat(40 * 1024);
+        execute(&service, 1, 48 * 1024).complete(&payload).unwrap();
+        let owner = execute(&service, 2, 4096);
+        let _pressure = budget.reserve(budget.available() - 1024).unwrap();
+        let reply = owner.complete(&payload).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<String>(reply.bytes()).unwrap(),
+            payload
+        );
+        assert_eq!(
+            error(service.begin(n(1), &hash(), 0, 0)),
+            ControlError::RequestExpired
+        );
+    }
+    #[test]
     fn writer_uses_exact_growth_when_rounded_capacity_does_not_fit() {
         let budget = ByteBudget::new(700_000);
         let mut writer = ChargedWriter {
             bytes: Vec::new(),
             memory: budget.reserve(0).unwrap(),
             max_bytes: MAX_MESSAGE_BYTES,
+            replay: Weak::new(),
         };
         writer.write_all(&vec![b'x'; 600_001]).unwrap();
         assert_eq!(writer.bytes.len(), 600_001);

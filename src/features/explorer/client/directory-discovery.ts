@@ -13,11 +13,14 @@ export function discoverDirectories(
   scope: RootSession,
   onError: (error: unknown) => void,
   onDone: () => void = () => {},
+  onResume: () => void = () => {},
 ) {
   const root = scope.rootEntryId;
-  const queue = new Set<string>([root]);
-  const pending = queue.values();
-  let directory = pending.next();
+  const queue = new Set<string>();
+  const visited = new Map<string, boolean>();
+  let directory: string | undefined = root;
+  let viewportDriven = false;
+  let idle = false;
   let start: ListingStart | undefined;
   let cursor: string | null = null;
   let stopped = false;
@@ -25,7 +28,7 @@ export function discoverDirectories(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const current = () => sameScope(client.store.getSnapshot().session, scope);
   const schedule = (delay = 0) => {
-    if (!current() || stopped || busy || timer !== undefined) return;
+    if (!current() || stopped || idle || busy || timer !== undefined) return;
     timer = setTimeout(() => {
       timer = undefined;
       void step();
@@ -36,6 +39,7 @@ export function discoverDirectories(
     if (stopped) return;
     stopped = true;
     queue.clear();
+    visited.clear();
     unsubscribe();
     clearTimeout(timer);
     if (start && !terminal(start.work.phase) && current())
@@ -46,7 +50,13 @@ export function discoverDirectories(
   function advance() {
     start = undefined;
     cursor = null;
-    directory = pending.next();
+    if (directory !== undefined)
+      visited.set(
+        directory,
+        client.store.getListing(directory, 'directories').loadState !==
+          'notRequested',
+      );
+    directory = undefined;
   }
   async function step() {
     if (
@@ -59,14 +69,23 @@ export function discoverDirectories(
     let delay = 0;
     busy = true;
     try {
-      if (directory.done) {
+      if (directory === undefined) {
+        directory = queue.values().next().value;
+        if (directory !== undefined) queue.delete(directory);
+      }
+      if (directory === undefined) {
+        if (viewportDriven) {
+          idle = true;
+          onDone();
+          return;
+        }
         // Include nodes discovered after the last usage notification.
         await client.readUsage(scope);
         if (!stopped && current()) onDone();
         stop();
         return;
       }
-      if (directory.value === root) {
+      if (directory === root) {
         // The normal session opening flow owns the first root listing.
         const listing = client.store.getListing(root, 'directories');
         if (
@@ -79,10 +98,11 @@ export function discoverDirectories(
           } else delay = 50;
           return;
         }
-        for (const id of listing.snapshot?.entryIds ?? []) queue.add(id);
+        if (!viewportDriven)
+          for (const id of listing.snapshot?.entryIds ?? []) queue.add(id);
         advance();
       } else if (!start) {
-        start = await client.startTreeListing(scope, directory.value);
+        start = await client.startTreeListing(scope, directory);
         if (stopped && current()) await client.cancel(start.work.taskId);
       } else {
         const page = await client.readTreePage(start, cursor);
@@ -91,7 +111,8 @@ export function discoverDirectories(
           if (client.store.getSnapshot().resourceLimited) return;
           throw new Error('INVALID_RESPONSE');
         }
-        for (const child of page.entries) queue.add(child.entryId);
+        if (!viewportDriven)
+          for (const child of page.entries) queue.add(child.entryId);
         cursor = page.nextCursor;
         if (!cursor && terminal(page.work.phase)) advance();
         else if (!page.entries.length) delay = 40;
@@ -101,7 +122,7 @@ export function discoverDirectories(
       if (error instanceof Error && error.message === 'RESOURCE_LIMIT') {
         client.store.suspendObservations();
       } else {
-        if (directory.done) {
+        if (directory === undefined) {
           stop();
           onDone();
         } else advance();
@@ -113,5 +134,30 @@ export function discoverDirectories(
     }
   }
   schedule();
-  return stop;
+  function setViewport(ids: readonly string[]) {
+    if (stopped) return;
+    viewportDriven = true;
+    if (client.store.trimAutomaticBranches(ids, directory)) {
+      const state = client.store.getSnapshot();
+      for (const [id, hadListing] of visited) {
+        if (
+          !state.entries.has(id) ||
+          (hadListing &&
+            client.store.getListing(id, 'directories').loadState ===
+              'notRequested')
+        )
+          visited.delete(id);
+      }
+    }
+    queue.clear();
+    for (const id of ids) {
+      if (id !== directory && !visited.has(id)) queue.add(id);
+    }
+    if (idle && queue.size) {
+      idle = false;
+      onResume();
+    }
+    schedule();
+  }
+  return Object.assign(stop, { setViewport });
 }

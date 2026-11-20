@@ -347,8 +347,8 @@ pub async fn connect_client(
     let epoch = state.runtime.connect(&context, &input.client_nonce)?;
     if document.replay.is_none() {
         // Controller epochs increase once per successfully connected document.
-        let replay =
-            ReplayService::new(epoch, state.budgets.work.clone(), 256, 300_000).map_err(control)?;
+        let replay = ReplayService::new(epoch, state.budgets.replay.clone(), 256, 300_000)
+            .map_err(control)?;
         document.replay = Some((epoch, Arc::new(replay)));
     }
     document.proof = Some(input.document_proof);

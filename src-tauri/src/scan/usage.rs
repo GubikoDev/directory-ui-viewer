@@ -336,7 +336,7 @@ impl<S: ObservationSource> UsageScanner<S> {
         let mut stack = Vec::new();
         let frame_bytes = FRAME_BYTES.max(std::mem::size_of::<Frame<S::Cursor>>() * 2);
         let work_memory = budgets
-            .work
+            .scan_workspace
             .reserve(SCANNER_BASE_BYTES + frame_bytes + VISITED_BYTES)
             .map_err(|_| "RESOURCE_LIMIT")?;
         let shared_memory = budgets.hardlinks.reserve(0).map_err(|_| "RESOURCE_LIMIT")?;
@@ -1114,15 +1114,15 @@ mod tests {
             110
         );
         assert_eq!(budgets.hardlinks.used(), 0);
-        assert!(budgets.work.used() > 0);
+        assert!(budgets.scan_workspace.used() > 0);
         drop((second, third));
-        assert_eq!(budgets.work.used(), 0);
+        assert_eq!(budgets.scan_workspace.used(), 0);
     }
     #[test]
     fn work_pool_exhaustion_precedes_child_open_and_returns_observed_partial() {
         let limit = SCANNER_BASE_BYTES + FRAME_BYTES + 2 * VISITED_BYTES;
         let budgets = ManagedBudgets {
-            work: crate::runtime::memory::ByteBudget::new(limit),
+            scan_workspace: crate::runtime::memory::ByteBudget::new(limit),
             ..ManagedBudgets::default()
         };
         let mut source = Source::default();
@@ -1137,33 +1137,36 @@ mod tests {
         assert!(
             matches!(usage.logical, Measure::Partial { reasons, .. } if reasons.contains(&Reason::ResourceLimit))
         );
-        assert!(budgets.work.peak() <= limit);
+        assert!(budgets.scan_workspace.peak() <= limit);
         drop(scan);
-        assert_eq!(budgets.work.used(), 0);
+        assert_eq!(budgets.scan_workspace.used(), 0);
     }
     #[test]
     fn stack_replacement_reserves_both_buffers_without_mutating_on_budget_failure() {
         let final_bytes = SCANNER_BASE_BYTES + 2 * FRAME_BYTES + 2 * VISITED_BYTES;
         let budgets = ManagedBudgets {
-            work: crate::runtime::memory::ByteBudget::new(
+            scan_workspace: crate::runtime::memory::ByteBudget::new(
                 final_bytes + std::mem::size_of::<Frame<Cursor>>(),
             ),
             ..ManagedBudgets::default()
         };
         let mut scan = charged_scanner(Source::default(), &budgets, "stack-transaction");
         let previous = scan.work_memory.bytes();
-        let blocker = budgets.work.reserve(1).unwrap();
+        let blocker = budgets.scan_workspace.reserve(1).unwrap();
         assert!(!scan.reserve_child());
         assert_eq!(scan.stack.capacity(), 1);
         assert_eq!(scan.work_memory.bytes(), previous);
-        assert_eq!(budgets.work.used(), previous + 1);
+        assert_eq!(budgets.scan_workspace.used(), previous + 1);
         drop(blocker);
         assert!(scan.reserve_child());
         assert_eq!(scan.stack.capacity(), 2);
-        assert_eq!(budgets.work.used(), final_bytes);
-        assert_eq!(budgets.work.peak(), budgets.work.limit());
+        assert_eq!(budgets.scan_workspace.used(), final_bytes);
+        assert_eq!(
+            budgets.scan_workspace.peak(),
+            budgets.scan_workspace.limit()
+        );
         drop(scan);
-        assert_eq!(budgets.work.used(), 0);
+        assert_eq!(budgets.scan_workspace.used(), 0);
     }
     #[test]
     fn missing_hardlink_identity_preserves_only_proven_unique_bytes() {
@@ -1197,7 +1200,7 @@ mod tests {
         }
         impl Drop for CheckedSource {
             fn drop(&mut self) {
-                assert!(self.budgets.work.used() >= SCANNER_BASE_BYTES);
+                assert!(self.budgets.scan_workspace.used() >= SCANNER_BASE_BYTES);
                 assert_eq!(self.budgets.hardlinks.used(), SHARED_BYTES);
             }
         }
@@ -1217,7 +1220,7 @@ mod tests {
         .unwrap();
         scan.step(1, STAMP);
         drop(scan);
-        assert_eq!(budgets.work.used(), 0);
+        assert_eq!(budgets.scan_workspace.used(), 0);
         assert_eq!(budgets.hardlinks.used(), 0);
     }
     #[test]

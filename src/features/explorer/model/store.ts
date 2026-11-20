@@ -282,6 +282,35 @@ export class ExplorerStore {
     this.listingOrders = this.pressureMetadata.orders;
     this.cancelPending = this.pressureMetadata.cancelled;
   }
+  // Offscreen children can be listed again through the same generation. Keep
+  // every ancestor on screen so pruning never detaches a visible folder.
+  trimAutomaticBranches(
+    viewport: readonly string[],
+    reading?: string,
+  ): boolean {
+    const state = this.state;
+    if (state.entries.size < 512 || state.listings.size < 64) return false;
+    const keep = new Set([
+      ...viewport,
+      ...state.expandedIds,
+      ...state.openFileListIds,
+    ]);
+    if (reading) keep.add(reading);
+    if (state.selectedId) keep.add(state.selectedId);
+    for (const id of keep) {
+      const parent = state.entries.get(id)?.parentId;
+      if (parent) keep.add(parent);
+    }
+    let cold = 0;
+    for (const listing of state.listings.values())
+      if (listing.automatic && !keep.has(listing.directoryId)) cold++;
+    // Reclaim in groups so a scroll does not copy all maps for a single leaf.
+    if (cold < 32) return false;
+    return this.change(keep, false, () => {
+      this.publish(compactClosed(state, this.budget, this.transaction!, keep));
+      return true;
+    });
+  }
   evictClosedListings(): boolean {
     if (this.state.listings === this.pressureState.listings) return false;
     this.state = this.pressureState;
@@ -513,7 +542,11 @@ export class ExplorerStore {
       this.cancelPending = new Set(this.cancelPending).add(taskId);
     });
   }
-  applyUsage(scope: Scope, usages: DirectoryUsage[]) {
+  applyUsage(
+    scope: Scope,
+    usages: DirectoryUsage[],
+    wanted?: ReadonlySet<string>,
+  ) {
     if (!sameScope(this.state.session, scope)) return;
     let growth = 0;
     for (const usage of usages) {
@@ -524,12 +557,17 @@ export class ExplorerStore {
       )
         growth += 512 + 2 * usage.directoryId.length;
     }
-    if (!growth) return true;
+    const trim =
+      wanted &&
+      Array.from(this.state.usages.keys()).some((id) => !wanted.has(id));
+    if (!growth && !trim) return true;
     return this.change(
       usages,
       undefined,
       () => {
         const next = new Map(this.state.usages);
+        if (trim)
+          for (const id of next.keys()) if (!wanted.has(id)) next.delete(id);
         for (const usage of usages) {
           if (this.state.entries.get(usage.directoryId)?.kind !== 'directory')
             continue;

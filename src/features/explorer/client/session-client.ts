@@ -45,6 +45,11 @@ export class SessionClient {
   private number = 0;
   private lifecycle = 0;
   private intent = 0;
+  private usageViewport?: {
+    scope: Scope;
+    ids: readonly string[];
+    wanted: ReadonlySet<string>;
+  };
   private currentScope: Scope | null = null;
   private picker?: Promise<boolean>;
   private refreshing?: Promise<void>;
@@ -149,6 +154,7 @@ export class SessionClient {
     clearInterval(this.timer);
     this.connection = undefined;
     this.epoch = null;
+    this.usageViewport = undefined;
     this.currentScope = null;
     this.recovery.clear();
     this.pageReads.clear();
@@ -230,6 +236,7 @@ export class SessionClient {
   }
   private async activate(root: RootData) {
     this.errorLog.clear();
+    this.usageViewport = undefined;
     this.currentScope = root.session;
     if (!this.store.reset(root)) {
       // Native has already accepted this scope. Keep its control identity even
@@ -537,22 +544,32 @@ export class SessionClient {
     if (work.operation === 'scanUsage') await this.readUsage(scope);
     else if (this.pageDemand.has(taskId)) await this.nextPage(taskId);
   }
+  setUsageViewport(scope: Scope, ids: readonly string[]) {
+    if (sameScope(this.store.getSnapshot().session, scope))
+      this.usageViewport = { scope, ids, wanted: new Set(ids) };
+  }
   async readUsage(scope: Scope | null = this.store.getSnapshot().session) {
-    if (!scope) return;
-    const ids = this.observationIds('directories');
-    for (let offset = 0; offset < ids.length; offset += 1000) {
+    if (!scope || !sameScope(this.store.getSnapshot().session, scope)) return;
+    const viewport = this.usageViewport;
+    const ids =
+      viewport && sameScope(scope, viewport.scope)
+        ? viewport.ids
+        : this.observationIds('directories');
+    const batchSize = 32;
+    for (let offset = 0; offset < ids.length; offset += batchSize) {
       if (!sameScope(this.store.getSnapshot().session, scope)) return;
       const request = {
         ...this.scoped(scope),
         directoryIds: this.store.budget.allocate(
-          this.idSliceBytes(ids, offset, 1000),
-          () => ids.slice(offset, offset + 1000),
+          this.idSliceBytes(ids, offset, batchSize),
+          () => ids.slice(offset, offset + batchSize),
         ),
       };
       const response = await this.adapter.readUsage(request);
       if (!sameScope(this.store.getSnapshot().session, scope)) return;
+      if (viewport && viewport !== this.usageViewport) return;
       const usages = unwrap(response, request.requestId);
-      if (usages) this.store.applyUsage(scope, usages);
+      if (usages) this.store.applyUsage(scope, usages, viewport?.wanted);
     }
   }
   private idSliceBytes(ids: readonly string[], offset: number, count: number) {
@@ -711,6 +728,7 @@ export class SessionClient {
     unwrap(await pending, request.requestId);
     if (sameScope(this.rootScope(), scope)) {
       this.currentScope = null;
+      this.usageViewport = undefined;
       this.store.reset(null);
       this.lastPage.clear();
       this.pageDemand.clear();

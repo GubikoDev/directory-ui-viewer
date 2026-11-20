@@ -14,10 +14,12 @@ export function compactClosed(
   state: ExplorerState,
   budget: FrontendBudget,
   memory: FrontendReservation,
+  automaticBranches?: ReadonlySet<string>,
 ): ExplorerState {
   const selected = state.selectedId ?? state.session?.rootEntryId;
   const visible = (listing: DirectoryListing) =>
-    listing.automatic ||
+    (listing.automatic &&
+      (!automaticBranches || automaticBranches.has(listing.directoryId))) ||
     (listing.category === 'files'
       ? state.openFileListIds.has(listing.directoryId)
       : listing.directoryId === selected ||

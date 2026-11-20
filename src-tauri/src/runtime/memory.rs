@@ -139,6 +139,8 @@ pub struct ManagedBudgets {
     pub foreground_index: ByteBudget,
     pub listings: ByteBudget,
     pub hardlinks: ByteBudget,
+    pub scan_workspace: ByteBudget,
+    pub replay: ByteBudget,
     pub work: ByteBudget,
 }
 impl Default for ManagedBudgets {
@@ -147,9 +149,13 @@ impl Default for ManagedBudgets {
         Self {
             background_index: ByteBudget::new(48 * MIB),
             foreground_index: ByteBudget::new(16 * MIB),
-            listings: ByteBudget::new(48 * MIB),
+            listings: ByteBudget::new(38 * MIB),
             hardlinks: ByteBudget::new(12 * MIB),
-            work: ByteBudget::with_headroom(4 * MIB, MIB),
+            // Keep scanner history and replayable replies out of the budget used
+            // to open a directory and deliver its next page.
+            scan_workspace: ByteBudget::new(4 * MIB),
+            replay: ByteBudget::with_headroom(4 * MIB, MIB),
+            work: ByteBudget::with_headroom(6 * MIB, MIB),
         }
     }
 }
@@ -159,6 +165,8 @@ impl ManagedBudgets {
             + self.foreground_index.used()
             + self.listings.used()
             + self.hardlinks.used()
+            + self.scan_workspace.used()
+            + self.replay.used()
             + self.work.used()
     }
 }
@@ -260,6 +268,8 @@ mod tests {
                 + defaults.foreground_index.limit()
                 + defaults.listings.limit()
                 + defaults.hardlinks.limit()
+                + defaults.scan_workspace.limit()
+                + defaults.replay.limit()
                 + defaults.work.limit(),
             128 * 1024 * 1024
         );

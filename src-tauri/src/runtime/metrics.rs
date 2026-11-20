@@ -54,6 +54,8 @@ struct Snapshot {
     listings: Pool,
     hardlinks: Pool,
     work: Pool,
+    scan_workspace: Pool,
+    replay: Pool,
     component_lifetime_peak_sum_upper_bound: usize,
     managed_fd_current: usize,
     managed_fd_lifetime_peak: usize,
@@ -111,6 +113,8 @@ impl Recorder {
         let foreground_index = Pool::read(&self.budgets.foreground_index);
         let listings = Pool::read(&self.budgets.listings);
         let hardlinks = Pool::read(&self.budgets.hardlinks);
+        let scan_workspace = Pool::read(&self.budgets.scan_workspace);
+        let replay = Pool::read(&self.budgets.replay);
         let work = Pool::read(&self.budgets.work);
         Snapshot {
             kind: "nativeManagedCounters",
@@ -128,10 +132,14 @@ impl Recorder {
             listings,
             hardlinks,
             work,
+            scan_workspace,
+            replay,
             component_lifetime_peak_sum_upper_bound: background_index.lifetime_peak
                 + foreground_index.lifetime_peak
                 + listings.lifetime_peak
                 + hardlinks.lifetime_peak
+                + scan_workspace.lifetime_peak
+                + replay.lifetime_peak
                 + work.lifetime_peak,
             managed_fd_current: self.handles.open(),
             managed_fd_lifetime_peak: self.handles.peak(),
@@ -226,6 +234,8 @@ mod tests {
         value.listings = max;
         value.hardlinks = max;
         value.work = max;
+        value.scan_workspace = max;
+        value.replay = max;
         value.elapsed_us = u128::MAX;
         value.unix_ms = u128::MAX;
         value.component_lifetime_peak_sum_upper_bound = usize::MAX;
