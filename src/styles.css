@@ -519,3 +519,47 @@ button:focus-visible {
     width: 280px;
   }
 }
+.root-picker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.root-info {
+  position: relative;
+}
+.root-info summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 5px;
+}
+.root-info summary::-webkit-details-marker {
+  display: none;
+}
+.root-info > div {
+  position: absolute;
+  z-index: 10;
+  top: 100%;
+  left: 0;
+  width: max-content;
+  max-width: 320px;
+  overflow-wrap: anywhere;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.dot.running {
+  animation: scan-breathe 1.4s ease-in-out infinite;
+}
+@keyframes scan-breathe {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.8);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dot.running {
+    animation: none;
+  }
+}

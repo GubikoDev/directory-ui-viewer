@@ -229,6 +229,7 @@ export class SessionClient {
     return true;
   }
   private async activate(root: RootData) {
+    this.errorLog.clear();
     this.currentScope = root.session;
     if (!this.store.reset(root)) {
       // Native has already accepted this scope. Keep its control identity even
@@ -412,6 +413,7 @@ export class SessionClient {
     return true;
   }
   async retryObservations(): Promise<boolean> {
+    this.errorLog.clear();
     if (!this.store.resumeObservations()) return false;
     const scope = this.store.getSnapshot().session;
     if (!scope) return true;

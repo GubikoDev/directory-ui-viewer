@@ -84,7 +84,6 @@ it.skipIf(process.env.DUV_NATIVE_UI_SMOKE !== '1')(
           client.store.getSnapshot().session?.rootEntryId,
         ),
       );
-      fireEvent.click(screen.getByRole('button', { name: 'child 파일 목록' }));
       await act(async () => {
         await client.poll();
       });
@@ -110,6 +109,7 @@ it.skipIf(process.env.DUV_NATIVE_UI_SMOKE !== '1')(
       await waitFor(() =>
         expect(client.store.getSnapshot().session?.generation).toBe(2),
       );
+      fireEvent.click(screen.getByLabelText('현재 폴더 정보'));
       fireEvent.click(screen.getByRole('button', { name: '연결 닫기' }));
       await waitFor(() => expect(client.hasSession).toBe(false));
       for (const operation of [

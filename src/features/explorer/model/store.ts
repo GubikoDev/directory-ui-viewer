@@ -505,7 +505,15 @@ export class ExplorerStore {
   applyUsage(scope: Scope, usages: DirectoryUsage[]) {
     if (!sameScope(this.state.session, scope)) return;
     let growth = 0;
-    for (const usage of usages) growth += 512 + 2 * usage.directoryId.length;
+    for (const usage of usages) {
+      if (
+        this.state.entries.get(usage.directoryId)?.kind === 'directory' &&
+        usage.usageRevision >
+          (this.state.usages.get(usage.directoryId)?.usageRevision ?? -1)
+      )
+        growth += 512 + 2 * usage.directoryId.length;
+    }
+    if (!growth) return true;
     return this.change(
       usages,
       undefined,

@@ -25,7 +25,7 @@ test('v2 fixture flow wires folders, files, presentation, refresh and close', as
     page.getByRole('button', { name: '마인드맵', exact: true }),
   ).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: 'C', exact: true }).click();
-  await expect(page.getByText('하위 폴더가 없습니다.')).toBeVisible();
+  await expect(page.getByRole('region', { name: 'C 파일 목록' })).toBeVisible();
   await page.getByRole('button', { name: '새로고침', exact: true }).click();
   await expect(
     page.getByRole('dialog', { name: '다시 읽기 확인' }),
@@ -34,6 +34,7 @@ test('v2 fixture flow wires folders, files, presentation, refresh and close', as
   await expect(
     page.getByRole('button', { name: 'A', exact: true }),
   ).toBeVisible();
+  await page.getByLabel('현재 폴더 정보').click();
   await page.getByRole('button', { name: '연결 닫기', exact: true }).click();
   await expect(
     page.getByRole('button', { name: '폴더 열기', exact: true }),

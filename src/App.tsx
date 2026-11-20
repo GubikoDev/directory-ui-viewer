@@ -1,5 +1,5 @@
 import engineLicenses from '../licenses/THIRD-PARTY-NOTICES.txt?raw';
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createAdapter } from './features/explorer/adapters/create';
 import { SessionClient } from './features/explorer/client/session-client';
 import { terminal, type Entry } from './features/explorer/model/types';
@@ -82,8 +82,39 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
   const root = state.session
     ? state.entries.get(state.session.rootEntryId)
     : undefined;
+  const selectedUsage = selected ? state.usages.get(selected) : undefined;
+  const limitedUsage = [selectedUsage?.allocated, selectedUsage?.logical].some(
+    (measure) =>
+      measure?.state === 'partial' && measure.reasons.includes('resourceLimit'),
+  );
   const tasks = Array.from(state.tasks.values());
   const active = tasks.filter((t) => !terminal(t.phase));
+  const scan = active.find((task) => task.operation === 'scanUsage');
+  const directoryPage = selected
+    ? client.store.getListing(selected, 'directories').snapshot
+    : undefined;
+  const leaf =
+    directoryPage?.coverage === 'complete' &&
+    directoryPage.entryIds.length === 0;
+  const autoFiles = useRef('');
+  useEffect(() => {
+    if (!selected || !state.session || !leaf) {
+      autoFiles.current = '';
+      return;
+    }
+    const key = JSON.stringify([
+      state.session.sessionId,
+      state.session.generation,
+      selected,
+    ]);
+    if (autoFiles.current === key) return;
+    autoFiles.current = key;
+    if (!state.openFileListIds.has(selected)) {
+      void client
+        .list(selected, 'files')
+        .catch((e) => setError(e instanceof Error ? e.message : 'INTERNAL'));
+    }
+  }, [client, leaf, selected, state.session, state.openFileListIds]);
   const failure =
     error || state.failedRoot?.issue.code || client.errors.at(-1)?.message;
   const graph = layoutGraph(state, showHidden, limits);
@@ -114,25 +145,56 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
       <h1 className="sr-only">Directory UI Viewer</h1>
       <header className="topbar">
         <div className="root-name">
-          {root && icon('imgRootIcon', 15)}
-          <span>{root?.displayName ?? ''}</span>
+          {root && (
+            <>
+              <button
+                className="root-picker"
+                onClick={choose}
+                disabled={choosing}
+                aria-label="현재 폴더 변경"
+              >
+                {icon('imgRootIcon', 15)}
+                <span>{root.displayName}</span>
+              </button>
+              <details className="root-info" key={state.session?.sessionId}>
+                <summary aria-label="현재 폴더 정보">▾</summary>
+                <div>
+                  <strong>{root.displayName}</strong>
+                  <p>
+                    디스크 사용량{' '}
+                    {formatMeasure(state.usages.get(root.entryId)?.allocated)}
+                  </p>
+                  <p>수정 {dateLabel(root)}</p>
+                  <button onClick={() => run(() => client.close())}>
+                    연결 닫기
+                  </button>
+                </div>
+              </details>
+            </>
+          )}
         </div>
         <section className="readout" aria-label="작업 상태">
-          {failure ? (
+          {failure || state.resourceLimited ? (
             <span role="alert" className="danger">
-              {failure} · 폴더를 다시 선택해주세요
+              {failure === 'RESOURCE_LIMIT' || state.resourceLimited
+                ? '앱의 자원 한도에 도달했습니다. 열린 목록을 닫은 뒤 작업을 다시 시도하세요.'
+                : state.failedRoot
+                  ? '폴더를 다시 선택해주세요.'
+                  : failure}
             </span>
-          ) : active.length ? (
+          ) : null}
+          {active.length > 0 && (
             <span role="status">
               <i className="dot running" />
-              읽는 중 · 항목 {active[0].processedEntries} · {active.length}개
-              작업
+              {scan ? '용량 집계 중' : '목록 읽는 중'} · 항목{' '}
+              {(scan ?? active[0]).processedEntries}
             </span>
-          ) : state.resourceLimited ? (
+          )}
+          {state.resourceLimited && (
             <button onClick={() => run(() => client.retryObservations())}>
-              관측 다시 읽기
+              다시 시도
             </button>
-          ) : null}
+          )}
           {active.length > 0 && (
             <button
               onClick={() =>
@@ -497,6 +559,11 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                   </strong>
                 </div>
               </div>
+              {limitedUsage && (
+                <p role="status">
+                  탐색 자원 한도에 도달해 확인한 용량만 표시합니다.
+                </p>
+              )}
               <p className="detail-note">
                 노드 크기는 디스크 사용량 기준. 링크 대상은 세지 않습니다.
               </p>
@@ -554,12 +621,6 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
             onClick={() => run(() => client.list(entry.entryId, 'files'))}
           >
             파일 목록 보기
-          </button>
-          <button
-            disabled={!client.hasSession}
-            onClick={() => run(() => client.close())}
-          >
-            연결 닫기
           </button>
         </div>
       )}

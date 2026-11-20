@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { InternalApp } from './InternalApp';
@@ -31,6 +31,23 @@ describe('App', () => {
     );
     expect(screen.getByRole('button', { name: 'child-0' })).toBeInTheDocument();
     view.unmount();
+  });
+  it('shows files automatically when the selected root has no directories', async () => {
+    const client = new SessionClient(
+      new FixtureAdapter({
+        entries: [
+          fixtureEntry('root', null),
+          fixtureEntry('leaf.txt', 'root', 'regularFile'),
+        ],
+      }),
+    );
+    render(<App client={client} />);
+    fireEvent.click(screen.getByRole('button', { name: '폴더 열기' }));
+    expect(await screen.findByRole('cell', { name: 'leaf.txt' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '파일 목록 닫기' }));
+    await waitFor(() =>
+      expect(screen.queryByRole('cell', { name: 'leaf.txt' })).toBeNull(),
+    );
   });
   it('identifies the application', () => {
     render(<App />);

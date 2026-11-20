@@ -143,6 +143,8 @@ struct SharedSize {
 }
 #[derive(Default)]
 struct Aggregate {
+    ordinary_logical: u128,
+    ordinary_allocated: u128,
     logical: Sum,
     allocated: Sum,
     shared: BTreeMap<FileIdentity, SharedSize>,
@@ -157,6 +159,12 @@ impl Aggregate {
         self.allocated.reason(reason);
     }
     fn add_own(&mut self, observation: &Observation) {
+        if let Metric::Known(value) = observation.logical {
+            self.ordinary_logical += u128::from(value);
+        }
+        if let Metric::Known(value) = observation.allocated {
+            self.ordinary_allocated += u128::from(value);
+        }
         self.logical.add(observation.logical);
         self.allocated.add(observation.allocated);
     }
@@ -230,12 +238,17 @@ impl Aggregate {
         }
         *shared_bytes += SHARED_BYTES;
         self.shared.insert(identity, size);
-        self.add_own(observation);
+        self.logical.add(size.logical);
+        self.allocated.add(size.allocated);
         true
     }
     fn merge(&mut self, mut child: Self, shared_bytes: &mut usize) {
         // Merge ordinary and shared totals, then subtract duplicate shared
         // contributions. Moving map nodes avoids cloning all ancestor sets.
+        self.ordinary_logical = self.ordinary_logical.saturating_add(child.ordinary_logical);
+        self.ordinary_allocated = self
+            .ordinary_allocated
+            .saturating_add(child.ordinary_allocated);
         self.logical.merge(&child.logical);
         self.allocated.merge(&child.allocated);
         for (identity, size) in std::mem::take(&mut child.shared) {
@@ -702,14 +715,25 @@ impl<S: ObservationSource> UsageScanner<S> {
             self.stats.peak_working_bytes = self.stats.peak_working_bytes.max(working);
         }
         if self.phase == ScanPhase::Running {
-            for frame in &self.stack {
+            // Open descendants have not merged yet. Include their ordinary bytes
+            // immediately; hard links need identity reconciliation at merge.
+            let mut logical_below = 0u128;
+            let mut allocated_below = 0u128;
+            for frame in self.stack.iter().rev() {
+                let mut logical = frame.aggregate.logical.clone();
+                let mut allocated = frame.aggregate.allocated.clone();
+                logical.add_number(logical_below);
+                allocated.add_number(allocated_below);
+                logical_below = logical_below.saturating_add(frame.aggregate.ordinary_logical);
+                allocated_below =
+                    allocated_below.saturating_add(frame.aggregate.ordinary_allocated);
                 self.revision += 1;
                 let usage = DirectoryUsage {
                     directory_id: frame.id.clone(),
                     usage_revision: self.revision,
                     scan_state: ScanState::Running,
-                    logical: frame.aggregate.logical.measure(true),
-                    allocated: frame.aggregate.allocated.measure(true),
+                    logical: logical.measure(true),
+                    allocated: allocated.measure(true),
                     observed_at: observed_at.into(),
                 };
                 self.index
@@ -1207,6 +1231,24 @@ mod tests {
         assert!(
             matches!(sum.measure(false), Measure::Partial { reasons, .. } if reasons.contains(&Reason::Overflow))
         );
+    }
+    #[test]
+    fn root_progress_includes_files_in_an_open_child() {
+        let mut source = Source::default();
+        source
+            .children
+            .insert(1, vec![node(2, "child", Kind::Directory, 1, 2)]);
+        source
+            .children
+            .insert(2, vec![node(3, "file", Kind::RegularFile, 30, 60)]);
+        let mut scan = scanner(source, ScanLimits::default());
+        scan.step(1, STAMP);
+        scan.step(1, STAMP);
+        let usage = scan.index.usage(scan.root_id()).unwrap().unwrap();
+        assert_eq!(usage.scan_state, ScanState::Running);
+        assert_eq!((bytes(&usage.logical), bytes(&usage.allocated)), (41, 82));
+        scan.run(STAMP);
+        assert_eq!(complete(&scan, scan.root_id()), (41, 82));
     }
     #[test]
     fn step_publishes_partial_progress_and_large_sums_remain_exact() {
