@@ -379,6 +379,7 @@ impl Completion {
         let serialized = serde_json::to_writer(&mut writer, &value);
         drop(value);
         let reply = if serialized.is_ok() {
+            writer.bytes.shrink_to_fit();
             writer
                 .memory
                 .resize(writer.bytes.capacity())
@@ -431,11 +432,27 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn completed_small_replies_release_the_unused_start_listing_allowance() {
+        let budget = ByteBudget::with_headroom(4 * 1024 * 1024, 1024 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 256, 300_000).unwrap();
+        let allowance = 80 * 1024;
+        for sequence in 1..=300 {
+            let (RequestAdmission::Execute(owner, _waiter), Some(_delivery)) = service
+                .begin_for_delivery(n(sequence), &hash(), 0, allowance, false, Some(allowance))
+                .unwrap()
+            else {
+                panic!("expected a new listing request");
+            };
+            let _response_memory = budget.reserve(64 * 1024).unwrap();
+            owner.complete(json!({"sequence": sequence})).unwrap();
+        }
+        let replay = tauri::async_runtime::block_on(wait(&service, 300, 0).wait()).unwrap();
+        assert_eq!(replay.bytes(), br#"{"sequence":300}"#);
+    }
+    #[test]
     fn delivery_admission_reclaims_completed_cache_and_preserves_current_replay() {
         let budget = ByteBudget::new(192 * 1024);
         let service = ReplayService::new(1, budget.clone(), 256, 1000).unwrap();
-        // Each completed reply owns a preallocated48KiB buffer. Two records
-        // leave too little room for the next caller's approximately36KiB eval.
         drop(
             execute(&service, 1, 48 * 1024)
                 .complete(json!({"id":1}))
@@ -443,9 +460,11 @@ mod tests {
         );
         drop(
             execute(&service, 2, 48 * 1024)
-                .complete(json!({"id":2}))
+                .complete("x".repeat(48 * 1024 - 2))
                 .unwrap(),
         );
+        // Force delivery to reclaim the second reply while replaying the first.
+        let pressure = budget.reserve(budget.available()).unwrap();
         let (RequestAdmission::Wait(waiter), Some(delivery)) = service
             .begin_for_delivery(n(1), &hash(), 0, 4096, false, Some(4096))
             .unwrap()
@@ -459,7 +478,7 @@ mod tests {
         );
         // New requests also remain admissible after the completed cache was
         // reclaimed, rather than leaving the request ledger permanently full.
-        drop((reply, delivery));
+        drop((reply, delivery, pressure));
         let (RequestAdmission::Execute(owner, _), Some(delivery)) = service
             .begin_for_delivery(n(3), &hash(), 0, 4096, false, Some(4096))
             .unwrap()
@@ -712,7 +731,7 @@ mod tests {
         for sequence in 1..=3 {
             held.push(
                 execute(&service, sequence, 16 * 1024)
-                    .complete("x".repeat(9000))
+                    .complete("x".repeat(16 * 1024 - 2))
                     .unwrap(),
             );
         }
