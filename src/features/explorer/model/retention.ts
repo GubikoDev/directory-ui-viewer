@@ -16,10 +16,12 @@ export function compactClosed(
   memory: FrontendReservation,
 ): ExplorerState {
   const selected = state.selectedId ?? state.session?.rootEntryId;
-  const visible = (id: string, files: boolean) =>
-    files
-      ? state.openFileListIds.has(id)
-      : id === selected || state.expandedIds.has(id);
+  const visible = (listing: DirectoryListing) =>
+    listing.automatic ||
+    (listing.category === 'files'
+      ? state.openFileListIds.has(listing.directoryId)
+      : listing.directoryId === selected ||
+        state.expandedIds.has(listing.directoryId));
   let closed = false;
   const retained = new Set<string>();
   const tasks = new Set<string>();
@@ -28,7 +30,7 @@ export function compactClosed(
   for (const id of state.expandedIds) retained.add(id);
   for (const id of state.openFileListIds) retained.add(id);
   for (const listing of state.listings.values()) {
-    if (!visible(listing.directoryId, listing.category === 'files')) {
+    if (!visible(listing)) {
       closed = true;
       continue;
     }
@@ -51,8 +53,7 @@ export function compactClosed(
   if (!closed) return state;
   const listings = new Map<string, DirectoryListing>();
   for (const [key, listing] of state.listings)
-    if (visible(listing.directoryId, listing.category === 'files'))
-      listings.set(key, listing);
+    if (visible(listing)) listings.set(key, listing);
   const entries = new Map<string, Entry>();
   const usages = new Map<string, DirectoryUsage>();
   const work = new Map<string, WorkRecord>();

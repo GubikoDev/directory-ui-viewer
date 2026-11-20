@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { InternalApp } from './InternalApp';
@@ -7,6 +13,14 @@ import {
   FixtureAdapter,
   fixtureEntry,
 } from './features/explorer/adapters/fixture';
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((release) => {
+    resolve = release;
+  });
+  return { resolve, promise };
+}
 
 describe('App', () => {
   it('reports a synchronous page admission failure without losing the current view', async () => {
@@ -48,6 +62,89 @@ describe('App', () => {
     await waitFor(() =>
       expect(screen.queryByRole('cell', { name: 'leaf.txt' })).toBeNull(),
     );
+  });
+  it('opens the clicked panel while directory discovery and the size scan are pending, then gives the file read priority', async () => {
+    const adapter = new FixtureAdapter({
+      entries: [
+        fixtureEntry('root', null),
+        fixtureEntry('one', 'root'),
+        fixtureEntry('two', 'root'),
+        fixtureEntry('child', 'one'),
+        fixtureEntry('direct.txt', 'one', 'regularFile'),
+      ],
+    });
+    const directory = gate();
+    const file = gate();
+    const usage = gate();
+    const read = adapter.startListing.bind(adapter);
+    const start = vi
+      .spyOn(adapter, 'startListing')
+      .mockImplementation(async (request) => {
+        const response = await read(request);
+        if (request.directoryId === 'one')
+          await (request.category === 'files'
+            ? file.promise
+            : directory.promise);
+        return response;
+      });
+    const scan = adapter.startUsageScan.bind(adapter);
+    vi.spyOn(adapter, 'startUsageScan').mockImplementation(async (request) => {
+      const response = await scan(request);
+      await usage.promise;
+      return response;
+    });
+    const client = new SessionClient(adapter);
+    const view = render(<App client={client} />);
+    try {
+      fireEvent.click(screen.getByRole('button', { name: '폴더 열기' }));
+      await waitFor(() =>
+        expect(start).toHaveBeenCalledWith(
+          expect.objectContaining({
+            directoryId: 'one',
+            category: 'directories',
+          }),
+        ),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'one' }));
+      const panel = await screen.findByRole('region', {
+        name: 'one 파일 목록',
+      });
+      expect(panel).toHaveTextContent('읽는 중');
+      await act(async () => directory.resolve());
+      expect(screen.queryByRole('button', { name: 'child' })).toBeNull();
+      expect(start).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          directoryId: 'two',
+          category: 'directories',
+        }),
+      );
+      await act(async () => file.resolve());
+      expect(
+        await screen.findByRole('cell', { name: 'direct.txt' }),
+      ).toBeVisible();
+      await waitFor(() =>
+        expect(start).toHaveBeenCalledWith(
+          expect.objectContaining({
+            directoryId: 'two',
+            category: 'directories',
+          }),
+        ),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'two' }));
+      expect(
+        await screen.findByRole('region', { name: 'two 파일 목록' }),
+      ).toBeVisible();
+      expect(
+        screen.queryByRole('region', { name: 'one 파일 목록' }),
+      ).toBeNull();
+    } finally {
+      await act(async () => {
+        directory.resolve();
+        file.resolve();
+        usage.resolve();
+      });
+      view.unmount();
+    }
   });
   it('identifies the application', () => {
     render(<App />);

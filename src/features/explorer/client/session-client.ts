@@ -249,6 +249,8 @@ export class SessionClient {
     const scope = this.store.getSnapshot().session;
     if (!scope) throw new AdapterError('SESSION_CLOSED');
     const { start, pending } = await this.control(async () => {
+      if (!sameScope(this.store.getSnapshot().session, scope))
+        throw new AdapterError('STALE_GENERATION');
       const request = { ...this.scoped(scope), directoryId, category };
       const order = this.number;
       if (!this.store.beginListing(directoryId, category, order))
@@ -302,8 +304,15 @@ export class SessionClient {
       // A definitive native error is itself replayable. Keeping its request
       // would retry the same cached failure forever; only an unobserved result
       // or a rejected local registration needs pending-start recovery.
-      if (response.requestId === id && response.outcome === 'error')
+      if (response.requestId === id && response.outcome === 'error') {
         this.pendingStarts.delete(id);
+        if (start.kind === 'listing')
+          this.store.failListingStart(
+            start.request.directoryId,
+            start.request.category,
+            start.order,
+          );
+      }
       const data = unwrap(response, id);
       if (!data) {
         this.pendingStarts.delete(id);
@@ -341,6 +350,79 @@ export class SessionClient {
       else this.pendingStarts.delete(id);
       throw error;
     }
+  }
+  async startTreeListing(scope: Scope, directoryId: string) {
+    if (!sameScope(this.store.getSnapshot().session, scope))
+      throw new AdapterError('STALE_GENERATION');
+    const request = {
+      ...this.scoped(scope),
+      directoryId,
+      category: 'directories' as const,
+    };
+    const start = unwrap(
+      await this.adapter.startListing(request),
+      request.requestId,
+    );
+    if (
+      !start ||
+      !sameScope(scope, start.work) ||
+      start.category !== 'directories' ||
+      start.directoryId !== directoryId
+    )
+      throw new AdapterError('INVALID_RESPONSE');
+    return start;
+  }
+  async readTreePage(start: ListingStart, cursor: string | null) {
+    if (!sameScope(this.store.getSnapshot().session, start.work))
+      throw new AdapterError('STALE_GENERATION');
+    const request = {
+      ...this.scoped(start.work),
+      taskId: start.work.taskId,
+      cursor,
+      limit: 200,
+    };
+    const page = unwrap(
+      await this.adapter.readListingPage(request),
+      request.requestId,
+    );
+    if (
+      !page ||
+      !sameScope(start.work, page.work) ||
+      page.work.taskId !== start.work.taskId ||
+      page.listingRevision !== start.listingRevision ||
+      page.directoryId !== start.directoryId ||
+      page.category !== start.category ||
+      page.cursor !== cursor
+    )
+      throw new AdapterError('INVALID_RESPONSE');
+    return page;
+  }
+  hasFileDemand() {
+    let starting = false;
+    this.pendingStarts.forEach((start) => {
+      if (
+        start.kind === 'listing' &&
+        start.request.category === 'files' &&
+        sameScope(this.store.getSnapshot().session, start.request) &&
+        this.store.isListingRequestCurrent(
+          start.request.directoryId,
+          'files',
+          start.order,
+        )
+      )
+        starting = true;
+    });
+    if (starting) return true;
+    for (const id of this.store.getSnapshot().openFileListIds) {
+      const listing = this.store.getListing(id, 'files');
+      if (
+        listing.taskId &&
+        (this.pageDemand.has(listing.taskId) ||
+          this.pageReads.has(listing.taskId))
+      )
+        return true;
+    }
+    return false;
   }
   nextPage(taskId: string): Promise<boolean> {
     const state = this.store.getSnapshot();

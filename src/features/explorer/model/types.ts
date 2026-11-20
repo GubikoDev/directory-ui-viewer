@@ -94,6 +94,8 @@ export interface ListingPage extends ListingStart {
   issues: Issues;
 }
 export interface DirectoryListing {
+  /** Automatic tree observations have no user close intent. */
+  automatic?: true;
   directoryId: string;
   category: Category;
   loadState: 'notRequested' | 'loading' | 'settled' | 'failed' | 'cancelled';

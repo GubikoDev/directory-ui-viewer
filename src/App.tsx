@@ -1,8 +1,20 @@
 import engineLicenses from '../licenses/THIRD-PARTY-NOTICES.txt?raw';
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import {
+  useEffect,
+  useRef,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import { createAdapter } from './features/explorer/adapters/create';
+import { useGraphViewport } from './features/explorer/ui/use-graph-viewport';
+import { discoverDirectories } from './features/explorer/client/directory-discovery';
 import { SessionClient } from './features/explorer/client/session-client';
-import { terminal, type Entry } from './features/explorer/model/types';
+import {
+  terminal,
+  type Entry,
+  type RootSession,
+} from './features/explorer/model/types';
 import {
   formatBytes,
   formatMeasure,
@@ -57,7 +69,21 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
   const [showHidden, setShowHidden] = useState(false);
   const [light, setLight] = useState(false);
   const [details, setDetails] = useState(false);
-  const [limits, setLimits] = useState<ReadonlyMap<string, number>>(new Map());
+  const [finishedTree, setFinishedTree] = useState<RootSession | null>(null);
+  const discovering = !!state.session && state.session !== finishedTree;
+  const discovery = useRef<(() => void) | undefined>(undefined);
+  useEffect(() => {
+    if (!state.session) return;
+    const session = state.session;
+    const stop = discoverDirectories(
+      client,
+      session,
+      (e) => setError(e instanceof Error ? e.message : 'INTERNAL'),
+      () => setFinishedTree(session),
+    );
+    discovery.current = stop;
+    return stop;
+  }, [client, state.session]);
   useEffect(() => () => client.dispose(), [client]);
   const run = (action: () => unknown | Promise<unknown>) => {
     setError('');
@@ -71,7 +97,6 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
       try {
         if (await client.chooseRoot()) {
           setDetails(false);
-          setLimits(new Map());
         }
       } finally {
         setChoosing(false);
@@ -98,7 +123,12 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
     directoryPage.entryIds.length === 0;
   const autoFiles = useRef('');
   useEffect(() => {
-    if (!selected || !state.session || !leaf) {
+    if (
+      !selected ||
+      selected !== state.session?.rootEntryId ||
+      !state.session ||
+      !leaf
+    ) {
       autoFiles.current = '';
       return;
     }
@@ -117,15 +147,47 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
   }, [client, leaf, selected, state.session, state.openFileListIds]);
   const failure =
     error || state.failedRoot?.issue.code || client.errors.at(-1)?.message;
-  const graph = layoutGraph(state, showHidden, limits);
-  const positions = new Map(graph.nodes.map((n) => [n.id, n]));
+  const { session, entries, listings, usages, mode } = state;
+  const graph = useMemo(
+    () => layoutGraph({ session, entries, listings, usages, mode }, showHidden),
+    [session, entries, listings, usages, mode, showHidden],
+  );
+  const positions = useMemo(
+    () => new Map(graph.nodes.map((n) => [n.id, n])),
+    [graph],
+  );
+  const { ref: graphRef, bounds } = useGraphViewport(
+    session,
+    mode,
+    selected ? positions.get(selected) : undefined,
+  );
+  const windowed =
+    graph.nodes.length > 200 && bounds.width > 0 && bounds.height > 0;
+  const intersects = (
+    left: number,
+    top: number,
+    right: number,
+    bottom: number,
+  ) =>
+    !windowed ||
+    (right >= bounds.left - 200 &&
+      left <= bounds.left + bounds.width + 200 &&
+      bottom >= bounds.top - 200 &&
+      top <= bounds.top + bounds.height + 200);
+  const visibleNodes = graph.nodes.filter((n) =>
+    intersects(n.x, n.y, n.x + n.width, n.y + n.height),
+  );
   const open = (id: string) =>
     run(async () => {
       client.store.select(id);
-      const listing = client.store.getListing(id, 'directories');
-      client.store.setExpanded(id, true);
-      if (!listing.snapshot || listing.loadState === 'failed')
-        await client.list(id, 'directories');
+      for (const previous of client.store.getSnapshot().openFileListIds) {
+        if (previous !== id) client.closeListing(previous, 'files');
+      }
+      if (
+        !client.store.getSnapshot().openFileListIds.has(id) ||
+        client.store.getListing(id, 'files').loadState === 'failed'
+      )
+        await client.list(id, 'files');
     });
   const fileLists = Array.from(state.openFileListIds).filter((id) =>
     positions.has(id),
@@ -183,11 +245,21 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                   : failure}
             </span>
           ) : null}
-          {active.length > 0 && (
+          {(discovering || active.length > 0) && (
             <span role="status">
               <i className="dot running" />
-              {scan ? '용량 집계 중' : '목록 읽는 중'} · 항목{' '}
-              {(scan ?? active[0]).processedEntries}
+              {active.some((t) => t.operation === 'listFiles')
+                ? '파일 목록 읽는 중'
+                : discovering
+                  ? '폴더 찾는 중'
+                  : scan
+                    ? '용량 집계 중'
+                    : '목록 읽는 중'}
+              {scan &&
+                (discovering ||
+                  active.some((t) => t.operation === 'listFiles')) &&
+                ' · 용량 집계 중'}
+              {scan && ` · 항목 ${scan.processedEntries}`}
             </span>
           )}
           {state.resourceLimited && (
@@ -195,12 +267,16 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
               다시 시도
             </button>
           )}
-          {active.length > 0 && (
+          {(discovering || active.length > 0) && (
             <button
               onClick={() =>
-                run(() =>
-                  Promise.all(active.map((t) => client.cancel(t.taskId))),
-                )
+                run(() => {
+                  discovery.current?.();
+                  setFinishedTree(state.session);
+                  return Promise.all(
+                    active.map((t) => client.cancel(t.taskId)),
+                  );
+                })
               }
             >
               중지
@@ -263,14 +339,13 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
           role="dialog"
           aria-label="다시 읽기 확인"
         >
-          <p>다시 읽으면 펼친 폴더가 접힙니다</p>
+          <p>폴더 구조와 용량을 처음부터 다시 읽을까요?</p>
           <div>
             <button
               className="primary"
               onClick={() => {
                 setConfirmRefresh(false);
                 setDetails(false);
-                setLimits(new Map());
                 run(() => client.refresh());
               }}
             >
@@ -297,7 +372,11 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
         </section>
       ) : (
         <div className="workspace">
-          <section className="graph-scroll" aria-label="폴더 구조">
+          <section
+            ref={graphRef}
+            className="graph-scroll"
+            aria-label="폴더 구조"
+          >
             <div
               className="graph-canvas"
               style={{ width: graph.width, height: graph.height }}
@@ -310,7 +389,16 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
               >
                 {graph.nodes.map((n) => {
                   const p = n.parent ? positions.get(n.parent) : undefined;
-                  if (!p) return null;
+                  if (
+                    !p ||
+                    !intersects(
+                      Math.min(p.x, n.x),
+                      Math.min(p.y, n.y),
+                      Math.max(p.x + p.width, n.x + n.width),
+                      Math.max(p.y + p.height, n.y + n.height),
+                    )
+                  )
+                    return null;
                   const x = p.x + p.width;
                   const y = p.y + p.height / 2;
                   const endY = n.y + n.height / 2;
@@ -326,7 +414,7 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                   );
                 })}
               </svg>
-              {graph.nodes.map((n) => {
+              {visibleNodes.map((n) => {
                 const item = state.entries.get(n.id)!;
                 const usage = state.usages.get(n.id);
                 const listing = client.store.getListing(n.id, 'directories');
@@ -365,6 +453,11 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                         {icon('imgFolder', 14)}
                         <span>{item.displayName}</span>
                       </button>
+                      {(listing.snapshot?.coverage === 'partial' &&
+                        listing.loadState !== 'loading') ||
+                      listing.loadState === 'failed' ? (
+                        <span className="tag">일부 읽기 불가</span>
+                      ) : null}
                       {hidden > 0 && <span className="tag">숨김 {hidden}</span>}
                     </div>
                     <div className="node-value">
@@ -391,11 +484,9 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                         aria-label={`${item.displayName} 파일 목록`}
                         aria-expanded={state.openFileListIds.has(n.id)}
                         onClick={() =>
-                          run(() =>
-                            state.openFileListIds.has(n.id)
-                              ? client.closeListing(n.id, 'files')
-                              : client.list(n.id, 'files'),
-                          )
+                          state.openFileListIds.has(n.id)
+                            ? run(() => client.closeListing(n.id, 'files'))
+                            : open(n.id)
                         }
                       >
                         {icon('imgFileIcon', 11)}
@@ -407,38 +498,6 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                   </div>
                 );
               })}
-              {graph.nodes.map((n) => {
-                const listing = client.store.getListing(n.id, 'directories');
-                if (
-                  n.id !== state.session?.rootEntryId &&
-                  !state.expandedIds.has(n.id)
-                )
-                  return null;
-                const visibleCount = (listing.snapshot?.entryIds ?? []).filter(
-                  (id) => {
-                    const h = state.entries.get(id)?.hidden;
-                    return showHidden || h?.state !== 'known' || !h.value;
-                  },
-                ).length;
-                const limit = limits.get(n.id) ?? 12;
-                return visibleCount > limit || listing.snapshot?.nextCursor ? (
-                  <button
-                    key={`more-${n.id}`}
-                    className="more-folders"
-                    style={{ left: n.x, top: n.y + n.height + 8 }}
-                    aria-label="폴더 다음 페이지"
-                    onClick={() =>
-                      run(async () => {
-                        if (visibleCount <= limit && listing.taskId)
-                          await client.nextPage(listing.taskId);
-                        setLimits((old) => new Map(old).set(n.id, limit + 12));
-                      })
-                    }
-                  >
-                    그 외 폴더 더 보기
-                  </button>
-                ) : null;
-              })}
               {fileLists.map((id) => {
                 const n = positions.get(id)!;
                 const listing = client.store.getListing(id, 'files');
@@ -447,17 +506,32 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                   const h = state.entries.get(fid)?.hidden;
                   return showHidden || h?.state !== 'known' || !h.value;
                 });
+                const right = n.x + n.width + 12;
+                const left =
+                  bounds.width && right + 316 > bounds.left + bounds.width
+                    ? Math.max(bounds.left + 4, n.x - 328)
+                    : right;
+                const top = bounds.height
+                  ? Math.max(
+                      bounds.top,
+                      Math.min(n.y, bounds.top + bounds.height - 160),
+                    )
+                  : n.y;
                 return (
                   <section
                     key={`files-${id}`}
                     className="file-panel"
                     aria-label={`${state.entries.get(id)?.displayName} 파일 목록`}
-                    style={{ left: n.x + n.width + 20, top: n.y + 80 }}
+                    style={{ left, top }}
                   >
                     <header>
                       <strong>{state.entries.get(id)?.displayName}</strong>
                       <span className="tag">
-                        직계 파일 {ids.length}
+                        직계 파일{' '}
+                        {listing.loadState === 'notRequested' ||
+                        (listing.loadState === 'loading' && !ids.length)
+                          ? '—'
+                          : ids.length}
                         {listing.snapshot?.nextCursor ? '+' : ''} · 숨김{' '}
                         {ids.length - shown.length}
                       </span>
@@ -510,9 +584,13 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                     </table>
                     {!shown.length && (
                       <p className="panel-empty">
-                        {listing.loadState === 'loading'
+                        {listing.loadState === 'loading' ||
+                        listing.loadState === 'notRequested'
                           ? '읽는 중…'
-                          : '표시할 파일이 없습니다.'}
+                          : listing.loadState === 'failed' ||
+                              listing.snapshot?.coverage === 'partial'
+                            ? '파일 목록을 모두 읽지 못했습니다.'
+                            : '표시할 파일이 없습니다.'}
                       </p>
                     )}
                     {listing.snapshot?.nextCursor && listing.taskId && (
@@ -588,20 +666,11 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                 <dd>{state.session.generation}세대</dd>
               </dl>
               <div className="detail-actions">
-                <button
-                  onClick={() => run(() => client.list(entry.entryId, 'files'))}
-                >
+                <button onClick={() => open(entry.entryId)}>
                   파일 목록 보기
                 </button>
                 <button onClick={() => run(() => client.scan())}>
                   용량 집계
-                </button>
-                <button
-                  onClick={() =>
-                    run(() => client.store.setExpanded(entry.entryId, false))
-                  }
-                >
-                  폴더 접기
                 </button>
                 {entry.parentId && (
                   <button onClick={() => open(entry.parentId!)}>
@@ -617,11 +686,7 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
         <div className="selection-actions" aria-label="선택 폴더 동작">
           <span>{entry.displayName}</span>
           <button onClick={() => setDetails(true)}>상세 보기</button>
-          <button
-            onClick={() => run(() => client.list(entry.entryId, 'files'))}
-          >
-            파일 목록 보기
-          </button>
+          <button onClick={() => open(entry.entryId)}>파일 목록 보기</button>
         </div>
       )}
       <details className="licenses">

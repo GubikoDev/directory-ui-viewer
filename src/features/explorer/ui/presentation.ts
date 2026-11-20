@@ -40,16 +40,18 @@ export interface GraphNode {
 }
 /** Layout only reads observations; it never acquires filesystem access. */
 export function layoutGraph(
-  state: ExplorerState,
+  state: Pick<
+    ExplorerState,
+    'session' | 'entries' | 'listings' | 'usages' | 'mode'
+  >,
   showHidden: boolean,
-  limits: ReadonlyMap<string, number>,
 ) {
   const root = state.session?.rootEntryId;
   const nodes: GraphNode[] = [];
   if (!root) return { nodes, width: 1440, height: 850 };
   const seen = new Set<string>();
   const stack = [{ id: root, parent: null as string | null, depth: 0 }];
-  while (stack.length && nodes.length < 240) {
+  while (stack.length) {
     const item = stack.pop()!;
     if (seen.has(item.id)) continue;
     const entry = state.entries.get(item.id);
@@ -57,16 +59,13 @@ export function layoutGraph(
     seen.add(item.id);
     const [width, height] = nodeSize(state.usages.get(item.id)?.allocated);
     nodes.push({ ...item, x: 0, y: 0, width, height });
-    if (item.id !== root && !state.expandedIds.has(item.id)) continue;
     const children =
       state.listings.get(listingKey(item.id, 'directories'))?.snapshot
         ?.entryIds ?? [];
-    const visible = children
-      .filter((id) => {
-        const hidden = state.entries.get(id)?.hidden;
-        return showHidden || hidden?.state !== 'known' || !hidden.value;
-      })
-      .slice(0, limits.get(item.id) ?? 12);
+    const visible = children.filter((id) => {
+      const hidden = state.entries.get(id)?.hidden;
+      return showHidden || hidden?.state !== 'known' || !hidden.value;
+    });
     for (let i = visible.length - 1; i >= 0; i--)
       stack.push({ id: visible[i], parent: item.id, depth: item.depth + 1 });
   }
@@ -78,17 +77,25 @@ export function layoutGraph(
       children.set(node.parent, list);
     }
   }
-  let leaf = 0;
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const node = nodes[i];
-    const branch = children.get(node.id);
-    node.x = 72 + node.depth * 320;
-    node.y = branch?.length
-      ? (branch[0].y + branch[branch.length - 1].y) / 2
-      : 100 + leaf++ * 112;
-  }
-  if (state.mode === 'mindmap') {
-    const maxDepth = Math.max(...nodes.map((n) => n.depth), 1);
+  if (state.mode === 'organization') {
+    // Keep the root and first branch in view as more siblings arrive.
+    let row = 0;
+    for (const node of nodes) {
+      node.x = 72 + node.depth * 320;
+      node.y = 100 + row * 112;
+      if (!children.has(node.id)) row++;
+    }
+  } else {
+    let leaf = 0;
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const node = nodes[i];
+      const branch = children.get(node.id);
+      node.y = branch?.length
+        ? (branch[0].y + branch[branch.length - 1].y) / 2
+        : 100 + leaf++ * 112;
+    }
+
+    const maxDepth = nodes.reduce((max, node) => Math.max(max, node.depth), 1);
     const radius = Math.max(320, leaf * 24);
     const center = radius + 280;
     for (const node of nodes) {
@@ -102,7 +109,7 @@ export function layoutGraph(
   }
   return {
     nodes,
-    width: Math.max(1440, ...nodes.map((n) => n.x + n.width + 120)),
-    height: Math.max(850, ...nodes.map((n) => n.y + n.height + 100)),
+    width: nodes.reduce((max, n) => Math.max(max, n.x + n.width + 120), 1440),
+    height: nodes.reduce((max, n) => Math.max(max, n.y + n.height + 100), 850),
   };
 }

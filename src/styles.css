@@ -288,13 +288,14 @@ button:focus-visible {
 .dot.settled {
   display: none;
 }
-.more-folders {
+.folder-select::after {
+  content: '';
   position: absolute;
-  color: var(--fg3) !important;
-  border: 1px dashed var(--line2) !important;
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 11px;
+  inset: 0;
+  border-radius: inherit;
+}
+.node-value button {
+  position: relative;
 }
 .file-panel {
   position: absolute;

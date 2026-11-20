@@ -473,6 +473,17 @@ export class ExplorerStore {
       return true;
     });
   }
+  failListingStart(id: string, category: Category, order: number) {
+    if (!this.isListingRequestCurrent(id, category, order)) return;
+    this.change(id, undefined, () => {
+      const listing = this.getListing(id, category);
+      const listings = new Map(this.state.listings).set(
+        listingKey(id, category),
+        { ...listing, loadState: 'failed' as const },
+      );
+      this.publish({ ...this.state, listings });
+    });
+  }
   acceptEvent(event: WorkEvent): boolean {
     const task = this.state.tasks.get(event.taskId);
     if (
@@ -535,10 +546,42 @@ export class ExplorerStore {
       growth,
     );
   }
-  applyPage(page: ListingPage): boolean {
+  applyPage(page: ListingPage, automatic = false): boolean {
     if (!sameScope(this.state.session, page.work)) return false;
     const key = listingKey(page.directoryId, page.category);
-    const listing = this.state.listings.get(key);
+    let listing = this.state.listings.get(key);
+    if (automatic) {
+      if (
+        page.category !== 'directories' ||
+        this.state.entries.get(page.directoryId)?.kind !== 'directory'
+      )
+        return false;
+      // The walker owns the cursor. Empty leaf/progress observations need no
+      // permanent task, listing or close reservation for every visited folder.
+      if (
+        !listing &&
+        !page.entries.length &&
+        !Object.keys(page.issues.counts).length &&
+        page.work.phase !== 'failed' &&
+        page.work.phase !== 'cancelled'
+      )
+        return true;
+      listing ??= {
+        automatic: true,
+        directoryId: page.directoryId,
+        category: page.category,
+        taskId: page.work.taskId,
+        loadState: 'loading',
+        snapshot: {
+          listingRevision: page.listingRevision,
+          entryIds: [],
+          nextCursor: page.cursor,
+          coverage: 'partial',
+          issues: page.issues,
+          observedAt: page.work.observedAt,
+        },
+      };
+    }
     if (
       listing?.taskId !== page.work.taskId ||
       listing.snapshot?.listingRevision !== page.listingRevision
@@ -617,9 +660,10 @@ export class ExplorerStore {
           },
         };
         const listings = new Map(this.state.listings).set(key, nextListing);
-        const tasks = this.acceptsTask(page.work)
-          ? new Map(this.state.tasks).set(page.work.taskId, page.work)
-          : this.state.tasks;
+        const tasks =
+          !automatic && this.acceptsTask(page.work)
+            ? new Map(this.state.tasks).set(page.work.taskId, page.work)
+            : this.state.tasks;
         this.publish({ ...this.state, entries, listings, tasks });
         return true;
       },

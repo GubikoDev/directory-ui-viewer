@@ -8,11 +8,10 @@ test('v2 fixture flow wires folders, files, presentation, refresh and close', as
   await expect(
     page.getByRole('button', { name: 'A', exact: true }),
   ).toBeVisible();
-  await page.getByRole('button', { name: 'B', exact: true }).click();
   await expect(
     page.getByRole('button', { name: 'C', exact: true }),
   ).toBeVisible();
-  await page.getByRole('button', { name: 'B 파일 목록', exact: true }).click();
+  await page.getByRole('button', { name: 'B', exact: true }).click();
   await expect(
     page.getByRole('cell', { name: 'file', exact: true }),
   ).toBeVisible();

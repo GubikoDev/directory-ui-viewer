@@ -193,7 +193,11 @@ describe('SessionClient with deterministic adapter', () => {
       await client.retryObservations();
       expect(start).toHaveBeenCalledTimes(count);
       expect(store.getListing('B', 'files').loadState).toBe(
-        ending === 'superseded' ? 'settled' : 'notRequested',
+        ending === 'superseded'
+          ? 'settled'
+          : ending === 'expired' || ending === 'nativeResourceError'
+            ? 'failed'
+            : 'notRequested',
       );
     },
   );
