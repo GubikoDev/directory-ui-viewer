@@ -45,6 +45,7 @@ export function layoutGraph(
     'session' | 'entries' | 'listings' | 'usages' | 'mode'
   >,
   showHidden: boolean,
+  collapsed?: ReadonlySet<string>,
 ) {
   const root = state.session?.rootEntryId;
   const nodes: GraphNode[] = [];
@@ -59,6 +60,7 @@ export function layoutGraph(
     seen.add(item.id);
     const [width, height] = nodeSize(state.usages.get(item.id)?.allocated);
     nodes.push({ ...item, x: 0, y: 0, width, height });
+    if (collapsed?.has(item.id)) continue;
     const children =
       state.listings.get(listingKey(item.id, 'directories'))?.snapshot
         ?.entryIds ?? [];

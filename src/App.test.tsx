@@ -46,7 +46,7 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: 'child-0' })).toBeInTheDocument();
     view.unmount();
   });
-  it('shows files automatically when the selected root has no directories', async () => {
+  it('requests files only from the file button, including a root with no directories', async () => {
     const client = new SessionClient(
       new FixtureAdapter({
         entries: [
@@ -57,6 +57,12 @@ describe('App', () => {
     );
     render(<App client={client} />);
     fireEvent.click(screen.getByRole('button', { name: '폴더 열기' }));
+    const root = await screen.findByRole('button', { name: 'root' });
+    fireEvent.click(root);
+    expect(client.store.getListing('root', 'files').loadState).toBe(
+      'notRequested',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'root 파일 목록' }));
     expect(await screen.findByRole('cell', { name: 'leaf.txt' })).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: '파일 목록 닫기' }));
     await waitFor(() =>
@@ -105,7 +111,7 @@ describe('App', () => {
           }),
         ),
       );
-      fireEvent.click(screen.getByRole('button', { name: 'one' }));
+      fireEvent.click(screen.getByRole('button', { name: 'one 파일 목록' }));
       const panel = await screen.findByRole('region', {
         name: 'one 파일 목록',
       });
@@ -130,7 +136,7 @@ describe('App', () => {
           }),
         ),
       );
-      fireEvent.click(screen.getByRole('button', { name: 'two' }));
+      fireEvent.click(screen.getByRole('button', { name: 'two 파일 목록' }));
       expect(
         await screen.findByRole('region', { name: 'two 파일 목록' }),
       ).toBeVisible();

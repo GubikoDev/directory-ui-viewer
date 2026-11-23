@@ -118,48 +118,32 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
   const tasks = Array.from(state.tasks.values());
   const active = tasks.filter((t) => !terminal(t.phase));
   const scan = active.find((task) => task.operation === 'scanUsage');
-  const directoryPage = selected
-    ? client.store.getListing(selected, 'directories').snapshot
-    : undefined;
-  const leaf =
-    directoryPage?.coverage === 'complete' &&
-    directoryPage.entryIds.length === 0;
-  const autoFiles = useRef('');
-  useEffect(() => {
-    if (
-      !selected ||
-      selected !== state.session?.rootEntryId ||
-      !state.session ||
-      !leaf
-    ) {
-      autoFiles.current = '';
-      return;
-    }
-    const key = JSON.stringify([
-      state.session.sessionId,
-      state.session.generation,
-      selected,
-    ]);
-    if (autoFiles.current === key) return;
-    autoFiles.current = key;
-    if (!state.openFileListIds.has(selected)) {
-      void client
-        .list(selected, 'files')
-        .catch((e) => setError(e instanceof Error ? e.message : 'INTERNAL'));
-    }
-  }, [client, leaf, selected, state.session, state.openFileListIds]);
   const failure =
     error || state.failedRoot?.issue.code || client.errors.at(-1)?.message;
   const { session, entries, listings, usages, mode } = state;
+  const [folds, setFolds] = useState<{
+    session: RootSession | null;
+    ids: Set<string>;
+  }>();
+  const collapsed = folds?.session === session ? folds?.ids : undefined;
   const graph = useMemo(
-    () => layoutGraph({ session, entries, listings, usages, mode }, showHidden),
-    [session, entries, listings, usages, mode, showHidden],
+    () =>
+      layoutGraph(
+        { session, entries, listings, usages, mode },
+        showHidden,
+        collapsed,
+      ),
+    [session, entries, listings, usages, mode, showHidden, collapsed],
   );
   const positions = useMemo(
     () => new Map(graph.nodes.map((n) => [n.id, n])),
     [graph],
   );
-  const { ref: graphRef, bounds } = useGraphViewport(
+  const {
+    ref: graphRef,
+    canvasRef,
+    bounds,
+  } = useGraphViewport(
     session,
     mode,
     selected ? positions.get(selected) : undefined,
@@ -206,7 +190,24 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
     }, 120);
     return () => clearTimeout(timer);
   }, [client, session, viewportKey]);
-  const open = (id: string) =>
+  const toggleBranch = (id: string, canFold: boolean) => {
+    client.store.select(id);
+    if (!canFold) return;
+    if (!collapsed?.has(id)) {
+      for (const fileId of client.store.getSnapshot().openFileListIds) {
+        let parent = positions.get(fileId)?.parent;
+        while (parent && parent !== id) parent = positions.get(parent)?.parent;
+        if (parent === id) client.closeListing(fileId, 'files');
+      }
+    }
+    setFolds((previous) => {
+      const ids = new Set(previous?.session === session ? previous?.ids : []);
+      if (ids.has(id)) ids.delete(id);
+      else ids.add(id);
+      return { session, ids };
+    });
+  };
+  const openFiles = (id: string) =>
     run(async () => {
       client.store.select(id);
       for (const previous of client.store.getSnapshot().openFileListIds) {
@@ -407,6 +408,7 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
             aria-label="폴더 구조"
           >
             <div
+              ref={canvasRef}
               className="graph-canvas"
               style={{ width: graph.width, height: graph.height }}
             >
@@ -454,6 +456,10 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                     return h?.state === 'known' && h.value;
                   },
                 ).length;
+                const canFold =
+                  collapsed?.has(n.id) ||
+                  (listing.snapshot?.entryIds.length ?? 0) >
+                    (showHidden ? 0 : hidden);
                 const isActive =
                   usage?.scanState === 'running' ||
                   usage?.scanState === 'queued';
@@ -477,8 +483,16 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                       <button
                         className="folder-select"
                         aria-label={item.displayName}
-                        onClick={() => open(n.id)}
+                        aria-expanded={
+                          canFold ? !collapsed?.has(n.id) : undefined
+                        }
+                        onClick={() => toggleBranch(n.id, canFold)}
                       >
+                        {canFold && (
+                          <span aria-hidden="true">
+                            {collapsed?.has(n.id) ? '▸' : '▾'}
+                          </span>
+                        )}
                         {icon('imgFolder', 14)}
                         <span>{item.displayName}</span>
                       </button>
@@ -515,13 +529,14 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                         onClick={() =>
                           state.openFileListIds.has(n.id)
                             ? run(() => client.closeListing(n.id, 'files'))
-                            : open(n.id)
+                            : openFiles(n.id)
                         }
                       >
                         {icon('imgFileIcon', 11)}
+                        파일 보기{' '}
                         {files.snapshot
                           ? `${files.snapshot.entryIds.length}${files.snapshot.nextCursor ? '+' : ''}`
-                          : '—'}
+                          : ''}
                       </button>
                     </div>
                   </div>
@@ -695,14 +710,14 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                 <dd>{state.session.generation}세대</dd>
               </dl>
               <div className="detail-actions">
-                <button onClick={() => open(entry.entryId)}>
+                <button onClick={() => openFiles(entry.entryId)}>
                   파일 목록 보기
                 </button>
                 <button onClick={() => run(() => client.scan())}>
                   용량 집계
                 </button>
                 {entry.parentId && (
-                  <button onClick={() => open(entry.parentId!)}>
+                  <button onClick={() => client.store.select(entry.parentId!)}>
                     상위 폴더
                   </button>
                 )}
@@ -715,7 +730,9 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
         <div className="selection-actions" aria-label="선택 폴더 동작">
           <span>{entry.displayName}</span>
           <button onClick={() => setDetails(true)}>상세 보기</button>
-          <button onClick={() => open(entry.entryId)}>파일 목록 보기</button>
+          <button onClick={() => openFiles(entry.entryId)}>
+            파일 목록 보기
+          </button>
         </div>
       )}
       <details className="licenses">

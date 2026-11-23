@@ -79,6 +79,7 @@ it.skipIf(process.env.DUV_NATIVE_UI_SMOKE !== '1')(
         { timeout: 10000 },
       );
       fireEvent.click(child);
+      fireEvent.click(screen.getByRole('button', { name: 'child 파일 목록' }));
       await waitFor(() =>
         expect(client.store.getSnapshot().selectedId).not.toBe(
           client.store.getSnapshot().session?.rootEntryId,

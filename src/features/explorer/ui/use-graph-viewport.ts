@@ -17,6 +17,8 @@ export function useGraphViewport(
     positions: ReadonlyMap<string, GraphNode>;
   } | null>(null);
   const ref = useRef<HTMLElement>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const scaleRef = useRef(1);
   const [bounds, setBounds] = useState({
     left: 0,
     top: 0,
@@ -25,12 +27,16 @@ export function useGraphViewport(
   });
   useLayoutEffect(() => {
     const element = ref.current;
-    if (!element || !session) return;
+    const canvas = canvasRef.current;
+    if (!element || !canvas || !session) return;
+    scaleRef.current = 1;
+    canvas.style.zoom = '1';
     const update = () => {
-      const left = element.scrollLeft,
-        top = element.scrollTop;
-      const width = element.clientWidth,
-        height = element.clientHeight;
+      const scale = scaleRef.current;
+      const left = element.scrollLeft / scale,
+        top = element.scrollTop / scale;
+      const width = element.clientWidth / scale,
+        height = element.clientHeight / scale;
       setBounds((prior) =>
         prior.left === left &&
         prior.top === top &&
@@ -43,11 +49,67 @@ export function useGraphViewport(
     element.scrollLeft = 0;
     element.scrollTop = 0;
     update();
+    const zoomAt = (requested: number, clientX: number, clientY: number) => {
+      if (!Number.isFinite(requested)) return;
+      const scale = Math.max(0.25, Math.min(4, requested));
+      const ratio = scale / scaleRef.current;
+      const rect = element.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      const left = (element.scrollLeft + x) * ratio - x;
+      const top = (element.scrollTop + y) * ratio - y;
+      canvas.style.zoom = String(scale);
+      scaleRef.current = scale;
+      element.scrollLeft = left;
+      element.scrollTop = top;
+      update();
+    };
+    // WebKit reports cumulative gesture scale. Chromium sends ctrl-wheel deltas.
+    let gestureBase: number | undefined;
+    const gestureStart = (event: Event) => {
+      event.preventDefault();
+      gestureBase = scaleRef.current;
+    };
+    const gestureChange = (event: Event) => {
+      if (gestureBase === undefined) return;
+      event.preventDefault();
+      const pinch = event as MouseEvent & { scale: number };
+      zoomAt(gestureBase * pinch.scale, pinch.clientX, pinch.clientY);
+    };
+    const gestureEnd = (event: Event) => {
+      event.preventDefault();
+      gestureBase = undefined;
+    };
+    const wheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      if (gestureBase !== undefined) return;
+      const unit =
+        event.deltaMode === 1
+          ? 16
+          : event.deltaMode === 2
+            ? element.clientHeight
+            : 1;
+      zoomAt(
+        scaleRef.current * Math.exp((-event.deltaY * unit) / 100),
+        event.clientX,
+        event.clientY,
+      );
+    };
+    const active = { passive: false };
+    element.addEventListener('wheel', wheel, active);
+    element.addEventListener('gesturestart', gestureStart, active);
+    element.addEventListener('gesturechange', gestureChange, active);
+    element.addEventListener('gestureend', gestureEnd, active);
     element.addEventListener('scroll', update, { passive: true });
     const observer =
       typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
     observer?.observe(element);
     return () => {
+      element.removeEventListener('wheel', wheel);
+      element.removeEventListener('gesturestart', gestureStart);
+      element.removeEventListener('gesturechange', gestureChange);
+      element.removeEventListener('gestureend', gestureEnd);
       element.removeEventListener('scroll', update);
       observer?.disconnect();
     };
@@ -57,9 +119,12 @@ export function useGraphViewport(
     previous.current = { session, mode, anchor, positions };
     const element = ref.current;
     if (!element || !anchor || !element.clientWidth) return;
+    const scale = scaleRef.current;
     if ((old?.mode !== mode || old.session !== session) && mode === 'mindmap') {
-      element.scrollLeft = anchor.x + (anchor.width - element.clientWidth) / 2;
-      element.scrollTop = anchor.y + (anchor.height - element.clientHeight) / 2;
+      element.scrollLeft =
+        (anchor.x + anchor.width / 2) * scale - element.clientWidth / 2;
+      element.scrollTop =
+        (anchor.y + anchor.height / 2) * scale - element.clientHeight / 2;
     } else if (
       old?.session === session &&
       old.mode === mode &&
@@ -68,33 +133,33 @@ export function useGraphViewport(
       // Collapsing offscreen branches can move the row the user is reading.
       for (const node of old.positions.values()) {
         if (
-          node.x + node.width <= element.scrollLeft ||
-          node.x >= element.scrollLeft + element.clientWidth ||
-          node.y + node.height <= element.scrollTop ||
-          node.y >= element.scrollTop + element.clientHeight
+          (node.x + node.width) * scale <= element.scrollLeft ||
+          node.x * scale >= element.scrollLeft + element.clientWidth ||
+          (node.y + node.height) * scale <= element.scrollTop ||
+          node.y * scale >= element.scrollTop + element.clientHeight
         )
           continue;
         const next = positions.get(node.id);
         if (next) {
-          element.scrollLeft += next.x - node.x;
-          element.scrollTop += next.y - node.y;
+          element.scrollLeft += (next.x - node.x) * scale;
+          element.scrollTop += (next.y - node.y) * scale;
           break;
         }
       }
     } else if (old?.session === session && old.anchor?.id === anchor.id) {
       // Keep a visible selection in place as new branches change the layout.
-      const x = old.anchor.x - element.scrollLeft,
-        y = old.anchor.y - element.scrollTop;
+      const x = old.anchor.x * scale - element.scrollLeft,
+        y = old.anchor.y * scale - element.scrollTop;
       if (
-        x > -old.anchor.width &&
+        x > -old.anchor.width * scale &&
         x < element.clientWidth &&
-        y > -old.anchor.height &&
+        y > -old.anchor.height * scale &&
         y < element.clientHeight
       ) {
-        element.scrollLeft += anchor.x - old.anchor.x;
-        element.scrollTop += anchor.y - old.anchor.y;
+        element.scrollLeft += (anchor.x - old.anchor.x) * scale;
+        element.scrollTop += (anchor.y - old.anchor.y) * scale;
       }
     }
   }, [session, mode, anchor, positions]);
-  return { ref, bounds };
+  return { ref, canvasRef, bounds };
 }
