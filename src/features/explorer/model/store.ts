@@ -468,11 +468,21 @@ export class ExplorerStore {
   }
   applyTask(work: WorkRecord): boolean {
     if (!this.acceptsTask(work)) return false;
-    return this.change(work, false, () => {
-      const tasks = new Map(this.state.tasks).set(work.taskId, work);
-      this.publish({ ...this.state, tasks });
-      return true;
-    });
+    const reuse =
+      this.state === this.compactState &&
+      (work.operation === 'scanUsage' ||
+        this.state.tasks.get(work.taskId)?.operation === work.operation);
+    return this.change(
+      work,
+      false,
+      () => {
+        const tasks = new Map(this.state.tasks).set(work.taskId, work);
+        this.publish({ ...this.state, tasks }, reuse);
+        return true;
+      },
+      reuse,
+      reuse ? ownBytes(this.state.tasks) + 512 + 2 * work.taskId.length : 0,
+    );
   }
   registerListing(start: ListingStart, requestOrder: number): boolean {
     if (!sameScope(this.state.session, start.work)) return false;
@@ -550,13 +560,19 @@ export class ExplorerStore {
       Math.max(this.sequences.get(event.taskId) ?? -1, task.sequence)
     )
       return false;
-    return this.change(event, false, () => {
-      this.sequences = new Map(this.sequences).set(
-        event.taskId,
-        event.sequence,
-      );
-      return true;
-    });
+    return this.change(
+      event,
+      false,
+      () => {
+        this.sequences = new Map(this.sequences).set(
+          event.taskId,
+          event.sequence,
+        );
+        return true;
+      },
+      !this.pressureMetadata,
+      ownBytes(this.sequences) + 512 + 2 * event.taskId.length,
+    );
   }
   markCancelPending(taskId: string) {
     if (!this.state.tasks.has(taskId)) return;
@@ -583,6 +599,7 @@ export class ExplorerStore {
       wanted &&
       Array.from(this.state.usages.keys()).some((id) => !wanted.has(id));
     if (!growth && !trim) return true;
+    const reuse = this.state === this.compactState;
     return this.change(
       usages,
       undefined,
@@ -602,8 +619,8 @@ export class ExplorerStore {
         }
         this.publish({ ...this.state, usages: next }, true);
       },
-      false,
-      growth,
+      reuse,
+      growth + (reuse ? ownBytes(this.state.usages) : 0),
     );
   }
   applyPage(page: ListingPage, automatic = false): boolean {
@@ -669,6 +686,7 @@ export class ExplorerStore {
         ? latestWork
         : page.work;
     let growth = 0;
+    let appendOnly = true;
     for (const entry of page.entries) {
       if (
         entry.parentId !== page.directoryId ||
@@ -677,31 +695,34 @@ export class ExplorerStore {
         return false;
       // New entry-map slots plus ID arrays, their concatenation and dedup Set.
       growth += 2048 + 8 * entry.entryId.length;
+      if (this.state.entries.has(entry.entryId)) appendOnly = false;
+    }
+    const reuse = appendOnly && this.state === this.compactState;
+    if (reuse) {
+      growth += ownBytes(this.state.listings) + ownBytes(this.state.tasks);
+      if (page.entries.length)
+        growth += ownBytes(this.state.entries) + ownBytes(snapshot.entryIds);
     }
     return this.change(
       page,
       false,
       () => {
-        const entries = new Map(this.state.entries);
-        for (const entry of page.entries) {
-          if (
-            entry.parentId !== page.directoryId ||
-            (page.category === 'directories') !== (entry.kind === 'directory')
-          )
-            return false;
-          entries.set(entry.entryId, entry);
-        }
-        const seen = new Set(snapshot.entryIds);
-        const entryIds = [...snapshot.entryIds];
-        for (const entry of page.entries) {
-          if (!seen.has(entry.entryId)) {
-            seen.add(entry.entryId);
-            entryIds.push(entry.entryId);
+        let entries = this.state.entries;
+        let entryIds = snapshot.entryIds;
+        if (page.entries.length) {
+          const nextEntries = new Map(entries);
+          const seen = new Set(appendOnly ? [] : entryIds);
+          entryIds = [...entryIds];
+          for (const entry of page.entries) {
+            nextEntries.set(entry.entryId, entry);
+            if (!seen.has(entry.entryId)) {
+              seen.add(entry.entryId);
+              entryIds.push(entry.entryId);
+            }
           }
+          entries = nextEntries;
+          this.budget.retain(seen, this.transaction!);
         }
-        // The dedup scratch also lives until GC. Avoid unowned concatenation
-        // and mapped arrays; keep this one temporary Set on the transaction.
-        this.budget.retain(seen, this.transaction!);
         const nextListing: DirectoryListing = {
           ...listing,
           loadState:
@@ -724,10 +745,10 @@ export class ExplorerStore {
           !automatic && this.acceptsTask(page.work)
             ? new Map(this.state.tasks).set(page.work.taskId, page.work)
             : this.state.tasks;
-        this.publish({ ...this.state, entries, listings, tasks });
+        this.publish({ ...this.state, entries, listings, tasks }, appendOnly);
         return true;
       },
-      false,
+      reuse,
       growth,
     );
   }

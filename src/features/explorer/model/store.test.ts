@@ -101,6 +101,35 @@ describe('ExplorerStore observations', () => {
     expect(store.getSnapshot().resourceLimited).toBe(false);
     expect(store.getSnapshot().usages.get('A')?.usageRevision).toBe(200);
   });
+  it('processes progress without copying or reserving the whole wide listing', () => {
+    const store = setup();
+    expect(
+      store.applyPage(
+        page({
+          entries: Array.from({ length: 1000 }, (_, i) =>
+            fixtureEntry('dir-' + i, 'A'),
+          ),
+        }),
+      ),
+    ).toBe(true);
+    const entries = store.getSnapshot().entries;
+    const ids = store.getListing('A', 'directories').snapshot?.entryIds;
+    expect(store.applyPage(page({ cursor: 'cursor-0' }))).toBe(true);
+    expect(store.getSnapshot().entries).toBe(entries);
+    expect(store.getListing('A', 'directories').snapshot?.entryIds).toBe(ids);
+    const pressure = store.budget.reserve(store.budget.available - 64 * 1024);
+    expect(
+      store.acceptEvent({
+        ...work,
+        protocolVersion: 1,
+        sequence: 2,
+        kind: 'progress',
+      }),
+    ).toBe(true);
+    expect(store.applyTask({ ...work, sequence: 2 })).toBe(true);
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    pressure.close();
+  });
   it('restores unused close capacity when validation throws before a close can allocate', () => {
     const store = setup();
     const held = store.getSnapshot();
