@@ -52,6 +52,52 @@ function setup() {
   return store;
 }
 describe('ExplorerStore observations', () => {
+  it('keeps the selection when the same wide branch is folded repeatedly', () => {
+    const store = setup();
+    expect(
+      store.applyPage(
+        page({
+          entries: Array.from({ length: 1000 }, (_, i) =>
+            fixtureEntry('dir-' + i, 'A'),
+          ),
+          nextCursor: null,
+        }),
+      ),
+    ).toBe(true);
+    store.select('A');
+    const before = store.getSnapshot();
+    const bytes = store.budget.used;
+    for (let i = 0; i < 200; i++) store.select('A');
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(store.budget.used).toBe(bytes);
+  });
+  it('can update one folder size repeatedly while a wide listing stays open', () => {
+    const store = setup();
+    expect(
+      store.applyPage(
+        page({
+          entries: Array.from({ length: 1000 }, (_, i) =>
+            fixtureEntry('dir-' + i, 'A'),
+          ),
+          nextCursor: null,
+        }),
+      ),
+    ).toBe(true);
+    for (let revision = 1; revision <= 200; revision++)
+      store.applyUsage(root.session, [
+        {
+          directoryId: 'A',
+          usageRevision: revision,
+          scanState: 'running',
+          logical: { state: 'unknown' },
+          allocated: { state: 'unknown' },
+          observedAt: work.observedAt,
+        },
+      ]);
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    expect(store.getSnapshot().usages.get('A')?.usageRevision).toBe(200);
+  });
   it('restores unused close capacity when validation throws before a close can allocate', () => {
     const store = setup();
     const held = store.getSnapshot();

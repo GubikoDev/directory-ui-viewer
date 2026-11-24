@@ -23,6 +23,54 @@ function gate() {
 }
 
 describe('App', () => {
+  it('limits discovery and usage to the viewport when folding below 200 graph nodes', async () => {
+    const width = vi
+      .spyOn(Element.prototype, 'clientWidth', 'get')
+      .mockReturnValue(900);
+    const height = vi
+      .spyOn(Element.prototype, 'clientHeight', 'get')
+      .mockReturnValue(600);
+    const adapter = new FixtureAdapter({
+      entries: [
+        fixtureEntry('root', null),
+        ...Array.from({ length: 160 }, (_, i) =>
+          fixtureEntry('folder-' + i, 'root'),
+        ),
+        ...Array.from({ length: 60 }, (_, i) =>
+          fixtureEntry('child-' + i, 'folder-0'),
+        ),
+      ],
+    });
+    const client = new SessionClient(adapter);
+    const discovery = vi.spyOn(client, 'startTreeListing');
+    const viewport = vi.spyOn(client, 'setUsageViewport');
+    const view = render(<App client={client} />);
+    try {
+      fireEvent.click(screen.getByRole('button', { name: '폴더 열기' }));
+      const branch = await screen.findByRole('button', { name: 'folder-0' });
+      await screen.findByRole('button', { name: 'child-0' });
+      fireEvent.click(branch);
+      await waitFor(() =>
+        expect(branch).toHaveAttribute('aria-expanded', 'false'),
+      );
+      // Small graphs keep their cards in the DOM. A fold must not turn
+      // offscreen cards into disk reads when the graph crosses that threshold.
+      expect(
+        screen.getByRole('button', { name: 'folder-159' }),
+      ).toBeInTheDocument();
+      expect(viewport.mock.lastCall?.[1]).not.toContain('folder-159');
+      fireEvent.click(branch);
+      await screen.findByRole('button', { name: 'child-0' });
+      expect(discovery.mock.calls.some(([, id]) => id === 'folder-159')).toBe(
+        false,
+      );
+      expect(screen.queryByRole('alert')).toBeNull();
+    } finally {
+      view.unmount();
+      width.mockRestore();
+      height.mockRestore();
+    }
+  });
   it('reports a synchronous page admission failure without losing the current view', async () => {
     const client = new SessionClient(
       new FixtureAdapter({

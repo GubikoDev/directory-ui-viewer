@@ -20,22 +20,58 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('SessionClient with deterministic adapter', () => {
-  it('reports an accepted close while further observation admission remains unavailable', async () => {
+  it('reclaims a closed file list using its existing allowance without suspending a healthy tree', async () => {
     const budget = new FrontendBudget();
     const { client, adapter, store } = setup(undefined, budget);
     await client.chooseRoot();
     await client.list('B', 'files');
     const starts = adapter.calls.startListing;
-    const pressure = vi.spyOn(budget, 'reserve').mockImplementation(() => {
-      throw new Error('RESOURCE_LIMIT');
-    });
+    const suspended: boolean[] = [];
+    const unsubscribe = store.subscribe(() =>
+      suspended.push(store.getSnapshot().resourceLimited),
+    );
+    const pressure = budget.reserve(budget.available);
     expect(client.closeListing('B', 'files')).toBe(true);
     expect(store.getListing('B', 'files').loadState).toBe('notRequested');
-    expect(store.getSnapshot().resourceLimited).toBe(true);
-    pressure.mockRestore();
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    unsubscribe();
+    expect(suspended).not.toContain(true);
+    pressure.close();
     expect(await client.retryObservations()).toBe(true);
     expect(store.getSnapshot().resourceLimited).toBe(false);
     expect(adapter.calls.startListing).toBe(starts);
+  });
+  it('serializes usage reads and skips superseded fold viewports', async () => {
+    const { client, adapter, store } = setup();
+    await client.chooseRoot();
+    const scope = store.getSnapshot().session!;
+    const read = adapter.readUsage.bind(adapter);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reads = vi
+      .spyOn(adapter, 'readUsage')
+      .mockImplementationOnce(async (request) => {
+        const response = await read(request);
+        await gate;
+        return response;
+      });
+    client.setUsageViewport(scope, ['A', 'B']);
+    const first = client.readUsage(scope);
+    client.setUsageViewport(scope, ['A']);
+    const folded = client.readUsage(scope);
+    client.setUsageViewport(scope, ['B']);
+    const reopened = client.readUsage(scope);
+    const concurrent = reads.mock.calls.length;
+    release();
+    await Promise.all([first, folded, reopened]);
+    expect(concurrent).toBe(1);
+    expect(reads.mock.calls.map(([r]) => r.directoryIds)).toEqual([
+      ['A', 'B'],
+      ['B'],
+    ]);
+    expect([...store.getSnapshot().usages.keys()]).toEqual(['B']);
   });
   it('recovers two pending usage requests through replay of the same native task', async () => {
     const budget = new FrontendBudget();

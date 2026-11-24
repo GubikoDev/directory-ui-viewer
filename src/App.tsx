@@ -149,22 +149,23 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
     selected ? positions.get(selected) : undefined,
     positions,
   );
-  const windowed =
-    graph.nodes.length > 200 && bounds.width > 0 && bounds.height > 0;
+  const windowed = graph.nodes.length > 200;
   const intersects = (
     left: number,
     top: number,
     right: number,
     bottom: number,
   ) =>
-    !windowed ||
+    !bounds.width ||
+    !bounds.height ||
     (right >= bounds.left - 200 &&
       left <= bounds.left + bounds.width + 200 &&
       bottom >= bounds.top - 200 &&
       top <= bounds.top + bounds.height + 200);
-  const visibleNodes = graph.nodes.filter((n) =>
+  const viewportNodes = graph.nodes.filter((n) =>
     intersects(n.x, n.y, n.x + n.width, n.y + n.height),
   );
+  const visibleNodes = windowed ? viewportNodes : graph.nodes;
   // Layout and progress can change without changing the visible directories.
   // Only restart viewport work when its IDs (or the session) actually change.
   const viewportKey = JSON.stringify(
@@ -172,7 +173,7 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
       new Set([
         ...(session ? [session.rootEntryId] : []),
         ...(selected ? [selected] : []),
-        ...visibleNodes.map((node) => node.id),
+        ...viewportNodes.map((node) => node.id),
       ]),
     ),
   );
@@ -422,12 +423,13 @@ function ExplorerApp({ client: provided }: { client?: SessionClient }) {
                   const p = n.parent ? positions.get(n.parent) : undefined;
                   if (
                     !p ||
-                    !intersects(
-                      Math.min(p.x, n.x),
-                      Math.min(p.y, n.y),
-                      Math.max(p.x + p.width, n.x + n.width),
-                      Math.max(p.y + p.height, n.y + n.height),
-                    )
+                    (windowed &&
+                      !intersects(
+                        Math.min(p.x, n.x),
+                        Math.min(p.y, n.y),
+                        Math.max(p.x + p.width, n.x + n.width),
+                        Math.max(p.y + p.height, n.y + n.height),
+                      ))
                   )
                     return null;
                   const x = p.x + p.width;

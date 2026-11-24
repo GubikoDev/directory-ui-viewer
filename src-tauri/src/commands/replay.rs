@@ -223,9 +223,13 @@ impl ReplayService {
         };
         match existing {
             Some(existing) => {
-                let memory = budget
-                    .reserve(WAITER_BYTES)
-                    .map_err(|_| ControlError::ResourceLimit)?;
+                let memory = loop {
+                    match budget.reserve(WAITER_BYTES) {
+                        Ok(memory) => break memory,
+                        Err(_) if state.ledger.evict_completed() => (),
+                        Err(_) => return Err(ControlError::ResourceLimit),
+                    }
+                };
                 let result = match existing {
                     Admission::Replay(reply) => WaitState::Ready(reply),
                     Admission::Pending => {
@@ -502,6 +506,22 @@ mod tests {
         drop(owner.complete(json!({"id":3})).unwrap());
         drop((delivery, service));
         assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn duplicate_waiter_reclaims_completed_cache_under_pressure() {
+        let budget = ByteBudget::new(128 * 1024);
+        let service = ReplayService::new(1, budget.clone(), 8, 1000).unwrap();
+        execute(&service, 1, 4096).complete(json!(1)).unwrap();
+        let owner = execute(&service, 2, 4096);
+        let _pressure = budget.reserve(budget.available()).unwrap();
+        let RequestAdmission::Wait(waiter) = service.begin(n(2), &hash(), 0, 4096).unwrap() else {
+            panic!("duplicate must join the original request");
+        };
+        let reply = owner.complete(json!(2)).unwrap();
+        assert!(Arc::ptr_eq(
+            &reply,
+            &tauri::async_runtime::block_on(waiter.wait()).unwrap()
+        ));
     }
     #[test]
     fn failed_delivery_admission_does_not_execute_or_consume_request_identity() {

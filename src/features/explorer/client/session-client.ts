@@ -50,6 +50,11 @@ export class SessionClient {
     ids: readonly string[];
     wanted: ReadonlySet<string>;
   };
+  private usageRead?: {
+    scope: Scope;
+    pending: Promise<void>;
+    repeat: () => void;
+  };
   private currentScope: Scope | null = null;
   private picker?: Promise<boolean>;
   private refreshing?: Promise<void>;
@@ -498,7 +503,8 @@ export class SessionClient {
   closeListing(directoryId: string, category: Category) {
     if (!this.store.setExpanded(directoryId, false, category)) return false;
     this.store.evictClosedListings();
-    this.store.resumeObservations();
+    if (this.store.getSnapshot().resourceLimited)
+      this.store.resumeObservations();
     return true;
   }
   async retryObservations(): Promise<boolean> {
@@ -550,6 +556,37 @@ export class SessionClient {
   }
   async readUsage(scope: Scope | null = this.store.getSnapshot().session) {
     if (!scope || !sameScope(this.store.getSnapshot().session, scope)) return;
+    if (this.usageRead && sameScope(this.usageRead.scope, scope)) {
+      this.usageRead.repeat();
+      return this.usageRead.pending;
+    }
+    // A terminal scan event can arrive while an older batch is in flight.
+    // Keep one trailing read of the latest viewport so that update isn't lost.
+    let again = false;
+    const pending = (async () => {
+      try {
+        do {
+          again = false;
+          await this.readUsageBatches(scope);
+        } while (
+          again &&
+          sameScope(this.store.getSnapshot().session, scope) &&
+          !this.store.getSnapshot().resourceLimited
+        );
+      } finally {
+        if (this.usageRead?.scope === scope) this.usageRead = undefined;
+      }
+    })();
+    this.usageRead = {
+      scope,
+      pending,
+      repeat: () => {
+        again = true;
+      },
+    };
+    return pending;
+  }
+  private async readUsageBatches(scope: Scope) {
     const viewport = this.usageViewport;
     const ids =
       viewport && sameScope(scope, viewport.scope)
@@ -567,9 +604,10 @@ export class SessionClient {
       };
       const response = await this.adapter.readUsage(request);
       if (!sameScope(this.store.getSnapshot().session, scope)) return;
-      if (viewport && viewport !== this.usageViewport) return;
+      if (viewport !== this.usageViewport) return;
       const usages = unwrap(response, request.requestId);
       if (usages) this.store.applyUsage(scope, usages, viewport?.wanted);
+      if (this.store.getSnapshot().resourceLimited) return;
     }
   }
   private idSliceBytes(ids: readonly string[], offset: number, count: number) {

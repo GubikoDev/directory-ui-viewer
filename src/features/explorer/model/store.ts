@@ -59,6 +59,7 @@ const closingOwners = new FinalizationRegistry<FrontendReservation>((memory) =>
 /** Pure normalized observations shared by every view; no Tauri or disk access. */
 export class ExplorerStore {
   private state!: ExplorerState;
+  private compactState!: ExplorerState;
   private pressureState!: ExplorerState;
   private pressureMetadata?: {
     sequences: Map<string, number>;
@@ -99,6 +100,7 @@ export class ExplorerStore {
         },
       };
       this.state = organization;
+      this.compactState = organization;
       this.pressureState = this.closed.organization.pressure;
       this.listeners = new Set();
       this.sequences = new Map();
@@ -188,6 +190,7 @@ export class ExplorerStore {
   ): T {
     if (this.transaction) return update();
     const previous = this.state;
+    const compact = this.compactState;
     const pressure = this.pressureState;
     const pressureMetadata = this.pressureMetadata;
     const sequences = this.sequences;
@@ -220,6 +223,7 @@ export class ExplorerStore {
       // attempt still own their charges until GC, just like normal rollback.
       if (closing && memory) memory.moveTo(this.closingCapacity, memory.bytes);
       this.state = previous;
+      this.compactState = compact;
       this.pressureState = pressure;
       this.pressureMetadata = pressureMetadata;
       this.sequences = sequences;
@@ -240,10 +244,15 @@ export class ExplorerStore {
         this.listeners.forEach((listener) => listener());
     }
   }
-  private publish(next: ExplorerState) {
+  private publish(next: ExplorerState, topologyUnchanged = false) {
     if (!this.transaction) throw new Error('INVALID_RESERVATION');
     this.budget.retain(next, this.transaction);
-    const compact = compactClosed(next, this.budget, this.transaction);
+    // Updating sizes or the view mode cannot detach entries or tasks. If the
+    // whole prior snapshot was retained, rebuilding its ID sets is redundant.
+    const compact =
+      topologyUnchanged && this.state === this.compactState
+        ? next
+        : compactClosed(next, this.budget, this.transaction);
     this.budget.retain(compact, this.transaction);
     let metadata: typeof this.pressureMetadata;
     if (compact !== next) {
@@ -273,6 +282,7 @@ export class ExplorerStore {
       : { ...compact, resourceLimited: true };
     this.budget.retain(pressure, this.transaction);
     this.state = next;
+    this.compactState = compact;
     this.pressureState = pressure;
     this.pressureMetadata = metadata;
   }
@@ -312,8 +322,9 @@ export class ExplorerStore {
     });
   }
   evictClosedListings(): boolean {
-    if (this.state.listings === this.pressureState.listings) return false;
-    this.state = this.pressureState;
+    if (this.state === this.compactState || this.state === this.pressureState)
+      return false;
+    this.state = this.compactState;
     this.usePressureMetadata();
     this.reserveClosures();
     this.listeners.forEach((listener) => listener());
@@ -341,6 +352,7 @@ export class ExplorerStore {
       const before = this.state;
       const closed = this.closed[before.mode];
       this.state = closed.state;
+      this.compactState = closed.state;
       this.pressureState = closed.pressure;
       this.pressureMetadata = undefined;
       this.sequences = this.emptySequences;
@@ -383,8 +395,9 @@ export class ExplorerStore {
     );
   }
   setMode(mode: ExplorerState['mode']) {
+    if (mode === this.state.mode) return;
     return this.change(mode, undefined, () => {
-      this.publish({ ...this.state, mode });
+      this.publish({ ...this.state, mode }, true);
     });
   }
   setExpanded(
@@ -415,6 +428,7 @@ export class ExplorerStore {
     );
   }
   select(id: string | null) {
+    if (id === this.state.selectedId) return;
     if (id === null || this.state.entries.has(id))
       this.change(id, undefined, () =>
         this.publish({ ...this.state, selectedId: id }),
@@ -578,7 +592,7 @@ export class ExplorerStore {
             continue;
           next.set(usage.directoryId, usage);
         }
-        this.publish({ ...this.state, usages: next });
+        this.publish({ ...this.state, usages: next }, true);
       },
       false,
       growth,
