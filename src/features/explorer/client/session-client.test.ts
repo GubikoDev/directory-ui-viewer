@@ -73,6 +73,21 @@ describe('SessionClient with deterministic adapter', () => {
     ]);
     expect([...store.getSnapshot().usages.keys()]).toEqual(['B']);
   });
+  it('reuses a completed file page only after a fresh start confirms the same revision', async () => {
+    const { client, adapter, store } = setup();
+    await client.chooseRoot();
+    const read = vi.spyOn(adapter, 'readListingPage');
+    const start = vi.spyOn(adapter, 'startListing');
+    await client.list('B', 'files');
+    client.closeListing('B', 'files');
+    await client.list('B', 'files');
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(store.getListing('B', 'files').snapshot?.entryIds).toEqual(['file']);
+    await client.refresh();
+    await client.list('B', 'files');
+    expect(read).toHaveBeenCalledTimes(3); // new root and file page
+  });
   it('recovers two pending usage requests through replay of the same native task', async () => {
     const budget = new FrontendBudget();
     const { client, adapter, store } = setup(undefined, budget);

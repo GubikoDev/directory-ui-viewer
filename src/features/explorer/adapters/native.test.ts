@@ -25,6 +25,48 @@ beforeEach(() => {
   });
 });
 describe('native wire boundary', () => {
+  it('shares identical listing metadata and preserves differing values and extended fields', async () => {
+    const first = wire.root.root;
+    const second = {
+      ...first,
+      entryId: 'other',
+      ownLogicalBytes: { state: 'known', value: '7' },
+    };
+    const third = {
+      ...second,
+      entryId: 'third',
+      hidden: { ...second.hidden, flag: 'extra' },
+    };
+    const entries = [first, second, third];
+    const data = {
+      entries,
+      directoryId: 'root',
+      category: 'directories',
+      work: wire.work,
+      listingRevision: 'rev',
+      cursor: null,
+      nextCursor: null,
+      coverage: 'complete',
+      issues: wire.work.issues,
+    };
+    deliverOnce({ requestId: request.requestId, outcome: 'ok', data });
+    const reply = await new NativeAdapter().readListingPage({
+      ...request,
+      sessionId: 'fixture-session',
+      generation: 1,
+      taskId: 'list',
+      cursor: null,
+      limit: 200,
+    });
+    if (reply.outcome !== 'ok') throw new Error('expected listing');
+    expect(reply.data.entries).toEqual(entries);
+    const [a, b, c] = reply.data.entries;
+    expect(a.hidden).toBe(b.hidden);
+    expect(a.ownLogicalBytes).not.toBe(b.ownLogicalBytes);
+    expect(b.hidden).not.toBe(c.hidden);
+    expect(b.specialType).toBe(c.specialType);
+    expect(Object.isFrozen(b.hidden)).toBe(true);
+  });
   it.each(['cancelTask', 'startListing', 'startUsageScan'] as const)(
     'retains worst-case bounded issue samples for %s under pressure',
     async (operation) => {

@@ -489,33 +489,50 @@ export class ExplorerStore {
     const key = listingKey(start.directoryId, start.category);
     if (requestOrder !== this.listingOrders.get(key)) return false;
     if (!this.acceptsTask(start.work)) return false;
-    return this.change(start, false, () => {
-      const tasks = new Map(this.state.tasks).set(
-        start.work.taskId,
-        start.work,
-      );
-      const prior = this.state.listings.get(key);
-      if (prior?.snapshot?.listingRevision === start.listingRevision) {
-        this.publish({ ...this.state, tasks });
+    const prior = this.state.listings.get(key);
+    const sameRevision =
+      prior?.snapshot?.listingRevision === start.listingRevision;
+    const reuse =
+      this.state === this.compactState &&
+      (!prior || (sameRevision && prior.taskId === start.work.taskId));
+    return this.change(
+      start,
+      false,
+      () => {
+        const tasks = new Map(this.state.tasks).set(
+          start.work.taskId,
+          start.work,
+        );
+        if (sameRevision) {
+          this.publish({ ...this.state, tasks }, reuse);
+          return true;
+        }
+        const listings = new Map(this.state.listings).set(key, {
+          directoryId: start.directoryId,
+          category: start.category,
+          taskId: start.work.taskId,
+          loadState: 'loading' as const,
+          snapshot: {
+            listingRevision: start.listingRevision,
+            entryIds: [],
+            nextCursor: null,
+            coverage: 'partial' as const,
+            observedAt: start.work.observedAt,
+            issues: start.work.issues,
+          },
+        });
+        this.publish({ ...this.state, tasks, listings }, reuse);
         return true;
-      }
-      const listings = new Map(this.state.listings).set(key, {
-        directoryId: start.directoryId,
-        category: start.category,
-        taskId: start.work.taskId,
-        loadState: 'loading' as const,
-        snapshot: {
-          listingRevision: start.listingRevision,
-          entryIds: [],
-          nextCursor: null,
-          coverage: 'partial' as const,
-          observedAt: start.work.observedAt,
-          issues: start.work.issues,
-        },
-      });
-      this.publish({ ...this.state, tasks, listings });
-      return true;
-    });
+      },
+      reuse,
+      reuse
+        ? ownBytes(this.state.tasks) +
+            ownBytes(this.state.listings) +
+            2048 +
+            4 * key.length +
+            2 * start.work.taskId.length
+        : 0,
+    );
   }
   beginListing(
     directoryId: string,
@@ -525,14 +542,26 @@ export class ExplorerStore {
     if (this.state.entries.get(directoryId)?.kind !== 'directory') return false;
     const key = listingKey(directoryId, category);
     if (requestOrder <= (this.listingOrders.get(key) ?? -1)) return false;
-    return this.change(directoryId, false, () => {
-      this.listingOrders = new Map(this.listingOrders).set(key, requestOrder);
-      const field =
-        category === 'directories' ? 'expandedIds' : 'openFileListIds';
-      const ids = new Set(this.state[field]).add(directoryId);
-      this.publish({ ...this.state, [field]: ids });
-      return true;
-    });
+    const field =
+      category === 'directories' ? 'expandedIds' : 'openFileListIds';
+    const reuse = this.state === this.compactState;
+    return this.change(
+      directoryId,
+      false,
+      () => {
+        this.listingOrders = new Map(this.listingOrders).set(key, requestOrder);
+        const ids = new Set(this.state[field]).add(directoryId);
+        this.publish({ ...this.state, [field]: ids }, reuse);
+        return true;
+      },
+      reuse,
+      reuse
+        ? ownBytes(this.listingOrders) +
+            ownBytes(this.state[field]) +
+            1024 +
+            4 * key.length
+        : 0,
+    );
   }
   failListingStart(id: string, category: Category, order: number) {
     if (!this.isListingRequestCurrent(id, category, order)) return;

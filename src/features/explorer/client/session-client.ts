@@ -13,6 +13,7 @@ import {
   type ScopedRequest,
   type WorkRecord,
   type ListingStart,
+  type ListingPage,
 } from '../model/types';
 
 type PendingStart =
@@ -67,6 +68,7 @@ export class SessionClient {
   private connection?: Promise<void>;
   private recovery: TaskMap<Promise<void>>;
   private pageReads: TaskMap<Promise<boolean>>;
+  private lastFilePage?: WeakRef<ListingPage>;
   private lastPage: TaskMap<number>;
   private pageDemand: TaskMap<boolean>;
   private lastEvent: TaskMap<number>;
@@ -163,6 +165,7 @@ export class SessionClient {
     this.currentScope = null;
     this.recovery.clear();
     this.pageReads.clear();
+    this.lastFilePage = undefined;
     this.pendingStarts.clear();
     this.store.reset(null);
     this.stateSubscription?.();
@@ -241,6 +244,7 @@ export class SessionClient {
   }
   private async activate(root: RootData) {
     this.errorLog.clear();
+    this.lastFilePage = undefined;
     this.usageViewport = undefined;
     this.currentScope = root.session;
     if (!this.store.reset(root)) {
@@ -487,11 +491,29 @@ export class SessionClient {
     // Do not retain the entire previous state across an adapter wait.
     const request = this.pageRequest(taskId);
     if (!request) return false;
-    const response = await this.adapter.readListingPage(request);
-    if (!sameScope(this.store.getSnapshot().session, request)) return false;
-    const page = unwrap(response, request.requestId);
+    // A fresh start has already validated the native task and revision. A
+    // recently closed panel may still have its immutable first page until GC.
+    let page = request.cursor === null ? this.lastFilePage?.deref() : undefined;
+    if (
+      !page ||
+      !sameScope(page.work, request) ||
+      page.work.taskId !== taskId ||
+      this.store.getListing(page.directoryId, 'files').snapshot
+        ?.listingRevision !== page.listingRevision
+    ) {
+      const response = await this.adapter.readListingPage(request);
+      if (!sameScope(this.store.getSnapshot().session, request)) return false;
+      page = unwrap(response, request.requestId) ?? undefined;
+    }
     if (!page) return false;
     const applied = this.store.applyPage(page);
+    if (
+      applied &&
+      page.category === 'files' &&
+      page.cursor === null &&
+      page.work.phase === 'completed'
+    )
+      this.lastFilePage = new WeakRef(page);
     if (page.entries.length > 0 || page.nextCursor === null || !applied)
       this.pageDemand.delete(taskId);
     return applied;

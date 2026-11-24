@@ -52,6 +52,50 @@ function replyCredit(operation: string): number {
       return 0;
   }
 }
+// Adjacent rows often have identical hidden flags, sizes and timestamps.
+// Share only equal scalar fields inside this reply, before it is frozen.
+const entryFields = [
+  'hidden',
+  'specialType',
+  'modifiedAt',
+  'ownLogicalBytes',
+  'ownAllocatedBytes',
+] as const;
+type WireField = Record<string, unknown>;
+function equalFields(left: WireField, right: WireField) {
+  for (const key in left)
+    if (!Object.hasOwn(right, key) || left[key] !== right[key]) return false;
+  for (const key in right) if (!Object.hasOwn(left, key)) return false;
+  return true;
+}
+function shareListingFields(value: unknown, charge: (owner: object) => void) {
+  const reply = value as { data?: { entries?: unknown } };
+  if (!Array.isArray(reply.data?.entries)) return;
+  let previous: Record<string, WireField> | undefined;
+  for (const row of reply.data.entries) {
+    if (!row || typeof row !== 'object') continue;
+    if (previous) {
+      for (const key of entryFields) {
+        const field = row[key] as WireField | undefined;
+        const prior = previous[key];
+        if (
+          !field ||
+          !prior ||
+          typeof field !== 'object' ||
+          typeof prior !== 'object' ||
+          Array.isArray(field) ||
+          Array.isArray(prior) ||
+          !equalFields(field, prior)
+        )
+          continue;
+        charge(prior);
+        charge(field); // the discarded parsed object remains charged until GC
+        row[key] = prior;
+      }
+    }
+    previous = row;
+  }
+}
 /** Native wire translation only. Paths and native contexts never enter this API. */
 export class NativeAdapter implements FilesystemAdapter {
   constructor(private readonly budget: FrontendBudget = frontendBudget) {
@@ -137,7 +181,10 @@ export class NativeAdapter implements FilesystemAdapter {
           ),
         priority,
       );
-      return inbox.parse(key) as Response<T>;
+      return inbox.parse(
+        key,
+        operation === 'readListingPage' ? shareListingFields : undefined,
+      ) as Response<T>;
     } catch (error) {
       const code = errorCode(error);
       return {

@@ -136,7 +136,10 @@ export class ReplyInbox {
       throw new Error(slot?.error ?? 'INVALID_RESPONSE');
     return slot.json;
   }
-  parse(key: string): unknown {
+  parse(
+    key: string,
+    prepare?: Parameters<FrontendBudget['parse']>[3],
+  ): unknown {
     // Parsed descendants keep individual reservations after their response slot
     // is closed; a store/snapshot may retain them longer than the outer reply.
     const json = this.read(key);
@@ -147,7 +150,7 @@ export class ReplyInbox {
     slot.memory.resize(Math.max(slot.memory.bytes, slot.bytes + bytes));
     const parsed = slot.memory.take(bytes);
     try {
-      return this.budget.parse(json, slot.priority, parsed);
+      return this.budget.parse(json, slot.priority, parsed, prepare);
     } finally {
       parsed.close();
     }

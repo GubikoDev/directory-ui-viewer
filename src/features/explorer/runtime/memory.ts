@@ -290,6 +290,7 @@ export class FrontendBudget {
     json: string,
     priority = false,
     reserved?: FrontendReservation,
+    prepare?: (value: unknown, charge: (owner: object) => void) => void,
   ): unknown {
     const bytes = this.parseBytes(json);
     const memory = reserved ?? this.reserve(bytes, priority);
@@ -299,6 +300,7 @@ export class FrontendBudget {
       const value: unknown = JSON.parse(json);
       if (value === null || typeof value !== 'object')
         throw new Error('INVALID_RESPONSE');
+      prepare?.(value, (owner) => this.retain(owner, memory));
       return this.retain(value, memory);
     } finally {
       if (!reserved) memory.close();
