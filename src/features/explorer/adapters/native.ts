@@ -44,8 +44,7 @@ function replyCredit(operation: string): number {
     case 'startListing':
     case 'startUsageScan':
     case 'cancelTask':
-      // Encoded UTF16 plus structural parse cost for32 bounded issue samples.
-      // The maximum-escape fixture requires570184bytes before decoding.
+      // Cover both the encoded UTF-16 reply and parsing 32 escaped issue samples.
       return 640 * 1024;
     case 'closeSession':
       return 32 * 1024;

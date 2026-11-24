@@ -21,7 +21,7 @@ import {
   type WorkEvent,
   type WorkRecord,
 } from './types';
-import { compactClosed } from './retention';
+import { canDeselectWithoutPruning, compactClosed } from './retention';
 
 export interface ExplorerState {
   session: RootSession | null;
@@ -184,7 +184,7 @@ export class ExplorerStore {
     input: unknown,
     fallback: T,
     update: () => T,
-    replacing = false,
+    skipCollectionCopies = false,
     growthBytes = 0,
     closing = false,
   ): T {
@@ -202,7 +202,7 @@ export class ExplorerStore {
         16 * 1024 +
         this.budget.untrackedBytes(input) +
         growthBytes +
-        (replacing ? 0 : 3 * this.collectionBytes());
+        (skipCollectionCopies ? 0 : 3 * this.collectionBytes());
       memory = closing
         ? this.closingCapacity.take(bytes)
         : this.budget.reserve(bytes);
@@ -244,13 +244,13 @@ export class ExplorerStore {
         this.listeners.forEach((listener) => listener());
     }
   }
-  private publish(next: ExplorerState, topologyUnchanged = false) {
+  private publish(next: ExplorerState, retentionUnchanged = false) {
     if (!this.transaction) throw new Error('INVALID_RESERVATION');
     this.budget.retain(next, this.transaction);
     // Updating sizes or the view mode cannot detach entries or tasks. If the
     // whole prior snapshot was retained, rebuilding its ID sets is redundant.
     const compact =
-      topologyUnchanged && this.state === this.compactState
+      retentionUnchanged && this.state === this.compactState
         ? next
         : compactClosed(next, this.budget, this.transaction);
     this.budget.retain(compact, this.transaction);
@@ -428,11 +428,19 @@ export class ExplorerStore {
     );
   }
   select(id: string | null) {
-    if (id === this.state.selectedId) return;
-    if (id === null || this.state.entries.has(id))
-      this.change(id, undefined, () =>
-        this.publish({ ...this.state, selectedId: id }),
-      );
+    if (
+      id === this.state.selectedId ||
+      (id !== null && !this.state.entries.has(id))
+    )
+      return;
+    const reuse =
+      this.state === this.compactState && canDeselectWithoutPruning(this.state);
+    this.change(
+      id,
+      undefined,
+      () => this.publish({ ...this.state, selectedId: id }, reuse),
+      reuse,
+    );
   }
   getListing(id: string, category: Category): DirectoryListing {
     return (

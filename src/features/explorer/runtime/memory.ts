@@ -260,8 +260,10 @@ export class FrontendBudget {
     }
   }
   parseBytes(json: string): number {
-    // Count structural tokens outside strings before JSON.parse. String UTF-16
-    // storage plus per-node/property/slot headroom bounds native wire objects.
+    // Source length bounds all decoded UTF-16 keys and strings, even with
+    // escapes. In ownBytes an object property costs at most 256 fixed bytes
+    // (128 + two string headers), and an array slot at most 128. The opening
+    // allowance covers the 512-byte container and the first array slot.
     if (json.length > 1_048_576) throw new Error('RESOURCE_LIMIT');
     let bytes = 4096 + json.length * 2;
     let depth = 0;
@@ -275,12 +277,12 @@ export class FrontendBudget {
         else if (char === '"') quoted = false;
       } else if (char === '"') {
         quoted = true;
-        bytes += 128;
       } else if (char === '{' || char === '[') {
         if (++depth > 64) throw new Error('INVALID_RESPONSE');
         bytes += 1024;
       } else if (char === '}' || char === ']') depth--;
-      else if (char === ':' || char === ',') bytes += 512;
+      else if (char === ':') bytes += 256;
+      else if (char === ',') bytes += 128;
     }
     return bytes;
   }

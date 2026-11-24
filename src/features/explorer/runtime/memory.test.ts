@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { fixtureEntry } from '../adapters/fixture';
 import { FrontendBudget, ownBytes } from './memory';
 
 function harness(limit = 32 * 1024 * 1024) {
@@ -166,6 +167,19 @@ describe('document-wide managed observation budget', () => {
     } finally {
       parse.mockRestore();
     }
+  });
+  it('admits a 200-file reply with 4 MiB remaining and charges each parsed owner', () => {
+    const budget = new FrontendBudget();
+    const json = JSON.stringify({
+      entries: Array.from({ length: 200 }, (_, i) =>
+        fixtureEntry('파일-' + i, 'A', 'regularFile'),
+      ),
+    });
+    const pressure = budget.reserve(budget.available - 4 * 1024 * 1024);
+    const expected = budget.untrackedBytes(JSON.parse(json));
+    expect(budget.parse(json)).toHaveProperty('entries.length', 200);
+    expect(budget.used - pressure.bytes).toBe(expected);
+    pressure.close();
   });
   it('rejects cyclic adoption and malformed wire without silently consuming the pool', () => {
     const { budget } = harness();

@@ -71,6 +71,9 @@ describe('ExplorerStore observations', () => {
     expect(store.getSnapshot().resourceLimited).toBe(false);
     expect(store.getSnapshot()).toBe(before);
     expect(store.budget.used).toBe(bytes);
+    for (let i = 0; i < 200; i++) store.select(i % 2 ? 'A' : 'dir-0');
+    expect(store.getSnapshot().resourceLimited).toBe(false);
+    expect(store.getSnapshot().selectedId).toBe('A');
   });
   it('can update one folder size repeatedly while a wide listing stays open', () => {
     const store = setup();
@@ -382,6 +385,10 @@ describe('ExplorerStore observations', () => {
     ]);
     expect(store.getSnapshot().selectedId).toBe('selected-file');
     expect(store.getSnapshot().tasks.has('files')).toBe(false);
+    store.select('B');
+    store.suspendObservations();
+    expect(store.getSnapshot().entries.has('selected-file')).toBe(false);
+    expect(store.getSnapshot().entries.has('B')).toBe(true);
   });
   it('distinguishes unrequested, pending empty, true empty, and permission failure', () => {
     const store = new ExplorerStore();

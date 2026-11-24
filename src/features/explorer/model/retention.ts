@@ -1,11 +1,30 @@
-import type {
-  DirectoryListing,
-  Entry,
-  DirectoryUsage,
-  WorkRecord,
+import {
+  listingKey,
+  type DirectoryListing,
+  type Entry,
+  type DirectoryUsage,
+  type WorkRecord,
 } from './types';
 import type { ExplorerState } from './store';
 import type { FrontendBudget, FrontendReservation } from '../runtime/memory';
+
+/** A selection can be the sole owner of a closed directory listing or an
+ * otherwise detached entry. Only reuse retention when both survive deselection. */
+export function canDeselectWithoutPruning(state: ExplorerState): boolean {
+  const id = state.selectedId ?? state.session?.rootEntryId;
+  if (!id) return true;
+  const listing = state.listings.get(listingKey(id, 'directories'));
+  if (listing && !listing.automatic && !state.expandedIds.has(id)) return false;
+  if (id === state.session?.rootEntryId) return true;
+  const entry = state.entries.get(id);
+  if (!entry?.parentId) return false;
+  const category = entry.kind === 'directory' ? 'directories' : 'files';
+  return (
+    state.listings
+      .get(listingKey(entry.parentId, category))
+      ?.snapshot?.entryIds.includes(id) ?? false
+  );
+}
 
 /** Build while a normal store transaction has spare capacity. Pressure later
  * switches to this already-owned snapshot without allocating or mutating old
