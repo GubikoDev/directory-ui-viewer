@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A visual, local-first directory explorer"
 authors = ["bigwin22"]
 edition = "2024"
+license = "MIT"
 
 [features]
 internal-metrics = []

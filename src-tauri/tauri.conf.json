@@ -29,7 +29,10 @@
     "active": false,
     "targets": ["dmg", "appimage"],
     "resources": {
-      "../licenses/": "licenses/"
+      "../LICENSE": "licenses/Directory-UI-Viewer-MIT.txt",
+      "../licenses/THIRD-PARTY-NOTICES.txt": "licenses/THIRD-PARTY-NOTICES.txt",
+      "../licenses/walkdir/*.txt": "licenses/walkdir/",
+      "../licenses/same-file/*.txt": "licenses/same-file/"
     }
   }
 }

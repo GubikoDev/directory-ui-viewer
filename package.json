@@ -1,6 +1,7 @@
 {
   "name": "directory-ui-viewer",
   "private": true,
+  "license": "MIT",
   "version": "0.1.0",
   "type": "module",
   "packageManager": "npm@11.19.0",
@@ -20,7 +21,9 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:gc": "node --expose-gc e2e/frontend-gc.mjs",
-    "tauri": "tauri"
+    "licenses:mac": "node scripts/macos-notices.mjs",
+    "tauri": "tauri",
+    "bundle:mac": "MACOSX_DEPLOYMENT_TARGET=14.0 tauri build --bundles app,dmg"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
